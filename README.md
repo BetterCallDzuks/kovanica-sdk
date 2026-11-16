@@ -10,7 +10,7 @@ Typed, lightweight TypeScript client and utilities for the **Kovanica (KVNC)** L
 ## Features
 
 - **Standard JSON-RPC 2.0 Transport:** Configurable endpoint URL, automatic request IDs, configurable timeouts, caller-controlled cancellation (`AbortSignal`), and typed error classes.
-- **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`feab9050b178ee6d25798c0976a7fa138e90f537`](https://github.com/KovanicaDAG/kovanica/commit/feab9050b178ee6d25798c0976a7fa138e90f537).
+- **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`511af88532dceebdf0349b63c6c4c898eee7ca6e`](https://github.com/KovanicaDAG/kovanica-l1/commit/511af88532dceebdf0349b63c6c4c898eee7ca6e).
 - **Lossless Precision (Large Integers):** Kovanica balances, heights, stakes, nonces, and gas rates are represented losslessly as native JavaScript `bigint`. Never coerced into IEEE-754 `Number`. Plain JSON integers up to `u64::MAX` are preserved losslessly.
 - **PRO-21 Address Support:** Canonical 64-character `kvnc...dag` base32 addresses (256-bit Ed25519 public key + 29-bit `blake3` checksum) and chain-aware validation.
 - **Chain Registry:** Verified chain ID metadata for the canonical chains: Mainnet (`1`, Hybrid PoW + GHOSTDAG, strict PRO-21), Testnet (`2`, Hybrid PoW + GHOSTDAG, strict PRO-21, alias `HYBRID_TESTNET = 2`), Devnet (`3`, Mysticeti, legacy hex allowed), and Local (`1337`, Mysticeti, legacy hex allowed).
@@ -137,7 +137,7 @@ To prevent precision corruption:
 
 ## RPC Compatibility Matrix
 
-All methods are mapped directly to handlers in `crates/kovanica-rpc` verified at node commit [`feab9050b178ee6d25798c0976a7fa138e90f537`](https://github.com/KovanicaDAG/kovanica/commit/feab9050b178ee6d25798c0976a7fa138e90f537):
+All methods are mapped directly to handlers in `crates/kovanica-rpc` verified at node commit [`511af88532dceebdf0349b63c6c4c898eee7ca6e`](https://github.com/KovanicaDAG/kovanica-l1/commit/511af88532dceebdf0349b63c6c4c898eee7ca6e):
 
 | JSON-RPC Method | SDK Client Method | Handler in `kovanica-rpc` | Supported Chains | Notes |
 | :--- | :--- | :--- | :--- | :--- |
@@ -258,4 +258,4 @@ The deterministic test suite (`tests/transport-contracts.test.ts`) verifies clie
 ## License Basis
 
 - **License:** MIT License (`LICENSE`).
-- **Basis:** Developed from scratch as a clean TypeScript client based on public protocol constants (`kovanica-params`) and the JSON-RPC interface specification (`kovanica-rpc`) verified at node commit [`feab9050b178ee6d25798c0976a7fa138e90f537`](https://github.com/KovanicaDAG/kovanica/commit/feab9050b178ee6d25798c0976a7fa138e90f537). Contains no copied code from GPL-3.0 licensed consensus internals.
+- **Basis:** Developed from scratch as a clean TypeScript client based on public protocol constants (`kovanica-params`) and the JSON-RPC interface specification (`kovanica-rpc`) verified at node commit [`511af88532dceebdf0349b63c6c4c898eee7ca6e`](https://github.com/KovanicaDAG/kovanica-l1/commit/511af88532dceebdf0349b63c6c4c898eee7ca6e). Contains no copied code from GPL-3.0 licensed consensus internals.
