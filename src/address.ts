@@ -1,6 +1,6 @@
 /**
  * Kovanica PRO-21 and legacy address encoding, decoding and validation.
- * Verified against crates/kovanica-types/src/address.rs at commit 2c2e54b4615eb53c61ebb9963b7606d2ccbfaa47.
+ * Verified against crates/kovanica-types/src/address.rs at commit d2239fd8314a0c6edb08d54724738d662d406a32.
  */
 
 import { blake3 } from "@noble/hashes/blake3.js";

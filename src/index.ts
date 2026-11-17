@@ -62,6 +62,7 @@ export {
   getChainConfig,
   isLegacyAddressAllowed,
   KNOWN_CHAINS,
+  NETWORK_TAGS,
 } from "./chains";
 
 // Address Utilities

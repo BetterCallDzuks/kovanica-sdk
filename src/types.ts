@@ -1,6 +1,6 @@
 /**
  * Kovanica JSON-RPC request and response schemas.
- * Verified against crates/kovanica-rpc in kovanica git SHA: 2c2e54b4615eb53c61ebb9963b7606d2ccbfaa47
+ * Verified against crates/kovanica-rpc in kovanica git SHA: d2239fd8314a0c6edb08d54724738d662d406a32
  */
 
 export interface RequestOptions {

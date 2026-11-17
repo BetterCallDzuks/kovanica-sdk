@@ -10,10 +10,10 @@ Typed, lightweight TypeScript client and utilities for the **Kovanica (KVNC)** L
 ## Features
 
 - **Standard JSON-RPC 2.0 Transport:** Configurable endpoint URL, automatic request IDs, configurable timeouts, caller-controlled cancellation (`AbortSignal`), and typed error classes.
-- **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`511af88532dceebdf0349b63c6c4c898eee7ca6e`](https://github.com/KovanicaDAG/kovanica-l1/commit/511af88532dceebdf0349b63c6c4c898eee7ca6e).
+- **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`d2239fd8314a0c6edb08d54724738d662d406a32`](https://github.com/KovanicaDAG/kovanica-l1/commit/d2239fd8314a0c6edb08d54724738d662d406a32).
 - **Lossless Precision (Large Integers):** Kovanica balances, heights, stakes, nonces, and gas rates are represented losslessly as native JavaScript `bigint`. Never coerced into IEEE-754 `Number`. Plain JSON integers up to `u64::MAX` are preserved losslessly.
 - **PRO-21 Address Support:** Canonical 64-character `kvnc...dag` base32 addresses (256-bit Ed25519 public key + 29-bit `blake3` checksum) and chain-aware validation.
-- **Chain Registry:** Verified chain ID metadata for the canonical chains: Mainnet (`1`, Hybrid PoW + GHOSTDAG, strict PRO-21), Testnet (`2`, Hybrid PoW + GHOSTDAG, strict PRO-21, alias `HYBRID_TESTNET = 2`), and Devnet (`3`, Mysticeti, legacy hex allowed, also used for local testing).
+- **Chain Registry:** Verified chain ID metadata for the canonical chains: Mainnet (`1`, Hybrid PoW + GHOSTDAG, official network tag `1-4d827d40dd9655db`, strict PRO-21), Testnet (`2`, Hybrid PoW + GHOSTDAG, official network tag `2-acfdf6a6c80fd28a`, strict PRO-21, alias `HYBRID_TESTNET = 2`), and Devnet (`3`, Mysticeti, legacy hex allowed, also used for local testing).
 - **Hybrid PoW & DAG Queries:** First-class typed support for `kovanica_getMiningInfo` and `kovanica_getDagTips` on Mainnet (Chain 1) and Testnet (Chain 2) (Hybrid PoW + GHOSTDAG).
 
 ---
@@ -137,7 +137,7 @@ To prevent precision corruption:
 
 ## RPC Compatibility Matrix
 
-All methods are mapped directly to handlers in `crates/kovanica-rpc` verified at node commit [`de641f6f305287de56a42ee559d8f490afc8b7bd`](https://github.com/KovanicaDAG/kovanica-l1/commit/de641f6f305287de56a42ee559d8f490afc8b7bd):
+All methods are mapped directly to handlers in `crates/kovanica-rpc` verified at node commit [`d2239fd8314a0c6edb08d54724738d662d406a32`](https://github.com/KovanicaDAG/kovanica-l1/commit/d2239fd8314a0c6edb08d54724738d662d406a32):
 
 | JSON-RPC Method | SDK Client Method | Handler in `kovanica-rpc` | Supported Chains | Notes |
 | :--- | :--- | :--- | :--- | :--- |
@@ -173,7 +173,7 @@ The L1 RPC returns `SyncStatus` with `#[serde(rename_all = "camelCase")]`:
 - `behindBy`: `u64` (omitted if not catching up)
 - `peerCount`: `usize` (plain integer)
 - `peers`: array of `SyncPeerStatus` (`peerId`: string, `reportedTipRound`: optional `u64`)
-- `networkTag`: `<chain_id>-<16 hex chars>`
+- `networkTag`: `<chain_id>-<16 hex chars>` (official frozen tags: Mainnet `1-4d827d40dd9655db`, Testnet `2-acfdf6a6c80fd28a`)
 
 ### Synchronization State Semantics
 In Kovanica L1, **`catchingUp === false` alone is insufficient** to conclude a node is in sync:
@@ -186,11 +186,11 @@ In Kovanica L1, **`catchingUp === false` alone is insufficient** to conclude a n
 
 ## Chain ID Registry
 
-| Chain ID | Name | Consensus | Target Block | Address Rule |
-| :---: | :--- | :--- | :---: | :--- |
-| `1` | **Mainnet** | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
-| `2` | **Testnet** (`HYBRID_TESTNET` alias) | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
-| `3` | **Devnet** | Mysticeti | 4 s | PRO-21 base32 and legacy hex allowed |
+| Chain ID | Name | Network Tag | Consensus | Target Block | Address Rule |
+| :---: | :--- | :---: | :--- | :---: | :--- |
+| `1` | **Mainnet** | `1-4d827d40dd9655db` | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
+| `2` | **Testnet** (`HYBRID_TESTNET` alias) | `2-acfdf6a6c80fd28a` | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
+| `3` | **Devnet** | `3-<16 hex chars>` (ephemeral) | Mysticeti | 4 s | PRO-21 base32 and legacy hex allowed |
 
 > [!NOTE]
 > Per `crates/kovanica-params/src/lib.rs` and `crates/kovanica-types/src/signing.rs`, both Mainnet (`1`) and Testnet (`2`, alias `HYBRID_TESTNET = 2`) execute Hybrid PoW + GHOSTDAG mining (`is_hybrid(chain_id) == true`, `K = 5`, target 4 s, KovanicaHash) and enforce strict PRO-21 base32 addresses (`isLegacyAddressAllowed(chainId) == false`). Devnet (`3`) uses a development parameter profile (also for local testing) and allows legacy hex addresses.
@@ -259,4 +259,4 @@ The deterministic test suite (`tests/transport-contracts.test.ts`) verifies clie
 ## License Basis
 
 - **License:** MIT License (`LICENSE`).
-- **Basis:** Developed from scratch as a clean TypeScript client based on public protocol constants (`kovanica-params`) and the JSON-RPC interface specification (`kovanica-rpc`) verified at node commit [`de641f6f305287de56a42ee559d8f490afc8b7bd`](https://github.com/KovanicaDAG/kovanica-l1/commit/de641f6f305287de56a42ee559d8f490afc8b7bd). Contains no copied code from GPL-3.0 licensed consensus internals.
+- **Basis:** Developed from scratch as a clean TypeScript client based on public protocol constants (`kovanica-params`) and the JSON-RPC interface specification (`kovanica-rpc`) verified at node commit [`d2239fd8314a0c6edb08d54724738d662d406a32`](https://github.com/KovanicaDAG/kovanica-l1/commit/d2239fd8314a0c6edb08d54724738d662d406a32). Contains no copied code from GPL-3.0 licensed consensus internals.

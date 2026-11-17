@@ -1,6 +1,7 @@
 /**
  * Chain IDs and configuration for Kovanica networks.
- * Verified against crates/kovanica-params/src/lib.rs and crates/kovanica-types/src/signing.rs.
+ * Verified against crates/kovanica-params/src/lib.rs, crates/kovanica-types/src/signing.rs,
+ * and mainnet/genesis.json at commit d2239fd8314a0c6edb08d54724738d662d406a32.
  */
 
 export const CHAIN_IDS = {
@@ -8,6 +9,11 @@ export const CHAIN_IDS = {
   TESTNET: 2,
   HYBRID_TESTNET: 2,
   DEVNET: 3,
+} as const;
+
+export const NETWORK_TAGS = {
+  MAINNET: "1-4d827d40dd9655db",
+  TESTNET: "2-acfdf6a6c80fd28a",
 } as const;
 
 export type ChainId = (typeof CHAIN_IDS)[keyof typeof CHAIN_IDS] | number;
@@ -20,6 +26,8 @@ export interface ChainConfig {
   consensus: "Mysticeti" | "Hybrid PoW + GHOSTDAG";
   targetBlockTimeMs: number;
   ghostdagK?: number;
+  /** Official `<chain_id>-<16 hex genesis digest>` wire network tag when frozen. */
+  networkTag?: string;
   allowsLegacyAddress: boolean;
   /** Suggested local / developer endpoint. */
   defaultRpcUrl?: string;
@@ -35,8 +43,10 @@ export const KNOWN_CHAINS: Record<number, ChainConfig> = {
     consensus: "Hybrid PoW + GHOSTDAG",
     targetBlockTimeMs: 4000,
     ghostdagK: 5,
+    networkTag: NETWORK_TAGS.MAINNET,
     allowsLegacyAddress: false,
-    description: "Kovanica Mainnet (Hybrid PoW + GHOSTDAG, KovanicaHash, target 4s, K=5). Strict PRO-21 base32 addresses only.",
+    description:
+      "Kovanica Mainnet (Hybrid PoW + GHOSTDAG, KovanicaHash, target 4s, K=5, network tag 1-4d827d40dd9655db). Strict PRO-21 base32 addresses only.",
   },
   [CHAIN_IDS.TESTNET]: {
     chainId: CHAIN_IDS.TESTNET,
@@ -46,10 +56,11 @@ export const KNOWN_CHAINS: Record<number, ChainConfig> = {
     consensus: "Hybrid PoW + GHOSTDAG",
     targetBlockTimeMs: 4000,
     ghostdagK: 5,
+    networkTag: NETWORK_TAGS.TESTNET,
     allowsLegacyAddress: false,
     defaultRpcUrl: "http://127.0.0.1:8545/rpc",
     description:
-      "Kovanica Testnet (Hybrid PoW + GHOSTDAG, KovanicaHash, target 4s, K=5). Strict PRO-21 base32 addresses only.",
+      "Kovanica Testnet (Hybrid PoW + GHOSTDAG, KovanicaHash, target 4s, K=5, network tag 2-acfdf6a6c80fd28a). Strict PRO-21 base32 addresses only.",
   },
   [CHAIN_IDS.DEVNET]: {
     chainId: CHAIN_IDS.DEVNET,

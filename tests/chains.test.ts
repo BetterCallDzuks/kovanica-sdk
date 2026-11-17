@@ -4,6 +4,7 @@ import {
   getChainConfig,
   isLegacyAddressAllowed,
   KNOWN_CHAINS,
+  NETWORK_TAGS,
 } from "../src/chains";
 
 describe("chains configuration", () => {
@@ -12,6 +13,8 @@ describe("chains configuration", () => {
     expect(CHAIN_IDS.TESTNET).toBe(2);
     expect(CHAIN_IDS.HYBRID_TESTNET).toBe(2);
     expect(CHAIN_IDS.DEVNET).toBe(3);
+    expect(NETWORK_TAGS.MAINNET).toBe("1-4d827d40dd9655db");
+    expect(NETWORK_TAGS.TESTNET).toBe("2-acfdf6a6c80fd28a");
     expect("LOCAL" in CHAIN_IDS).toBe(false);
     expect("TESTNET_V2" in CHAIN_IDS).toBe(false);
     expect(KNOWN_CHAINS[4]).toBeUndefined();
@@ -28,6 +31,7 @@ describe("chains configuration", () => {
     expect(mainnet?.decimals).toBe(9);
     expect(mainnet?.consensus).toBe("Hybrid PoW + GHOSTDAG");
     expect(mainnet?.ghostdagK).toBe(5);
+    expect(mainnet?.networkTag).toBe("1-4d827d40dd9655db");
     expect(mainnet?.allowsLegacyAddress).toBe(false);
 
     const devnet = getChainConfig(CHAIN_IDS.DEVNET);
@@ -35,6 +39,7 @@ describe("chains configuration", () => {
     expect(devnet?.name).toBe("Devnet");
     expect(devnet?.consensus).toBe("Mysticeti");
     expect(devnet?.ghostdagK).toBeUndefined();
+    expect(devnet?.networkTag).toBeUndefined();
     expect(devnet?.allowsLegacyAddress).toBe(true);
 
     const testnet = getChainConfig(CHAIN_IDS.TESTNET);
@@ -43,6 +48,7 @@ describe("chains configuration", () => {
     expect(testnet?.consensus).toBe("Hybrid PoW + GHOSTDAG");
     expect(testnet?.targetBlockTimeMs).toBe(4000);
     expect(testnet?.ghostdagK).toBe(5);
+    expect(testnet?.networkTag).toBe("2-acfdf6a6c80fd28a");
     expect(testnet?.allowsLegacyAddress).toBe(false);
   });
 
