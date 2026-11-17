@@ -14,7 +14,7 @@ describe("chains configuration", () => {
     expect(CHAIN_IDS.HYBRID_TESTNET).toBe(2);
     expect(CHAIN_IDS.DEVNET).toBe(3);
     expect(NETWORK_TAGS.MAINNET).toBe("1-f35df34c92001436");
-    expect(NETWORK_TAGS.TESTNET).toBe("2-acfdf6a6c80fd28a");
+    expect(NETWORK_TAGS.TESTNET).toBe("2-24cdb5fadd98b207");
     expect("LOCAL" in CHAIN_IDS).toBe(false);
     expect("TESTNET_V2" in CHAIN_IDS).toBe(false);
     expect(KNOWN_CHAINS[4]).toBeUndefined();
@@ -48,7 +48,7 @@ describe("chains configuration", () => {
     expect(testnet?.consensus).toBe("Hybrid PoW + GHOSTDAG");
     expect(testnet?.targetBlockTimeMs).toBe(4000);
     expect(testnet?.ghostdagK).toBe(5);
-    expect(testnet?.networkTag).toBe("2-acfdf6a6c80fd28a");
+    expect(testnet?.networkTag).toBe("2-24cdb5fadd98b207");
     expect(testnet?.allowsLegacyAddress).toBe(false);
   });
 

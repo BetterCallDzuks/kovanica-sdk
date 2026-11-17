@@ -13,7 +13,7 @@ Typed, lightweight TypeScript client and utilities for the **Kovanica (KVNC)** L
 - **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`d2239fd8314a0c6edb08d54724738d662d406a32`](https://github.com/KovanicaDAG/kovanica-l1/commit/d2239fd8314a0c6edb08d54724738d662d406a32).
 - **Lossless Precision (Large Integers):** Kovanica balances, heights, stakes, nonces, and gas rates are represented losslessly as native JavaScript `bigint`. Never coerced into IEEE-754 `Number`. Plain JSON integers up to `u64::MAX` are preserved losslessly.
 - **PRO-21 Address Support:** Canonical 64-character `kvnc...dag` base32 addresses (256-bit Ed25519 public key + 29-bit `blake3` checksum) and chain-aware validation.
-- **Chain Registry:** Verified chain ID metadata for the canonical chains: Mainnet (`1`, Hybrid PoW + GHOSTDAG, official network tag `1-f35df34c92001436`, strict PRO-21), Testnet (`2`, Hybrid PoW + GHOSTDAG, official network tag `2-acfdf6a6c80fd28a`, strict PRO-21, alias `HYBRID_TESTNET = 2`), and Devnet (`3`, Mysticeti, legacy hex allowed, also used for local testing).
+- **Chain Registry:** Verified chain ID metadata for the canonical chains: Mainnet (`1`, Hybrid PoW + GHOSTDAG, official network tag `1-f35df34c92001436`, strict PRO-21), Testnet (`2`, Hybrid PoW + GHOSTDAG, official network tag `2-24cdb5fadd98b207`, strict PRO-21, alias `HYBRID_TESTNET = 2`), and Devnet (`3`, Mysticeti, legacy hex allowed, also used for local testing).
 - **Hybrid PoW & DAG Queries:** First-class typed support for `kovanica_getMiningInfo` and `kovanica_getDagTips` on Mainnet (Chain 1) and Testnet (Chain 2) (Hybrid PoW + GHOSTDAG).
 
 ---
@@ -173,7 +173,7 @@ The L1 RPC returns `SyncStatus` with `#[serde(rename_all = "camelCase")]`:
 - `behindBy`: `u64` (omitted if not catching up)
 - `peerCount`: `usize` (plain integer)
 - `peers`: array of `SyncPeerStatus` (`peerId`: string, `reportedTipRound`: optional `u64`)
-- `networkTag`: `<chain_id>-<16 hex chars>` (official frozen tags: Mainnet `1-f35df34c92001436`, Testnet `2-acfdf6a6c80fd28a`)
+- `networkTag`: `<chain_id>-<16 hex chars>` (official frozen tags: Mainnet `1-f35df34c92001436`, Testnet `2-24cdb5fadd98b207`)
 
 ### Synchronization State Semantics
 In Kovanica L1, **`catchingUp === false` alone is insufficient** to conclude a node is in sync:
@@ -189,7 +189,7 @@ In Kovanica L1, **`catchingUp === false` alone is insufficient** to conclude a n
 | Chain ID | Name | Network Tag | Consensus | Target Block | Address Rule |
 | :---: | :--- | :---: | :--- | :---: | :--- |
 | `1` | **Mainnet** | `1-f35df34c92001436` | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
-| `2` | **Testnet** (`HYBRID_TESTNET` alias) | `2-acfdf6a6c80fd28a` | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
+| `2` | **Testnet** (`HYBRID_TESTNET` alias) | `2-24cdb5fadd98b207` | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
 | `3` | **Devnet** | `3-<16 hex chars>` (ephemeral) | Mysticeti | 4 s | PRO-21 base32 and legacy hex allowed |
 
 > [!NOTE]

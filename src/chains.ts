@@ -13,7 +13,7 @@ export const CHAIN_IDS = {
 
 export const NETWORK_TAGS = {
   MAINNET: "1-f35df34c92001436",
-  TESTNET: "2-acfdf6a6c80fd28a",
+  TESTNET: "2-24cdb5fadd98b207",
 } as const;
 
 export type ChainId = (typeof CHAIN_IDS)[keyof typeof CHAIN_IDS] | number;
@@ -60,7 +60,7 @@ export const KNOWN_CHAINS: Record<number, ChainConfig> = {
     allowsLegacyAddress: false,
     defaultRpcUrl: "http://127.0.0.1:8545/rpc",
     description:
-      "Kovanica Testnet (Hybrid PoW + GHOSTDAG, KovanicaHash, target 4s, K=5, network tag 2-acfdf6a6c80fd28a). Strict PRO-21 base32 addresses only.",
+      "Kovanica Testnet (Hybrid PoW + GHOSTDAG, KovanicaHash, target 4s, K=5, network tag 2-24cdb5fadd98b207). Strict PRO-21 base32 addresses only.",
   },
   [CHAIN_IDS.DEVNET]: {
     chainId: CHAIN_IDS.DEVNET,
