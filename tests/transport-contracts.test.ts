@@ -1290,6 +1290,11 @@ describe("Transport Contracts & Precision Verification", () => {
         invoke: (client) => client.getStake(TEST_ADDRESS),
       },
       {
+        method: "kovanica_getRewards",
+        reason: "staking rewards are not used on hybrid networks",
+        invoke: (client) => client.getRewards(TEST_ADDRESS),
+      },
+      {
         method: "kovanica_getLeaderSchedule",
         reason: "there is no committee leader schedule",
         invoke: (client) => client.getLeaderSchedule(4),
@@ -1340,6 +1345,7 @@ describe("Transport Contracts & Precision Verification", () => {
           const rpcError = error as KovanicaRpcError;
           expect(rpcError.code).toBe(RpcErrorCode.InvalidRequest);
           expect(rpcError.isInvalidRequest()).toBe(true);
+          expect(rpcError.isHybridUnsupported()).toBe(true);
           expect(rpcError.isMethodNotFound()).toBe(false);
           expect(rpcError.message).toContain(entry.method);
           expect(rpcError.message).toContain(`chain_id ${chainId}`);

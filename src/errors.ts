@@ -50,6 +50,14 @@ export class KovanicaRpcError extends KovanicaError {
     return this.code === RpcErrorCode.InvalidRequest;
   }
 
+  /**
+   * True when the RPC call is rejected because the network runs Hybrid PoW + GHOSTDAG
+   * without PoS validators, staking, or committee leader schedules (-32600).
+   */
+  isHybridUnsupported(): boolean {
+    return this.code === RpcErrorCode.InvalidRequest;
+  }
+
   isInvalidParams(): boolean {
     return this.code === RpcErrorCode.InvalidParams;
   }

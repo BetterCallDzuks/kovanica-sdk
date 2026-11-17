@@ -1,7 +1,7 @@
 /**
  * Chain IDs and configuration for Kovanica networks.
  * Verified against crates/kovanica-params/src/lib.rs, crates/kovanica-types/src/signing.rs,
- * and mainnet/genesis.json at commit d2239fd8314a0c6edb08d54724738d662d406a32.
+ * and mainnet/genesis.json at commit 9a3813cd3f61c8a99d33457eb4eb0dbeef6826d1.
  */
 
 export const CHAIN_IDS = {
@@ -12,7 +12,7 @@ export const CHAIN_IDS = {
 } as const;
 
 export const NETWORK_TAGS = {
-  MAINNET: "1-4d827d40dd9655db",
+  MAINNET: "1-f35df34c92001436",
   TESTNET: "2-acfdf6a6c80fd28a",
 } as const;
 
@@ -46,7 +46,7 @@ export const KNOWN_CHAINS: Record<number, ChainConfig> = {
     networkTag: NETWORK_TAGS.MAINNET,
     allowsLegacyAddress: false,
     description:
-      "Kovanica Mainnet (Hybrid PoW + GHOSTDAG, KovanicaHash, target 4s, K=5, network tag 1-4d827d40dd9655db). Strict PRO-21 base32 addresses only.",
+      "Kovanica Mainnet (Hybrid PoW + GHOSTDAG, KovanicaHash, target 4s, K=5, network tag 1-f35df34c92001436). Strict PRO-21 base32 addresses only.",
   },
   [CHAIN_IDS.TESTNET]: {
     chainId: CHAIN_IDS.TESTNET,

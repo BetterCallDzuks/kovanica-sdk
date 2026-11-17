@@ -5,7 +5,7 @@ All notable changes to `kovanica-sdk` are documented in this file.
 ## [Unreleased]
 
 ### Added
-- Official frozen `networkTag` metadata on `ChainConfig` and `NETWORK_TAGS` (`MAINNET: "1-4d827d40dd9655db"`, `TESTNET: "2-acfdf6a6c80fd28a"`) following the L1 #290 (`P4-3`) mainnet genesis ceremony.
+- Official frozen `networkTag` metadata on `ChainConfig` and `NETWORK_TAGS` (`MAINNET: "1-f35df34c92001436"`, `TESTNET: "2-acfdf6a6c80fd28a"`) following the L1 #290 (`P4-3`) mainnet genesis ceremony.
 - `KovanicaRpcError.isInvalidRequest()` to classify JSON-RPC `-32600` rejections as "method exists but is not applicable on this network".
 - Deterministic tests asserting that `getValidators`, `getStake`, and `getLeaderSchedule` surface the L1 #272 hybrid-chain rejection as `KovanicaRpcError` (`-32600`) on Chains `1` and `2`, never as `[]` or `0n`, with a Devnet (`3`) pass-through control.
 
