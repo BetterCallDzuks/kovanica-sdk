@@ -18,6 +18,14 @@ import type {
   ValidatorInfo,
 } from "./types";
 import { parseQuantity, toHexQuantity } from "./units";
+import {
+  type CallTxKind,
+  type CallTxKindInput,
+  type SignedTxResult,
+  buildCallTxKind,
+  signCallContractTransaction,
+} from "./contracts";
+import { getPublicKey } from "./wallet";
 
 export interface KovanicaClientOptions extends HttpTransportOptions {
   /** Optional custom transport. If provided, `url` and transport options are ignored. */
@@ -262,6 +270,46 @@ export class KovanicaClient {
   async estimateFee(options?: RequestOptions): Promise<bigint> {
     const raw = await this.call<unknown>("kovanica_estimateFee", [], options);
     return parseQuantity(raw);
+  }
+
+  /**
+   * Submits a serialized, signed raw transaction hex to the mempool.
+   * RPC: `kovanica_sendRawTransaction`
+   */
+  async sendRawTransaction(rawHex: string, options?: RequestOptions): Promise<string> {
+    const normalized = rawHex.startsWith("0x") ? rawHex : `0x${rawHex}`;
+    return this.call<string>("kovanica_sendRawTransaction", [normalized], options);
+  }
+
+  /**
+   * Constructs a validated CallTxKind with default gas limits.
+   */
+  buildCallTransaction(call: CallTxKindInput): CallTxKind {
+    return buildCallTxKind(call);
+  }
+
+  /**
+   * Constructs and signs a Call contract transaction for a sender.
+   */
+  signCallTransaction(
+    senderSecretKey: Uint8Array,
+    call: CallTxKind | CallTxKindInput,
+    options: {
+      nonce: bigint | number;
+      fee: bigint | number;
+      sender?: Uint8Array | string;
+      chainId?: number;
+    },
+  ): SignedTxResult {
+    const sender = options.sender ?? getPublicKey(senderSecretKey);
+    return signCallContractTransaction({
+      sender,
+      secretKey: senderSecretKey,
+      call,
+      nonce: options.nonce,
+      fee: options.fee,
+      chainId: options.chainId,
+    });
   }
 
   // ==========================================================================

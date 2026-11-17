@@ -12,7 +12,17 @@
 import { hmac } from "@noble/hashes/hmac.js";
 import { pbkdf2 } from "@noble/hashes/pbkdf2.js";
 import { sha512 } from "@noble/hashes/sha2.js";
-import { ADDRESS_PREFIX, encodeAddress } from "./address";
+import { ADDRESS_PREFIX, TESTNET_ADDRESS_PREFIX, encodeAddress } from "./address";
+import { CHAIN_IDS } from "./chains";
+import type { KovanicaClient } from "./client";
+import {
+  type CallTxKind,
+  type CallTxKindInput,
+  type SignedTxResult,
+  signCallContractTransaction,
+  signEd25519,
+} from "./contracts";
+import type { RequestOptions } from "./types";
 
 /// Standard BIP-44 purpose constant for HD derivation (44).
 export const BIP44_PURPOSE = 44;
@@ -335,4 +345,110 @@ export function addressFromSeed(
     address,
     path,
   };
+}
+
+/**
+ * High-level wallet representation for key management, transaction signing, and contract interactions.
+ */
+export class KovanicaWallet {
+  readonly secretKey: Uint8Array;
+  readonly publicKey: Uint8Array;
+  readonly address: string;
+  readonly chainId: number;
+  readonly client?: KovanicaClient;
+
+  constructor(
+    secretKey: Uint8Array,
+    options: { chainId?: number; client?: KovanicaClient } = {},
+  ) {
+    if (secretKey.length !== 32) {
+      throw new Error(`Secret key must be 32 bytes, got ${secretKey.length}`);
+    }
+    this.secretKey = new Uint8Array(secretKey);
+    this.publicKey = getPublicKey(this.secretKey);
+    this.chainId = options.chainId ?? CHAIN_IDS.MAINNET;
+    this.address = encodeAddress(
+      this.publicKey,
+      this.chainId === CHAIN_IDS.TESTNET ? TESTNET_ADDRESS_PREFIX : ADDRESS_PREFIX,
+    );
+    this.client = options.client;
+  }
+
+  static fromSeed(
+    seed64: Uint8Array,
+    account = 0,
+    change = 0,
+    index = 0,
+    coinType = KOVANICA_COIN_TYPE,
+    options: { chainId?: number; client?: KovanicaClient } = {},
+  ): KovanicaWallet {
+    const node = deriveBip44(seed64, account, change, index, coinType);
+    const wallet = new KovanicaWallet(node.key, options);
+    wipe(node.chainCode);
+    return wallet;
+  }
+
+  static fromMnemonic(
+    mnemonic: string,
+    passphrase = "",
+    account = 0,
+    change = 0,
+    index = 0,
+    coinType = KOVANICA_COIN_TYPE,
+    options: { chainId?: number; client?: KovanicaClient } = {},
+  ): KovanicaWallet {
+    const seed = bip39Seed(mnemonic, passphrase);
+    const wallet = KovanicaWallet.fromSeed(seed, account, change, index, coinType, options);
+    wipe(seed);
+    return wallet;
+  }
+
+  /**
+   * Signs an arbitrary byte message using pure Ed25519 (RFC 8032).
+   */
+  sign(message: Uint8Array): Uint8Array {
+    return signEd25519(message, this.secretKey);
+  }
+
+  /**
+   * Constructs and signs a Call contract transaction.
+   */
+  signCallTransaction(
+    call: CallTxKind | CallTxKindInput,
+    options: { nonce: bigint | number; fee: bigint | number; chainId?: number },
+  ): SignedTxResult {
+    return signCallContractTransaction({
+      sender: this.publicKey,
+      secretKey: this.secretKey,
+      call,
+      nonce: options.nonce,
+      fee: options.fee,
+      chainId: options.chainId ?? this.chainId,
+    });
+  }
+
+  /**
+   * Constructs, signs, and broadcasts a Call contract transaction using the attached client.
+   */
+  async sendCallTransaction(
+    call: CallTxKind | CallTxKindInput,
+    options: {
+      nonce?: bigint | number;
+      fee?: bigint | number;
+      chainId?: number;
+      requestOptions?: RequestOptions;
+    } = {},
+  ): Promise<string> {
+    if (!this.client) {
+      throw new Error("Cannot send transaction: no KovanicaClient attached to KovanicaWallet");
+    }
+    const nonce = options.nonce ?? (await this.client.getNonce(this.address, options.requestOptions));
+    const fee = options.fee ?? (await this.client.estimateFee(options.requestOptions));
+    const signed = this.signCallTransaction(call, {
+      nonce,
+      fee,
+      chainId: options.chainId ?? this.chainId,
+    });
+    return this.client.sendRawTransaction(`0x${signed.rawTxHex}`, options.requestOptions);
+  }
 }

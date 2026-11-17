@@ -1,0 +1,684 @@
+/**
+ * Canonical Smart Contract Argument Builders, Bincode Encoders & Transaction Signers
+ * Verified against crates/kovanica-execution/src/call_args.rs (PR #302, #305) and kovanica-playground (PR #21).
+ */
+
+import { blake3 } from "@noble/hashes/blake3.js";
+import { sha512 } from "@noble/hashes/sha2.js";
+import { decodeAddress } from "./address";
+import { CHAIN_IDS } from "./chains";
+
+// --- Domain Tags & Gas Limits ---
+
+export const DOMAIN_TAG_STR = "KVNC/tx/v1";
+export const KEYED_HASH_TAG_STR = "KVNC-TX-v1";
+
+export const DEFAULT_CALL_GAS_LIMIT = 100_000n;
+export const MAX_TX_GAS_LIMIT = 10_000_000n;
+
+export function asciiPad(str: string, len: number): Uint8Array {
+  const buf = new Uint8Array(len);
+  for (let i = 0; i < str.length && i < len; i++) {
+    buf[i] = str.charCodeAt(i);
+  }
+  return buf;
+}
+
+export const TX_DOMAIN = asciiPad(DOMAIN_TAG_STR, 16);
+export const TX_KEY = asciiPad(KEYED_HASH_TAG_STR, 32);
+
+// --- Little-Endian Numerical & Buffer Encoders ---
+
+export function concatBytes(arrays: Uint8Array[]): Uint8Array {
+  const total = arrays.reduce((acc, curr) => acc + curr.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const arr of arrays) {
+    out.set(arr, offset);
+    offset += arr.length;
+  }
+  return out;
+}
+
+export function bytesToHex(bytes: Uint8Array): string {
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i]!.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+export function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex;
+  if (clean.length % 2 !== 0) {
+    throw new Error(`Invalid hex string length: ${clean.length}`);
+  }
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    const val = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    if (Number.isNaN(val)) {
+      throw new Error(`Invalid byte '${clean.slice(i * 2, i * 2 + 2)}' in hex string`);
+    }
+    bytes[i] = val;
+  }
+  return bytes;
+}
+
+export function u32le(val: number | bigint): Uint8Array {
+  const num = Number(val);
+  if (!Number.isInteger(num) || num < 0 || num > 0xffffffff) {
+    throw new RangeError(`Value out of range for u32: ${val}`);
+  }
+  const buf = new Uint8Array(4);
+  new DataView(buf.buffer).setUint32(0, num, true);
+  return buf;
+}
+
+export function u64le(val: number | bigint): Uint8Array {
+  const b = BigInt(val);
+  if (b < 0n || b > 0xffffffffffffffffn) {
+    throw new RangeError(`Value out of range for u64: ${val}`);
+  }
+  const buf = new Uint8Array(8);
+  new DataView(buf.buffer).setBigUint64(0, b, true);
+  return buf;
+}
+
+export function u128le(val: number | bigint): Uint8Array {
+  const b = BigInt(val);
+  if (b < 0n || b > 0xffffffffffffffffffffffffffffffffn) {
+    throw new RangeError(`Value out of range for u128: ${val}`);
+  }
+  const buf = new Uint8Array(16);
+  const view = new DataView(buf.buffer);
+  const low = b & 0xffffffffffffffffn;
+  const high = b >> 64n;
+  view.setBigUint64(0, low, true);
+  view.setBigUint64(8, high, true);
+  return buf;
+}
+
+// --- Deterministic Bincode Encoders ---
+
+/**
+ * Encodes a string in canonical Bincode format: 8-byte little-endian length prefix followed by UTF-8 bytes.
+ */
+export function encodeBincodeString(str: string): Uint8Array {
+  const bytes = new TextEncoder().encode(str);
+  return concatBytes([u64le(BigInt(bytes.length)), bytes]);
+}
+
+/**
+ * Encodes a vector of 32-byte items in canonical Bincode format: 8-byte little-endian count prefix followed by 32-byte elements.
+ */
+export function encodeBincodeBytes32Vec(items: Uint8Array[]): Uint8Array {
+  const parts: Uint8Array[] = [u64le(BigInt(items.length))];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!;
+    if (item.length !== 32) {
+      throw new Error(`Expected 32-byte item, got ${item.length}`);
+    }
+    parts.push(item);
+  }
+  return concatBytes(parts);
+}
+
+/**
+ * Encodes a vector of strings in canonical Bincode format: 8-byte little-endian count prefix followed by each Bincode-encoded string.
+ */
+export function encodeBincodeStringVec(items: string[]): Uint8Array {
+  const parts: Uint8Array[] = [u64le(BigInt(items.length))];
+  for (const s of items) {
+    parts.push(encodeBincodeString(s));
+  }
+  return concatBytes(parts);
+}
+
+// --- Canonical Contract Call Payload Builders ---
+
+/**
+ * Encodes arguments for `name_register(name, pubkey, relay_endpoints)`.
+ * Wire layout: `(String, [u8; 32], Vec<String>)`
+ */
+export function buildNameRegisterCall(
+  name: string,
+  pubkey: Uint8Array,
+  relayEndpoints: string[],
+): Uint8Array {
+  if (pubkey.length !== 32) {
+    throw new Error(`Expected 32-byte pubkey, got ${pubkey.length}`);
+  }
+  return concatBytes([
+    encodeBincodeString(name),
+    pubkey,
+    encodeBincodeStringVec(relayEndpoints),
+  ]);
+}
+export const encodeNameRegisterArgs = buildNameRegisterCall;
+
+/**
+ * Encodes arguments for `htlc_create(hashlock, timelock, recipient)`.
+ * Wire layout: `([u8; 32], u64, [u8; 32])` (exact 72 bytes).
+ */
+export function buildHtlcCreateCall(
+  hashlock: Uint8Array,
+  timelock: bigint | number,
+  recipient: Uint8Array,
+): Uint8Array {
+  if (hashlock.length !== 32) {
+    throw new Error(`Expected 32-byte hashlock, got ${hashlock.length}`);
+  }
+  if (recipient.length !== 32) {
+    throw new Error(`Expected 32-byte recipient, got ${recipient.length}`);
+  }
+  if (BigInt(timelock) < 0n) {
+    throw new Error(`Timelock must be non-negative, got ${timelock}`);
+  }
+  return concatBytes([
+    hashlock,
+    u64le(timelock),
+    recipient,
+  ]);
+}
+export const encodeHtlcCreateArgs = buildHtlcCreateCall;
+
+/**
+ * Encodes arguments for `nft_mint(collection, to, token_id, token_uri)`.
+ * Wire layout: `([u8; 32], [u8; 32], u128, String)` (88 bytes header + token_uri bytes).
+ */
+export function buildNftMintCall(
+  collection: Uint8Array,
+  to: Uint8Array,
+  tokenId: bigint | number,
+  tokenUri: string,
+): Uint8Array {
+  if (collection.length !== 32) {
+    throw new Error(`Expected 32-byte collection, got ${collection.length}`);
+  }
+  if (to.length !== 32) {
+    throw new Error(`Expected 32-byte to pubkey, got ${to.length}`);
+  }
+  if (BigInt(tokenId) < 0n) {
+    throw new Error(`Token ID must be non-negative, got ${tokenId}`);
+  }
+  return concatBytes([
+    collection,
+    to,
+    u128le(tokenId),
+    encodeBincodeString(tokenUri),
+  ]);
+}
+export const encodeNftMintArgs = buildNftMintCall;
+
+/**
+ * Encodes arguments for `escrow_create(parties, threshold, amount, deadline)`.
+ * Wire layout: `(Vec<[u8; 32]>, u8, u64, u64)`.
+ */
+export function buildEscrowCreateCall(
+  parties: Uint8Array[],
+  threshold: number,
+  amount: bigint | number,
+  deadline: bigint | number,
+): Uint8Array {
+  if (!Number.isInteger(threshold) || threshold < 0 || threshold > 255) {
+    throw new Error(`Threshold must be between 0 and 255, got ${threshold}`);
+  }
+  if (threshold < 1) {
+    throw new Error(`Threshold must be at least 1, got ${threshold}`);
+  }
+  if (threshold > parties.length) {
+    throw new Error(`Threshold cannot exceed number of parties (${parties.length}), got ${threshold}`);
+  }
+  if (BigInt(amount) < 0n) {
+    throw new Error(`Amount must be non-negative, got ${amount}`);
+  }
+  if (BigInt(deadline) < 0n) {
+    throw new Error(`Deadline must be non-negative, got ${deadline}`);
+  }
+  return concatBytes([
+    encodeBincodeBytes32Vec(parties),
+    Uint8Array.of(threshold),
+    u64le(amount),
+    u64le(deadline),
+  ]);
+}
+export const encodeEscrowCreateArgs = buildEscrowCreateCall;
+
+// --- Call Transaction Builders ---
+
+export interface CallTxKind {
+  type: "call";
+  contract: Uint8Array;
+  method: string;
+  args: Uint8Array;
+  call_value: bigint;
+  gas_limit: bigint;
+  // Aliases for developer convenience
+  value: bigint;
+  gasLimit: bigint;
+}
+
+export interface CallTxKindInput {
+  contract: Uint8Array | string;
+  method: string;
+  args: Uint8Array;
+  call_value?: bigint | number;
+  value?: bigint | number;
+  gas_limit?: bigint | number;
+  gasLimit?: bigint | number;
+}
+
+export function parseContractAddress(contract: Uint8Array | string): Uint8Array {
+  if (contract instanceof Uint8Array) {
+    if (contract.length !== 32) {
+      throw new Error(`Expected 32-byte contract address, got ${contract.length}`);
+    }
+    return contract;
+  }
+  const trimmed = contract.trim();
+  if (trimmed.startsWith("kvnc") || trimmed.startsWith("tknc")) {
+    return decodeAddress(trimmed);
+  }
+  const bytes = hexToBytes(trimmed);
+  if (bytes.length !== 32) {
+    throw new Error(`Expected 32-byte contract address, got ${bytes.length}`);
+  }
+  return bytes;
+}
+
+export function buildCallTxKind(input: CallTxKindInput): CallTxKind {
+  const contract = parseContractAddress(input.contract);
+  const val = BigInt(input.call_value ?? input.value ?? 0n);
+  if (val < 0n) {
+    throw new Error(`call_value must be non-negative, got ${val}`);
+  }
+  const gas = BigInt(input.gas_limit ?? input.gasLimit ?? DEFAULT_CALL_GAS_LIMIT);
+  if (gas < 0n) {
+    throw new Error(`gas_limit must be non-negative, got ${gas}`);
+  }
+  if (gas > MAX_TX_GAS_LIMIT) {
+    throw new Error(`gas_limit ${gas} exceeds maximum allowed ${MAX_TX_GAS_LIMIT}`);
+  }
+
+  return {
+    type: "call",
+    contract,
+    method: input.method,
+    args: input.args,
+    call_value: val,
+    value: val,
+    gas_limit: gas,
+    gasLimit: gas,
+  };
+}
+
+export function buildNameRegisterCallTx(
+  contractPubkey: Uint8Array | string,
+  name: string,
+  pubkey: Uint8Array,
+  relayEndpoints: string[],
+  gasLimit: bigint | number = DEFAULT_CALL_GAS_LIMIT,
+): CallTxKind {
+  return buildCallTxKind({
+    contract: contractPubkey,
+    method: "name_register",
+    args: buildNameRegisterCall(name, pubkey, relayEndpoints),
+    gas_limit: gasLimit,
+  });
+}
+
+export function buildHtlcCreateCallTx(
+  contractPubkey: Uint8Array | string,
+  hashlock: Uint8Array,
+  timelock: bigint | number,
+  recipient: Uint8Array,
+  gasLimit: bigint | number = DEFAULT_CALL_GAS_LIMIT,
+): CallTxKind {
+  return buildCallTxKind({
+    contract: contractPubkey,
+    method: "htlc_create",
+    args: buildHtlcCreateCall(hashlock, timelock, recipient),
+    gas_limit: gasLimit,
+  });
+}
+
+export function buildNftMintCallTx(
+  contractPubkey: Uint8Array | string,
+  collection: Uint8Array,
+  to: Uint8Array,
+  tokenId: bigint | number,
+  tokenUri: string,
+  gasLimit: bigint | number = DEFAULT_CALL_GAS_LIMIT,
+): CallTxKind {
+  return buildCallTxKind({
+    contract: contractPubkey,
+    method: "nft_mint",
+    args: buildNftMintCall(collection, to, tokenId, tokenUri),
+    gas_limit: gasLimit,
+  });
+}
+
+export function buildEscrowCreateCallTx(
+  contractPubkey: Uint8Array | string,
+  parties: Uint8Array[],
+  threshold: number,
+  amount: bigint | number,
+  deadline: bigint | number,
+  gasLimit: bigint | number = DEFAULT_CALL_GAS_LIMIT,
+): CallTxKind {
+  return buildCallTxKind({
+    contract: contractPubkey,
+    method: "escrow_create",
+    args: buildEscrowCreateCall(parties, threshold, amount, deadline),
+    gas_limit: gasLimit,
+  });
+}
+
+export function buildTokenTransferCall(
+  contractPubkey: Uint8Array | string,
+  recipientPubkey: Uint8Array,
+  tokenUnits: bigint | number,
+  gasLimit: bigint | number = DEFAULT_CALL_GAS_LIMIT,
+): CallTxKind {
+  if (recipientPubkey.length !== 32) {
+    throw new Error(`Expected 32-byte recipient pubkey, got ${recipientPubkey.length}`);
+  }
+  return buildCallTxKind({
+    contract: contractPubkey,
+    method: "token_transfer",
+    args: concatBytes([recipientPubkey, u128le(tokenUnits)]),
+    gas_limit: gasLimit,
+  });
+}
+
+export function buildVaultCreateCall(
+  contractPubkey: Uint8Array | string,
+  beneficiaryPubkey: Uint8Array,
+  amountAtoms: bigint | number,
+  lockUntilMs: bigint | number,
+  gasLimit: bigint | number = DEFAULT_CALL_GAS_LIMIT,
+): CallTxKind {
+  if (beneficiaryPubkey.length !== 32) {
+    throw new Error(`Expected 32-byte beneficiary pubkey, got ${beneficiaryPubkey.length}`);
+  }
+  return buildCallTxKind({
+    contract: contractPubkey,
+    method: "vault_create",
+    args: concatBytes([
+      beneficiaryPubkey,
+      u128le(amountAtoms),
+      u32le(0),
+      u64le(lockUntilMs),
+    ]),
+    gas_limit: gasLimit,
+  });
+}
+
+// --- Transaction Signing & Bincode Serialization ---
+
+export interface SignedTxResult {
+  sighash: Uint8Array;
+  sighashHex: string;
+  signature: Uint8Array;
+  signatureHex: string;
+  rawTxBytes: Uint8Array;
+  rawTxHex: string;
+  txSize: number;
+}
+
+export function signingCallKindBytes(call: CallTxKind): Uint8Array {
+  const methodBytes = new TextEncoder().encode(call.method);
+  return concatBytes([
+    Uint8Array.of(4), // TransactionKind::Call tag in signing preimage
+    call.contract,
+    u64le(call.call_value),
+    u64le(BigInt(methodBytes.length)),
+    methodBytes,
+    u64le(BigInt(call.args.length)),
+    call.args,
+    u64le(call.gas_limit),
+  ]);
+}
+
+export function wireCallKindBytes(call: CallTxKind): Uint8Array {
+  const methodBytes = new TextEncoder().encode(call.method);
+  return concatBytes([
+    u32le(6), // TransactionKind::Call enum variant index in bincode
+    call.contract,
+    u64le(call.call_value),
+    u64le(BigInt(methodBytes.length)),
+    methodBytes,
+    u64le(BigInt(call.args.length)),
+    call.args,
+    u64le(call.gas_limit),
+  ]);
+}
+
+/**
+ * Computes the domain-tagged BLAKE3 signing hash for a Call transaction.
+ */
+export function computeCallTransactionSigningHash(
+  tx: {
+    sender: Uint8Array;
+    nonce: bigint | number;
+    call: CallTxKind;
+    fee: bigint | number;
+  },
+  chainId: number = CHAIN_IDS.MAINNET,
+): Uint8Array {
+  const preimage = concatBytes([
+    TX_DOMAIN,
+    u64le(BigInt(chainId)),
+    tx.sender,
+    u64le(tx.nonce),
+    signingCallKindBytes(tx.call),
+    u64le(tx.fee),
+  ]);
+  return blake3(preimage, { key: TX_KEY });
+}
+
+// --- Pure JS Ed25519 Signing Implementation ---
+
+const ED_P = 2n ** 255n - 19n;
+const ED_L = (1n << 252n) + 27742317777372353535851937790883648493n;
+
+function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
+  let res = 1n;
+  base = base % mod;
+  while (exp > 0n) {
+    if (exp % 2n === 1n) res = (res * base) % mod;
+    base = (base * base) % mod;
+    exp /= 2n;
+  }
+  return res;
+}
+
+function modInverse(n: bigint, m: bigint): bigint {
+  return modPow(n, m - 2n, m);
+}
+
+const ed_d = (-121665n * modInverse(121666n, ED_P)) % ED_P;
+const ed_d_mod = (ed_d + ED_P) % ED_P;
+const ed_I = modPow(2n, (ED_P - 1n) / 4n, ED_P);
+
+function recoverX(y: bigint): bigint {
+  const y2 = (y * y) % ED_P;
+  const u = (y2 - 1n + ED_P) % ED_P;
+  const v = (ed_d_mod * y2 + 1n) % ED_P;
+  let x = (u * modInverse(v, ED_P)) % ED_P;
+  x = modPow(x, (ED_P + 3n) / 8n, ED_P);
+  if ((x * x - u * modInverse(v, ED_P)) % ED_P !== 0n) {
+    x = (x * ed_I) % ED_P;
+  }
+  if (x % 2n !== 0n) x = ED_P - x;
+  return x;
+}
+
+const ed_By = (4n * modInverse(5n, ED_P)) % ED_P;
+const ed_Bx = recoverX(ed_By);
+type ExtendedPoint = [bigint, bigint, bigint, bigint];
+const ed_B: ExtendedPoint = [ed_Bx, ed_By, 1n, (ed_Bx * ed_By) % ED_P];
+
+function pointAdd(p1: ExtendedPoint, p2: ExtendedPoint): ExtendedPoint {
+  const [X1, Y1, Z1, T1] = p1;
+  const [X2, Y2, Z2, T2] = p2;
+  const A = ((Y1 - X1 + ED_P) * (Y2 - X2 + ED_P)) % ED_P;
+  const B_coord = ((Y1 + X1) * (Y2 + X2)) % ED_P;
+  const C = (2n * T1 * T2 * ed_d_mod) % ED_P;
+  const D = (2n * Z1 * Z2) % ED_P;
+  const E = (B_coord - A + ED_P) % ED_P;
+  const F = (D - C + ED_P) % ED_P;
+  const G = (D + C) % ED_P;
+  const H = (B_coord + A) % ED_P;
+  return [(E * F) % ED_P, (G * H) % ED_P, (F * G) % ED_P, (E * H) % ED_P];
+}
+
+function pointDouble(p: ExtendedPoint): ExtendedPoint {
+  const [X1, Y1, Z1] = p;
+  const A = (X1 * X1) % ED_P;
+  const B_coord = (Y1 * Y1) % ED_P;
+  const C = (2n * Z1 * Z1) % ED_P;
+  const D = (ED_P - A) % ED_P;
+  const E = ((X1 + Y1) * (X1 + Y1) - A - B_coord + 2n * ED_P) % ED_P;
+  const G = (D + B_coord) % ED_P;
+  const F = (G - C + ED_P) % ED_P;
+  const H = (D - B_coord + ED_P) % ED_P;
+  return [(E * F) % ED_P, (G * H) % ED_P, (F * G) % ED_P, (E * H) % ED_P];
+}
+
+function scalarMult(k: bigint, pt: ExtendedPoint): ExtendedPoint {
+  let r: ExtendedPoint = [0n, 1n, 1n, 0n];
+  let base = pt;
+  let tempK = k;
+  while (tempK > 0n) {
+    if (tempK & 1n) r = pointAdd(r, base);
+    base = pointDouble(base);
+    tempK >>= 1n;
+  }
+  return r;
+}
+
+function pointToBytes(pt: ExtendedPoint): Uint8Array {
+  const [X, Y, Z] = pt;
+  const zInv = modInverse(Z, ED_P);
+  const x = (X * zInv) % ED_P;
+  const y = (Y * zInv) % ED_P;
+  const pub = new Uint8Array(32);
+  let tempY = y;
+  for (let i = 0; i < 32; i++) {
+    pub[i] = Number(tempY & 0xffn);
+    tempY >>= 8n;
+  }
+  if (x & 1n) {
+    pub[31]! |= 0x80;
+  }
+  return pub;
+}
+
+function bytesToBigintLE(bytes: Uint8Array): bigint {
+  let res = 0n;
+  for (let i = 0; i < bytes.length; i++) {
+    res |= BigInt(bytes[i]!) << BigInt(8 * i);
+  }
+  return res;
+}
+
+function bigintToBytesLE(num: bigint, len = 32): Uint8Array {
+  const out = new Uint8Array(len);
+  let temp = num;
+  for (let i = 0; i < len; i++) {
+    out[i] = Number(temp & 0xffn);
+    temp >>= 8n;
+  }
+  return out;
+}
+
+/**
+ * Pure TypeScript Ed25519 signature computation adhering to RFC 8032.
+ */
+export function signEd25519(message: Uint8Array, secretKey: Uint8Array): Uint8Array {
+  if (secretKey.length !== 32) {
+    throw new Error(`Secret key must be 32 bytes, got ${secretKey.length}`);
+  }
+  const hash = sha512(secretKey);
+  const clamped = new Uint8Array(hash.slice(0, 32));
+  clamped[0] &= 248;
+  clamped[31] &= 127;
+  clamped[31] |= 64;
+
+  const a = bytesToBigintLE(clamped);
+  const A = pointToBytes(scalarMult(a, ed_B));
+  const prefix = hash.slice(32, 64);
+
+  const rHash = sha512(concatBytes([prefix, message]));
+  const r = bytesToBigintLE(rHash) % ED_L;
+  const R = pointToBytes(scalarMult(r, ed_B));
+
+  const kHash = sha512(concatBytes([R, A, message]));
+  const k = bytesToBigintLE(kHash) % ED_L;
+  const s = (r + k * a) % ED_L;
+
+  clamped.fill(0);
+  return concatBytes([R, bigintToBytesLE(s, 32)]);
+}
+
+/**
+ * Constructs and signs a Call contract transaction.
+ */
+export function signCallContractTransaction(params: {
+  sender: Uint8Array | string;
+  secretKey: Uint8Array;
+  call: CallTxKind | CallTxKindInput;
+  nonce: bigint | number;
+  fee: bigint | number;
+  chainId?: number;
+}): SignedTxResult {
+  const senderBytes =
+    params.sender instanceof Uint8Array
+      ? params.sender
+      : parseContractAddress(params.sender);
+
+  if (senderBytes.length !== 32) {
+    throw new Error(`Sender must be 32 bytes, got ${senderBytes.length}`);
+  }
+  if (params.secretKey.length !== 32) {
+    throw new Error(`Secret key must be 32 bytes, got ${params.secretKey.length}`);
+  }
+
+  const callKind = "call_value" in params.call && "gas_limit" in params.call
+    ? (params.call as CallTxKind)
+    : buildCallTxKind(params.call);
+
+  const chainId = params.chainId ?? CHAIN_IDS.MAINNET;
+  const sighash = computeCallTransactionSigningHash(
+    {
+      sender: senderBytes,
+      nonce: params.nonce,
+      call: callKind,
+      fee: params.fee,
+    },
+    chainId,
+  );
+
+  const signature = signEd25519(sighash, params.secretKey);
+
+  const rawTxBytes = concatBytes([
+    senderBytes,
+    u64le(params.nonce),
+    wireCallKindBytes(callKind),
+    u64le(params.fee),
+    u64le(64n), // u64 LE length prefix for Signature in bincode
+    signature,
+    sighash,
+  ]);
+
+  return {
+    sighash,
+    sighashHex: bytesToHex(sighash),
+    signature,
+    signatureHex: bytesToHex(signature),
+    rawTxBytes,
+    rawTxHex: bytesToHex(rawTxBytes),
+    txSize: rawTxBytes.length,
+  };
+}
