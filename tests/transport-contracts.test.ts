@@ -1261,4 +1261,136 @@ describe("Transport Contracts & Precision Verification", () => {
       expect(executed.block!.number).toBe(5n);
     });
   });
+
+  // ==========================================================================
+  // E. Hybrid PoW + GHOSTDAG rejection of legacy staking RPCs (L1 #272)
+  // ==========================================================================
+
+  describe("E. Hybrid PoW + GHOSTDAG legacy staking RPC rejection (L1 #272)", () => {
+    // L1 commit 4181fc6 (PR #272): `reject_on_hybrid` returns
+    // RpcError::InvalidRequest (-32600) for these methods on chains 1 and 2.
+    const HYBRID_CHAINS: number[] = [CHAIN_IDS.MAINNET, CHAIN_IDS.TESTNET];
+    const TEST_ADDRESS = "kvnc" + "a".repeat(50) + "dag";
+
+    interface LegacyMethodCase {
+      method: string;
+      reason: string;
+      invoke: (client: KovanicaClient) => Promise<unknown>;
+    }
+
+    const LEGACY_METHODS: LegacyMethodCase[] = [
+      {
+        method: "kovanica_getValidators",
+        reason: "there is no validator set",
+        invoke: (client) => client.getValidators(),
+      },
+      {
+        method: "kovanica_getStake",
+        reason: "stake is not used for consensus",
+        invoke: (client) => client.getStake(TEST_ADDRESS),
+      },
+      {
+        method: "kovanica_getLeaderSchedule",
+        reason: "there is no committee leader schedule",
+        invoke: (client) => client.getLeaderSchedule(4),
+      },
+    ];
+
+    function hybridRejectionHandler(chainId: number) {
+      return async (req: http.IncomingMessage, res: http.ServerResponse) => {
+        const body = await readRequestBody(req);
+        const entry = LEGACY_METHODS.find((m) => m.method === body.method);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        if (!entry) {
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: body.id,
+              error: { code: RpcErrorCode.MethodNotFound, message: "Method not found" },
+            }),
+          );
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            error: {
+              code: RpcErrorCode.InvalidRequest,
+              message: `${entry.method} is not available on hybrid PoW + GHOSTDAG networks (chain_id ${chainId}); ${entry.reason}`,
+            },
+          }),
+        );
+      };
+    }
+
+    it("rejects getValidators, getStake, and getLeaderSchedule on chains 1 and 2 with -32600", async () => {
+      const client = new KovanicaClient({ url: serverUrl });
+
+      for (const chainId of HYBRID_CHAINS) {
+        nextHandler = hybridRejectionHandler(chainId);
+
+        for (const entry of LEGACY_METHODS) {
+          const error = await entry.invoke(client).then(
+            () => null,
+            (e: unknown) => e,
+          );
+
+          expect(error).toBeInstanceOf(KovanicaRpcError);
+          const rpcError = error as KovanicaRpcError;
+          expect(rpcError.code).toBe(RpcErrorCode.InvalidRequest);
+          expect(rpcError.isInvalidRequest()).toBe(true);
+          expect(rpcError.isMethodNotFound()).toBe(false);
+          expect(rpcError.message).toContain(entry.method);
+          expect(rpcError.message).toContain(`chain_id ${chainId}`);
+          expect(rpcError.message).toContain(entry.reason);
+        }
+      }
+    });
+
+    it("keeps devnet (chain 3) responses intact so the rejection is chain-scoped", async () => {
+      const client = new KovanicaClient({ url: serverUrl });
+      const payoutAddress = "kvnc" + "b".repeat(50) + "dag";
+
+      nextHandler = async (req, res) => {
+        const body = await readRequestBody(req);
+        let result: unknown;
+        switch (body.method) {
+          case "kovanica_getValidators":
+            result = [
+              {
+                address: TEST_ADDRESS,
+                stake: "0x5",
+                commission_bps: 100,
+                active: true,
+                payout_address: payoutAddress,
+              },
+            ];
+            break;
+          case "kovanica_getStake":
+            result = "0x2a";
+            break;
+          case "kovanica_getLeaderSchedule":
+            result = [{ round: "0x6", leader_index: 1, leader_address: payoutAddress }];
+            break;
+          default:
+            result = null;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+      };
+
+      const validators = await client.getValidators();
+      expect(validators).toHaveLength(1);
+      expect(validators[0]?.stake).toBe(5n);
+
+      expect(await client.getStake(TEST_ADDRESS)).toBe(42n);
+
+      const schedule = await client.getLeaderSchedule(1);
+      expect(schedule).toHaveLength(1);
+      expect(schedule[0]?.round).toBe(6n);
+      expect(schedule[0]?.leaderIndex).toBe(1);
+      expect(schedule[0]?.leaderAddress).toBe(payoutAddress);
+    });
+  });
 });

@@ -38,6 +38,18 @@ export class KovanicaRpcError extends KovanicaError {
     return this.code === RpcErrorCode.MethodNotFound;
   }
 
+  /**
+   * True when the node rejected the request as not applicable (code `-32600`).
+   *
+   * Kovanica uses this for methods that exist but are unavailable on the
+   * served network — for example `kovanica_getValidators`,
+   * `kovanica_getStake`, and `kovanica_getLeaderSchedule` on the Hybrid
+   * PoW + GHOSTDAG chains `1` and `2`.
+   */
+  isInvalidRequest(): boolean {
+    return this.code === RpcErrorCode.InvalidRequest;
+  }
+
   isInvalidParams(): boolean {
     return this.code === RpcErrorCode.InvalidParams;
   }

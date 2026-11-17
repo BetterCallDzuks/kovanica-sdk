@@ -137,7 +137,7 @@ To prevent precision corruption:
 
 ## RPC Compatibility Matrix
 
-All methods are mapped directly to handlers in `crates/kovanica-rpc` verified at node commit [`511af88532dceebdf0349b63c6c4c898eee7ca6e`](https://github.com/KovanicaDAG/kovanica-l1/commit/511af88532dceebdf0349b63c6c4c898eee7ca6e):
+All methods are mapped directly to handlers in `crates/kovanica-rpc` verified at node commit [`de641f6f305287de56a42ee559d8f490afc8b7bd`](https://github.com/KovanicaDAG/kovanica-l1/commit/de641f6f305287de56a42ee559d8f490afc8b7bd):
 
 | JSON-RPC Method | SDK Client Method | Handler in `kovanica-rpc` | Supported Chains | Notes |
 | :--- | :--- | :--- | :--- | :--- |
@@ -152,10 +152,10 @@ All methods are mapped directly to handlers in `crates/kovanica-rpc` verified at
 | `kovanica_getTransactionReceipt` | `client.getTransactionReceipt(h)` | `handle_get_transaction_receipt` | 1, 2, 3, 1337 | Status, block execution receipt & gasUsed |
 | `kovanica_getPendingTransactions`| `client.getPendingTransactions()` | `handle_get_pending_transactions`| 1, 2, 3, 1337 | Mempool pending tx hashes |
 | `kovanica_estimateFee` | `client.estimateFee()` | `handle_estimate_fee` | 1, 2, 3, 1337 | Gas fee rate in atoms per byte |
-| `kovanica_getValidators` | `client.getValidators()` | `handle_get_validators` | 1, 2, 3, 1337 | Active validator set and stakes |
-| `kovanica_getStake` | `client.getStake(addr)` | `handle_get_stake` | 1, 2, 3, 1337 | Bonded stake amount |
+| `kovanica_getValidators` | `client.getValidators()` | `handle_get_validators` | 3, 1337 | Active validator set and stakes. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
+| `kovanica_getStake` | `client.getStake(addr)` | `handle_get_stake` | 3, 1337 | Bonded stake amount. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
 | `kovanica_getRewards` | `client.getRewards(addr)` | `handle_get_rewards` | 1, 2, 3, 1337 | Cumulative earned rewards |
-| `kovanica_getLeaderSchedule` | `client.getLeaderSchedule(count)` | `handle_get_leader_schedule` | 1, 2, 3, 1337 | Leader rounds schedule |
+| `kovanica_getLeaderSchedule` | `client.getLeaderSchedule(count)` | `handle_get_leader_schedule` | 3, 1337 | Leader rounds schedule. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
 | `kovanica_syncStatus` | `client.syncStatus()` | `handle_sync_status` | 1, 2, 3, 1337 | camelCase wire contract with peerId & reportedTipRound |
 | `kovanica_getMiningInfo` | `client.getMiningInfo()` | `handle_get_mining_info` | 1, 2 (Hybrid PoW) | Mining difficulty, DAA target |
 | `kovanica_getDagTips` | `client.getDagTips()` | `handle_get_dag_tips` | 1, 2 (Hybrid PoW) | Current DAG tip block hashes |
@@ -235,6 +235,7 @@ The deterministic test suite (`tests/transport-contracts.test.ts`) verifies clie
 - **Abrupt Connection Loss:** Socket termination mid-flight produces a `KovanicaTransportError` with sanitized credentials and without hanging.
 - **Client Recovery Across Failure Modes:** Verifies that after connection drops, timeouts, cancellation (`AbortSignal`), HTTP 500 responses, malformed JSON, or JSON-RPC errors, the same `KovanicaClient` instance cleanly recovers and processes subsequent requests with incrementing request IDs.
 - **Error Non-Conversion Contracts:** Failures, RPC errors, and absent results are **never converted** into `0n`, `0`, `[]`, or healthy node claims across `getBalance`, `getRewards`, `getStake`, `blockNumber`, `syncStatus`, `getValidators`, `getMiningInfo`, and `getDagTips`. Explicit zero values (`"0x0"`, `"0"`) remain distinct from missing data and are preserved as `0n`.
+- **Hybrid Rejection Contracts (L1 #272):** On hybrid PoW + GHOSTDAG chains `1` and `2`, `getValidators`, `getStake`, and `getLeaderSchedule` are rejected by the node with JSON-RPC code `-32600`. The deterministic suite asserts the SDK surfaces a `KovanicaRpcError` (with `isInvalidRequest() === true` and the method plus `chain_id` in the message) and never converts the rejection into `[]` or `0n`; devnet (`3`) responses are asserted to pass through unchanged.
 - **Synthetic Fixture Verification of Execution Assertions:** Tests the live execution assertion logic (`assertNonzeroExecutedState`) against synthetic fixtures (`SYNTHETIC_FIXTURE_*`), proving that a fixture reporting nonzero committed height but lacking executed author rewards (balance at unrewarded genesis liquid baseline `450_000_000_000_000n`) fails the execution assertion. Synthetic mock tests verify assertion logic offline and do not claim live DAA or node acceptance.
 
 ### 5. Test Modes and Outcome Meanings
@@ -251,11 +252,12 @@ The deterministic test suite (`tests/transport-contracts.test.ts`) verifies clie
 
 1. **Read-Only Surface:** This SDK implements the read-only JSON-RPC query surface. It does not construct or sign state-mutating transactions, light client proofs, or submit mining blocks.
 2. **Hybrid PoW Chains (1 & 2) for Mining:** `client.getMiningInfo()` and `client.getDagTips()` are supported on Mainnet (Chain ID 1) and Testnet (Chain ID 2, Hybrid PoW + GHOSTDAG). On non-hybrid chains, the node rejects these methods with code `-32600` or `-32601`.
-3. **Lossless Precision Range:** Integers on the wire up to `u64::MAX` (`18446744073709551615`) and 128-bit balances are parsed losslessly into `bigint`. Direct JavaScript `number` literals exceeding `Number.MAX_SAFE_INTEGER` will throw `TypeError` to guard against precision corruption.
+3. **Hybrid PoW Chains (1 & 2) Have No Staking:** `client.getValidators()`, `client.getStake()`, and `client.getLeaderSchedule()` are legacy (Mysticeti) methods. Since L1 #272 the node rejects them with code `-32600` (`InvalidRequest`) on Chains 1 & 2, and the SDK propagates a `KovanicaRpcError` (`err.isInvalidRequest() === true`) instead of returning `[]` or `0n`. They remain available on Devnet (`3`) and Local (`1337`).
+4. **Lossless Precision Range:** Integers on the wire up to `u64::MAX` (`18446744073709551615`) and 128-bit balances are parsed losslessly into `bigint`. Direct JavaScript `number` literals exceeding `Number.MAX_SAFE_INTEGER` will throw `TypeError` to guard against precision corruption.
 
 ---
 
 ## License Basis
 
 - **License:** MIT License (`LICENSE`).
-- **Basis:** Developed from scratch as a clean TypeScript client based on public protocol constants (`kovanica-params`) and the JSON-RPC interface specification (`kovanica-rpc`) verified at node commit [`511af88532dceebdf0349b63c6c4c898eee7ca6e`](https://github.com/KovanicaDAG/kovanica-l1/commit/511af88532dceebdf0349b63c6c4c898eee7ca6e). Contains no copied code from GPL-3.0 licensed consensus internals.
+- **Basis:** Developed from scratch as a clean TypeScript client based on public protocol constants (`kovanica-params`) and the JSON-RPC interface specification (`kovanica-rpc`) verified at node commit [`de641f6f305287de56a42ee559d8f490afc8b7bd`](https://github.com/KovanicaDAG/kovanica-l1/commit/de641f6f305287de56a42ee559d8f490afc8b7bd). Contains no copied code from GPL-3.0 licensed consensus internals.

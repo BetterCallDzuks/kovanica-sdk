@@ -271,6 +271,12 @@ export class KovanicaClient {
   /**
    * Returns the current validator set and their stake amounts.
    * RPC: `kovanica_getValidators`
+   *
+   * Legacy / non-hybrid chains only. On Hybrid PoW + GHOSTDAG chains
+   * (Mainnet `1` and Testnet `2`) there is no validator set, and the node
+   * rejects this call with JSON-RPC code `-32600` (`InvalidRequest`). The SDK
+   * surfaces that as a {@link KovanicaRpcError}; it never converts the
+   * rejection into an empty array.
    */
   async getValidators(options?: RequestOptions): Promise<ValidatorInfo[]> {
     const raw = await this.call<RawValidatorInfo[]>("kovanica_getValidators", [], options);
@@ -286,6 +292,12 @@ export class KovanicaClient {
   /**
    * Returns the bonded stake for a given address.
    * RPC: `kovanica_getStake`
+   *
+   * Legacy / non-hybrid chains only. Stake is not used for consensus on
+   * Hybrid PoW + GHOSTDAG chains (Mainnet `1` and Testnet `2`), where the
+   * node rejects this call with JSON-RPC code `-32600` (`InvalidRequest`).
+   * The SDK surfaces that as a {@link KovanicaRpcError}; it never converts the
+   * rejection into `0n`.
    */
   async getStake(address: string, options?: RequestOptions): Promise<bigint> {
     const raw = await this.call<unknown>("kovanica_getStake", [address], options);
@@ -304,6 +316,12 @@ export class KovanicaClient {
   /**
    * Returns the upcoming leader schedule.
    * RPC: `kovanica_getLeaderSchedule`
+   *
+   * Legacy / non-hybrid chains only. Hybrid PoW + GHOSTDAG chains (Mainnet `1`
+   * and Testnet `2`) have no committee leader schedule, and the node rejects
+   * this call with JSON-RPC code `-32600` (`InvalidRequest`). The SDK surfaces
+   * that as a {@link KovanicaRpcError}; it never converts the rejection into an
+   * empty array.
    */
   async getLeaderSchedule(count = 16, options?: RequestOptions): Promise<LeaderSlot[]> {
     const raw = await this.call<RawLeaderSlot[]>(
