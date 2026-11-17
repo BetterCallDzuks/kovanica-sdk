@@ -2,20 +2,40 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-17
 
 ### Added
-- Official frozen `networkTag` metadata on `ChainConfig` and `NETWORK_TAGS` (`MAINNET: "1-f35df34c92001436"`, `TESTNET: "2-24cdb5fadd98b207"`) following the L1 #290 (`P4-3`) mainnet genesis ceremony.
-- `KovanicaRpcError.isInvalidRequest()` to classify JSON-RPC `-32600` rejections as "method exists but is not applicable on this network".
+- **Canonical Smart Contract Argument Builders & Bincode Encoders** (`contracts.ts`):
+  - Deterministic Bincode encoders: `encodeBincodeString`, `encodeBincodeBytes32Vec`, `encodeBincodeStringVec`, and little-endian encoders `u32le`, `u64le`, `u128le`.
+  - Canonical call argument encoders and builders matching L1 and playground contracts:
+    - `buildNameRegisterCall` / `encodeNameRegisterArgs` (`name_register(name, pubkey, relay_endpoints)`)
+    - `buildHtlcCreateCall` / `encodeHtlcCreateArgs` (`htlc_create(hashlock, timelock, recipient)`)
+    - `buildNftMintCall` / `encodeNftMintArgs` (`nft_mint(collection, to, token_id, token_uri)`)
+    - `buildEscrowCreateCall` / `encodeEscrowCreateArgs` (`escrow_create(parties, threshold, amount, deadline)`)
+    - `buildTokenTransferCall` (`token_transfer(to, amount)`)
+    - `buildVaultCreateCall` (`vault_create(owner, lock_until)`)
+  - Gas limit constants: `DEFAULT_CALL_GAS_LIMIT = 100_000n`, `MAX_TX_GAS_LIMIT = 10_000_000n`.
+  - Domain-tagged BLAKE3 signing hash computation under `KVNC/tx/v1` (`TX_DOMAIN`) and `KVNC-TX-v1` (`TX_KEY`).
+  - Pure TypeScript RFC 8032 Ed25519 signer (`signEd25519`) and wire call contract transaction serializer (`signCallContractTransaction`).
+- **High-Level Wallet & Transaction Dispatch** (`wallet.ts`, `client.ts`):
+  - `KovanicaWallet`: BIP-39 mnemonic phrase / seed derivation, SLIP-0010 HD path derivation (`m/44'/3007'/0'/0/0`), address generation, message signing, and smart contract call transaction signing.
+  - `KovanicaClient`: Added `sendRawTransaction`, `buildCallTransaction`, and `signCallTransaction`.
+- **SLIP-0010 Key Derivation & Testnet Address Prefix Support** (`wallet.ts`, `address.ts`):
+  - Hardened SLIP-0010 derivation for Ed25519 using coin type `3007'` (`KOVANICA_COIN_TYPE`).
+  - Network-aware address prefixing: `kvnc...dag` on Mainnet (Chain 1) and Devnet (Chain 3), `testnet-kvnc...dag` on Testnet (Chain 2).
+- **Official Network Tag Metadata**:
+  - `MAINNET: "1-f35df34c92001436"`
+  - `TESTNET: "2-24cdb5fadd98b207"`
+- **RPC Error Classification**:
+  - `KovanicaRpcError.isInvalidRequest()` to classify JSON-RPC `-32600` rejections as "method exists but is not applicable on this network".
 - Deterministic tests asserting that `getValidators`, `getStake`, and `getLeaderSchedule` surface the L1 #272 hybrid-chain rejection as `KovanicaRpcError` (`-32600`) on Chains `1` and `2`, never as `[]` or `0n`, with a Devnet (`3`) pass-through control.
 
 ### Changed
-- Updated the verified `KovanicaDAG/kovanica-l1` reference commit to `d2239fd8314a0c6edb08d54724738d662d406a32` (post-#290/#291; previous: `de641f6f305287de56a42ee559d8f490afc8b7bd`).
+- Promoted SDK from read-only developer preview to full-featured client supporting key derivation, RFC 8032 signing, smart contract call builders, and transaction submission.
+- Updated the verified `KovanicaDAG/kovanica-l1` reference commit to `566da35`.
 - Retired chain ID `1337` (`LOCAL`) from `CHAIN_IDS`, `KNOWN_CHAINS`, and `isLegacyAddressAllowed()`; the canonical chain registry is now `1` (Mainnet), `2` (Testnet), and `3` (Devnet, also used for local testing).
 - Documented that `getValidators`, `getStake`, and `getLeaderSchedule` are legacy (Mysticeti) methods, and that hybrid PoW + GHOSTDAG Chains `1` & `2` reject them with `-32600` since L1 #272 (`4181fc6`). README compatibility matrix now lists `3` for these three methods.
-- Updated the verified `KovanicaDAG/kovanica-l1` RPC reference commit in `README.md` to `de641f6f305287de56a42ee559d8f490afc8b7bd` (previous: `511af88532dceebdf0349b63c6c4c898eee7ca6e`), which includes L1 #272 (`4181fc6`) rejecting legacy staking RPCs on hybrid Chains `1` & `2`.
-- Re-confirmed all 18 read-only JSON-RPC methods (`kovanica_blockNumber`, `kovanica_getBlockByNumber`, `kovanica_getBlockByHash`, `kovanica_getBalance`, `kovanica_getNonce`, `kovanica_getCode`, `kovanica_getStorageAt`, `kovanica_getTransactionByHash`, `kovanica_getTransactionReceipt`, `kovanica_getPendingTransactions`, `kovanica_estimateFee`, `kovanica_getValidators`, `kovanica_getStake`, `kovanica_getRewards`, `kovanica_getLeaderSchedule`, `kovanica_syncStatus`, `kovanica_getMiningInfo`, `kovanica_getDagTips`) match `crates/kovanica-rpc/src/lib.rs` and `crates/kovanica-rpc/src/chain_methods.rs`.
-- Confirmed `kovanica_getMiningInfo` and `kovanica_getDagTips` payloads match Hybrid PoW + GHOSTDAG (Chains 1 & 2), chain registry remains `1 / 2 / 3 / 1337` with strict PRO-21 enforcement on Chains 1 & 2, and the SDK remains strictly read-only (no private key derivation, transaction signing, or mining submit).
+
 
 ## [0.1.0] - 2026-11-14
 

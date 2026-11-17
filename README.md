@@ -1,16 +1,20 @@
 # kovanica-sdk
 
-Typed, lightweight TypeScript client and utilities for the **Kovanica (KVNC)** Layer-1 blockchain, suitable for modern browsers and Node.js (18+).
+Typed, lightweight TypeScript client and developer toolkit for the **Kovanica (KVNC)** Layer-1 blockchain, suitable for modern browsers and Node.js (18+).
 
 > [!NOTE]
-> **Developer Preview Notice:** This repository is an initial read-only developer preview. It does not contain private key derivation, transaction signing, hardware wallet connectors, or mining engines.
+> **Full Ecosystem Client (v0.3.0):** Features SLIP-0010 HD wallet derivation, canonical Wasmi smart contract call builders, deterministic Bincode encoders, RFC 8032 Ed25519 signing under domain `KVNC/tx/v1`, lossless JSON-RPC 2.0 transport, and transaction broadcasting.
 
 ---
 
 ## Features
 
 - **Standard JSON-RPC 2.0 Transport:** Configurable endpoint URL, automatic request IDs, configurable timeouts, caller-controlled cancellation (`AbortSignal`), and typed error classes.
-- **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`d2239fd8314a0c6edb08d54724738d662d406a32`](https://github.com/KovanicaDAG/kovanica-l1/commit/d2239fd8314a0c6edb08d54724738d662d406a32).
+- **Transaction Construction & Broadcasting:** High-level `KovanicaWallet` and `KovanicaClient` support for constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`.
+- **HD Wallet & Key Derivation (BIP-39 / SLIP-0010):** Standard BIP-44 path derivation with hardened Ed25519 (`m/44'/3007'/0'/0/0`), seed derivation, message signing, and network-aware address formatting.
+- **Canonical Smart Contract Argument Builders:** Deterministic Bincode encoders for core Wasmi contracts (`name_register`, `htlc_create`, `nft_mint`, `escrow_create`, `token_transfer`, `vault_create`) matching L1 node and playground specifications.
+- **Domain-Tagged Ed25519 Signing:** Pure TypeScript RFC 8032 Ed25519 signature computation with BLAKE3 domain hashing (`KVNC/tx/v1`).
+- **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`566da35`](https://github.com/KovanicaDAG/kovanica-l1/commit/566da35).
 - **Lossless Precision (Large Integers):** Kovanica balances, heights, stakes, nonces, and gas rates are represented losslessly as native JavaScript `bigint`. Never coerced into IEEE-754 `Number`. Plain JSON integers up to `u64::MAX` are preserved losslessly.
 - **PRO-21 Address Support:** Canonical 64-character `kvnc...dag` base32 addresses (256-bit Ed25519 public key + 29-bit `blake3` checksum) and chain-aware validation.
 - **Chain Registry:** Verified chain ID metadata for the canonical chains: Mainnet (`1`, Hybrid PoW + GHOSTDAG, official network tag `1-f35df34c92001436`, strict PRO-21), Testnet (`2`, Hybrid PoW + GHOSTDAG, official network tag `2-24cdb5fadd98b207`, strict PRO-21, alias `HYBRID_TESTNET = 2`), and Devnet (`3`, Mysticeti, legacy hex allowed, also used for local testing).
@@ -119,6 +123,62 @@ try {
 } finally {
   clearTimeout(timeout);
 }
+```
+
+### 5. HD Wallet Key Derivation (BIP-39 / SLIP-0010)
+
+```typescript
+import { KovanicaWallet, CHAIN_IDS } from "kovanica-sdk";
+
+// Create a new wallet from a BIP-39 mnemonic phrase
+const mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const wallet = KovanicaWallet.fromMnemonic(mnemonic);
+
+// Derives account index 0 under m/44'/3007'/0'/0/0
+const account = wallet.deriveAccount(0, CHAIN_IDS.TESTNET);
+console.log(`Address: ${account.address}`);
+console.log(`Public Key: ${account.publicKey}`);
+
+// Sign an arbitrary payload
+const signature = wallet.signMessage(new TextEncoder().encode("hello world"), 0);
+console.log(`Signature length: ${signature.length} bytes`);
+```
+
+### 6. Smart Contract Argument Builders & Call Dispatch
+
+```typescript
+import {
+  KovanicaClient,
+  KovanicaWallet,
+  buildNameRegisterCall,
+  buildHtlcCreateCall,
+  CHAIN_IDS,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+const wallet = KovanicaWallet.fromMnemonic("your seed phrase ...");
+
+// 1. Build canonical Name Register call payload
+const call = buildNameRegisterCall("alice", wallet.deriveAccount(0).publicKey, [
+  "127.0.0.1:8000",
+]);
+
+// 2. Sign transaction with domain-tagged BLAKE3 hash under KVNC/tx/v1
+const nonce = await client.getNonce(wallet.deriveAccount(0).address);
+const signedTx = wallet.signCallTransaction(
+  {
+    contract: call.contract,
+    method: call.method,
+    args: call.args,
+    gasLimit: call.gasLimit,
+    nonce,
+  },
+  0
+);
+
+// 3. Broadcast to node via JSON-RPC
+const txHash = await client.sendRawTransaction(signedTx.wireHex);
+console.log(`Broadcasted transaction hash: ${txHash}`);
 ```
 
 ---
@@ -249,7 +309,7 @@ The deterministic test suite (`tests/transport-contracts.test.ts`) verifies clie
 
 ## Compatibility Limits
 
-1. **Read-Only Surface:** This SDK implements the read-only JSON-RPC query surface. It does not construct or sign state-mutating transactions, light client proofs, or submit mining blocks.
+1. **Transaction Signing Surface:** This SDK implements standard SLIP-0010 key derivation, canonical smart contract call building, RFC 8032 Ed25519 signing under `KVNC/tx/v1`, and JSON-RPC transaction broadcasting via `sendRawTransaction`. Consensus block authoring and PoW hash mining remain node/miner level responsibilities.
 2. **Hybrid PoW Chains (1 & 2) for Mining:** `client.getMiningInfo()` and `client.getDagTips()` are supported on Mainnet (Chain ID 1) and Testnet (Chain ID 2, Hybrid PoW + GHOSTDAG). On non-hybrid chains, the node rejects these methods with code `-32600` or `-32601`.
 3. **Hybrid PoW Chains (1 & 2) Have No Staking:** `client.getValidators()`, `client.getStake()`, and `client.getLeaderSchedule()` are legacy (Mysticeti) methods. Since L1 #272 the node rejects them with code `-32600` (`InvalidRequest`) on Chains 1 & 2, and the SDK propagates a `KovanicaRpcError` (`err.isInvalidRequest() === true`) instead of returning `[]` or `0n`. They remain available on Devnet (`3`).
 4. **Lossless Precision Range:** Integers on the wire up to `u64::MAX` (`18446744073709551615`) and 128-bit balances are parsed losslessly into `bigint`. Direct JavaScript `number` literals exceeding `Number.MAX_SAFE_INTEGER` will throw `TypeError` to guard against precision corruption.
@@ -259,4 +319,4 @@ The deterministic test suite (`tests/transport-contracts.test.ts`) verifies clie
 ## License Basis
 
 - **License:** MIT License (`LICENSE`).
-- **Basis:** Developed from scratch as a clean TypeScript client based on public protocol constants (`kovanica-params`) and the JSON-RPC interface specification (`kovanica-rpc`) verified at node commit [`d2239fd8314a0c6edb08d54724738d662d406a32`](https://github.com/KovanicaDAG/kovanica-l1/commit/d2239fd8314a0c6edb08d54724738d662d406a32). Contains no copied code from GPL-3.0 licensed consensus internals.
+- **Basis:** Developed from scratch as a clean TypeScript client based on public protocol constants (`kovanica-params`) and the JSON-RPC interface specification (`kovanica-rpc`) verified at node commit [`566da35`](https://github.com/KovanicaDAG/kovanica-l1/commit/566da35). Contains no copied code from GPL-3.0 licensed consensus internals.
