@@ -7,6 +7,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { isLegacyAddressAllowed } from "./chains";
 
 export const ADDRESS_PREFIX = "kvnc";
+export const TESTNET_ADDRESS_PREFIX = "tknc";
 export const ADDRESS_SUFFIX = "dag";
 export const ADDRESS_PAYLOAD_LEN = 32;
 export const ADDRESS_CHECKSUM_BITS = 29;
@@ -39,9 +40,9 @@ export function legacyChecksum(payload: Uint8Array): Uint8Array {
 }
 
 /**
- * Canonical PRO-21 encoding: `kvnc` + 57 base32 chars (bech32 alphabet) + `dag` = 64 characters.
+ * Canonical PRO-21 encoding: prefix (`kvnc` or `tknc`) + 57 base32 chars (bech32 alphabet) + `dag` = 64 characters.
  */
-export function encodeAddress(publicKey: Uint8Array): string {
+export function encodeAddress(publicKey: Uint8Array, prefix = ADDRESS_PREFIX): string {
   if (publicKey.length !== ADDRESS_PAYLOAD_LEN) {
     throw new Error(`Public key must be exactly ${ADDRESS_PAYLOAD_LEN} bytes`);
   }
@@ -83,23 +84,28 @@ export function encodeAddress(publicKey: Uint8Array): string {
     body += BASE32_ALPHABET[c];
   }
 
-  return `${ADDRESS_PREFIX}${body}${ADDRESS_SUFFIX}`;
+  return `${prefix}${body}${ADDRESS_SUFFIX}`;
 }
 
 /**
  * Decodes a canonical 64-character PRO-21 address string into raw 32-byte public key.
  * Throws an Error if invalid.
  */
-export function decodeAddress(address: string): Uint8Array {
+export function decodeAddress(address: string, expectedPrefix?: string): Uint8Array {
   const trimmed = address.trim();
-  if (trimmed.length !== ADDRESS_LEN) {
-    throw new Error(`Address must be exactly ${ADDRESS_LEN} characters, got ${trimmed.length}`);
-  }
-  if (!trimmed.startsWith(ADDRESS_PREFIX) || !trimmed.endsWith(ADDRESS_SUFFIX)) {
-    throw new Error(`Address must start with "${ADDRESS_PREFIX}" and end with "${ADDRESS_SUFFIX}"`);
+  const allowedPrefixes = expectedPrefix ? [expectedPrefix] : [ADDRESS_PREFIX, TESTNET_ADDRESS_PREFIX];
+  const matchedPrefix = allowedPrefixes.find((p) => trimmed.startsWith(p));
+
+  if (!matchedPrefix || !trimmed.endsWith(ADDRESS_SUFFIX)) {
+    throw new Error(`Address must start with "${expectedPrefix ?? ADDRESS_PREFIX}" and end with "${ADDRESS_SUFFIX}"`);
   }
 
-  const body = trimmed.slice(ADDRESS_PREFIX.length, trimmed.length - ADDRESS_SUFFIX.length);
+  const expectedLen = matchedPrefix.length + ADDRESS_BODY_CHARS + ADDRESS_SUFFIX.length;
+  if (trimmed.length !== expectedLen) {
+    throw new Error(`Address must be exactly ${expectedLen} characters, got ${trimmed.length}`);
+  }
+
+  const body = trimmed.slice(matchedPrefix.length, trimmed.length - ADDRESS_SUFFIX.length);
   if (body.length !== ADDRESS_BODY_CHARS) {
     throw new Error(`Invalid body length: ${body.length}`);
   }
@@ -160,10 +166,10 @@ export function isValidAddress(address: string, chainId: number): boolean {
 export function parseAddressForChain(address: string, chainId: number): Uint8Array {
   const trimmed = address.trim();
 
-  // Try canonical PRO-21 format first
+  // Try canonical PRO-21 format first (kvnc...dag on all chains, tknc...dag accepted on testnet)
   if (
     trimmed.length === ADDRESS_LEN &&
-    trimmed.startsWith(ADDRESS_PREFIX) &&
+    (trimmed.startsWith(ADDRESS_PREFIX) || (chainId === 2 && trimmed.startsWith(TESTNET_ADDRESS_PREFIX))) &&
     trimmed.endsWith(ADDRESS_SUFFIX)
   ) {
     return decodeAddress(trimmed);

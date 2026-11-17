@@ -73,6 +73,7 @@ export {
   ADDRESS_PAYLOAD_LEN,
   ADDRESS_PREFIX,
   ADDRESS_SUFFIX,
+  TESTNET_ADDRESS_PREFIX,
   checksum29,
   decodeAddress,
   encodeAddress,
@@ -81,3 +82,23 @@ export {
   parseAddressForChain,
   parseLegacyAddress,
 } from "./address";
+
+// HD Wallet & Key Derivation (BIP-39 / BIP-44 / SLIP-0010)
+export {
+  BIP44_PURPOSE,
+  DEV_COIN_TYPE,
+  HARDENED_OFFSET,
+  KOVANICA_COIN_TYPE,
+  LEGACY_COIN_TYPE,
+  type DerivedAccount,
+  type Slip10Node,
+  addressFromSeed,
+  bip39Seed,
+  deriveBip44,
+  deriveHardened,
+  derivePath,
+  formatBip44Path,
+  getPublicKey,
+  masterFromSeed,
+  wipe,
+} from "./wallet";
