@@ -12,10 +12,12 @@ describe("chains configuration", () => {
     expect(CHAIN_IDS.TESTNET).toBe(2);
     expect(CHAIN_IDS.HYBRID_TESTNET).toBe(2);
     expect(CHAIN_IDS.DEVNET).toBe(3);
-    expect(CHAIN_IDS.LOCAL).toBe(1337);
+    expect("LOCAL" in CHAIN_IDS).toBe(false);
     expect("TESTNET_V2" in CHAIN_IDS).toBe(false);
     expect(KNOWN_CHAINS[4]).toBeUndefined();
     expect(getChainConfig(4)).toBeUndefined();
+    expect(KNOWN_CHAINS[1337]).toBeUndefined();
+    expect(getChainConfig(1337)).toBeUndefined();
   });
 
   it("retrieves chain config by chain ID", () => {
@@ -28,12 +30,12 @@ describe("chains configuration", () => {
     expect(mainnet?.ghostdagK).toBe(5);
     expect(mainnet?.allowsLegacyAddress).toBe(false);
 
-    const local = getChainConfig(CHAIN_IDS.LOCAL);
-    expect(local).toBeDefined();
-    expect(local?.name).toBe("Local Devnet");
-    expect(local?.consensus).toBe("Mysticeti");
-    expect(local?.ghostdagK).toBeUndefined();
-    expect(local?.allowsLegacyAddress).toBe(true);
+    const devnet = getChainConfig(CHAIN_IDS.DEVNET);
+    expect(devnet).toBeDefined();
+    expect(devnet?.name).toBe("Devnet");
+    expect(devnet?.consensus).toBe("Mysticeti");
+    expect(devnet?.ghostdagK).toBeUndefined();
+    expect(devnet?.allowsLegacyAddress).toBe(true);
 
     const testnet = getChainConfig(CHAIN_IDS.TESTNET);
     expect(testnet).toBeDefined();
@@ -50,7 +52,7 @@ describe("chains configuration", () => {
     expect(isLegacyAddressAllowed(3)).toBe(true);
     expect(isLegacyAddressAllowed(4)).toBe(false);
     expect(isLegacyAddressAllowed(5)).toBe(false);
-    expect(isLegacyAddressAllowed(1337)).toBe(true);
+    expect(isLegacyAddressAllowed(1337)).toBe(false);
     expect(isLegacyAddressAllowed(999)).toBe(false);
   });
 });

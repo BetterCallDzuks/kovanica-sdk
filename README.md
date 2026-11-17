@@ -13,7 +13,7 @@ Typed, lightweight TypeScript client and utilities for the **Kovanica (KVNC)** L
 - **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`511af88532dceebdf0349b63c6c4c898eee7ca6e`](https://github.com/KovanicaDAG/kovanica-l1/commit/511af88532dceebdf0349b63c6c4c898eee7ca6e).
 - **Lossless Precision (Large Integers):** Kovanica balances, heights, stakes, nonces, and gas rates are represented losslessly as native JavaScript `bigint`. Never coerced into IEEE-754 `Number`. Plain JSON integers up to `u64::MAX` are preserved losslessly.
 - **PRO-21 Address Support:** Canonical 64-character `kvnc...dag` base32 addresses (256-bit Ed25519 public key + 29-bit `blake3` checksum) and chain-aware validation.
-- **Chain Registry:** Verified chain ID metadata for the canonical chains: Mainnet (`1`, Hybrid PoW + GHOSTDAG, strict PRO-21), Testnet (`2`, Hybrid PoW + GHOSTDAG, strict PRO-21, alias `HYBRID_TESTNET = 2`), Devnet (`3`, Mysticeti, legacy hex allowed), and Local (`1337`, Mysticeti, legacy hex allowed).
+- **Chain Registry:** Verified chain ID metadata for the canonical chains: Mainnet (`1`, Hybrid PoW + GHOSTDAG, strict PRO-21), Testnet (`2`, Hybrid PoW + GHOSTDAG, strict PRO-21, alias `HYBRID_TESTNET = 2`), and Devnet (`3`, Mysticeti, legacy hex allowed, also used for local testing).
 - **Hybrid PoW & DAG Queries:** First-class typed support for `kovanica_getMiningInfo` and `kovanica_getDagTips` on Mainnet (Chain 1) and Testnet (Chain 2) (Hybrid PoW + GHOSTDAG).
 
 ---
@@ -34,7 +34,7 @@ npm install kovanica-sdk
 ```typescript
 import { KovanicaClient, formatKvnc, isNodeSynced } from "kovanica-sdk";
 
-// Connect to a local node (Chain 2 Hybrid Testnet or Local Devnet)
+// Connect to a local node (Chain 2 Hybrid Testnet or Chain 3 Devnet)
 const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
 
 // Get latest committed leader block height (returns bigint)
@@ -92,7 +92,7 @@ console.log(isValidAddress(address, CHAIN_IDS.MAINNET)); // true
 console.log(isValidAddress("0x1234...", CHAIN_IDS.MAINNET)); // false (legacy hex forbidden on Mainnet)
 console.log(isValidAddress("0x1234...", CHAIN_IDS.TESTNET)); // false (legacy hex forbidden on Testnet)
 
-// Devnet (3) and Local (1337) allow legacy hex
+// Devnet (3) allows legacy hex
 console.log(isValidAddress("0x1234...", CHAIN_IDS.DEVNET)); // true (if valid 32-byte hex)
 ```
 
@@ -141,22 +141,22 @@ All methods are mapped directly to handlers in `crates/kovanica-rpc` verified at
 
 | JSON-RPC Method | SDK Client Method | Handler in `kovanica-rpc` | Supported Chains | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `kovanica_blockNumber` | `client.blockNumber()` | `handle_block_number` | 1, 2, 3, 1337 | Returns committed leader height |
-| `kovanica_getBlockByNumber` | `client.getBlockByNumber(n, full)` | `handle_get_block_by_number` | 1, 2, 3, 1337 | Takes hex quantity or bigint |
-| `kovanica_getBlockByHash` | `client.getBlockByHash(h, full)` | `handle_get_block_by_hash` | 1, 2, 3, 1337 | 32-byte block digest |
-| `kovanica_getBalance` | `client.getBalance(addr)` | `handle_get_balance` | 1, 2, 3, 1337 | Returns atomic balance in atoms |
-| `kovanica_getNonce` | `client.getNonce(addr)` | `handle_get_nonce` | 1, 2, 3, 1337 | Account sequence number |
-| `kovanica_getCode` | `client.getCode(addr)` | `handle_get_code` | 1, 2, 3, 1337 | Contract bytecode hex |
-| `kovanica_getStorageAt` | `client.getStorageAt(addr, slot)` | `handle_get_storage_at` | 1, 2, 3, 1337 | Contract storage slot hex |
-| `kovanica_getTransactionByHash` | `client.getTransactionByHash(h)` | `handle_get_transaction_by_hash` | 1, 2, 3, 1337 | Returns transaction details |
-| `kovanica_getTransactionReceipt` | `client.getTransactionReceipt(h)` | `handle_get_transaction_receipt` | 1, 2, 3, 1337 | Status, block execution receipt & gasUsed |
-| `kovanica_getPendingTransactions`| `client.getPendingTransactions()` | `handle_get_pending_transactions`| 1, 2, 3, 1337 | Mempool pending tx hashes |
-| `kovanica_estimateFee` | `client.estimateFee()` | `handle_estimate_fee` | 1, 2, 3, 1337 | Gas fee rate in atoms per byte |
-| `kovanica_getValidators` | `client.getValidators()` | `handle_get_validators` | 3, 1337 | Active validator set and stakes. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
-| `kovanica_getStake` | `client.getStake(addr)` | `handle_get_stake` | 3, 1337 | Bonded stake amount. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
-| `kovanica_getRewards` | `client.getRewards(addr)` | `handle_get_rewards` | 1, 2, 3, 1337 | Cumulative earned rewards |
-| `kovanica_getLeaderSchedule` | `client.getLeaderSchedule(count)` | `handle_get_leader_schedule` | 3, 1337 | Leader rounds schedule. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
-| `kovanica_syncStatus` | `client.syncStatus()` | `handle_sync_status` | 1, 2, 3, 1337 | camelCase wire contract with peerId & reportedTipRound |
+| `kovanica_blockNumber` | `client.blockNumber()` | `handle_block_number` | 1, 2, 3 | Returns committed leader height |
+| `kovanica_getBlockByNumber` | `client.getBlockByNumber(n, full)` | `handle_get_block_by_number` | 1, 2, 3 | Takes hex quantity or bigint |
+| `kovanica_getBlockByHash` | `client.getBlockByHash(h, full)` | `handle_get_block_by_hash` | 1, 2, 3 | 32-byte block digest |
+| `kovanica_getBalance` | `client.getBalance(addr)` | `handle_get_balance` | 1, 2, 3 | Returns atomic balance in atoms |
+| `kovanica_getNonce` | `client.getNonce(addr)` | `handle_get_nonce` | 1, 2, 3 | Account sequence number |
+| `kovanica_getCode` | `client.getCode(addr)` | `handle_get_code` | 1, 2, 3 | Contract bytecode hex |
+| `kovanica_getStorageAt` | `client.getStorageAt(addr, slot)` | `handle_get_storage_at` | 1, 2, 3 | Contract storage slot hex |
+| `kovanica_getTransactionByHash` | `client.getTransactionByHash(h)` | `handle_get_transaction_by_hash` | 1, 2, 3 | Returns transaction details |
+| `kovanica_getTransactionReceipt` | `client.getTransactionReceipt(h)` | `handle_get_transaction_receipt` | 1, 2, 3 | Status, block execution receipt & gasUsed |
+| `kovanica_getPendingTransactions`| `client.getPendingTransactions()` | `handle_get_pending_transactions`| 1, 2, 3 | Mempool pending tx hashes |
+| `kovanica_estimateFee` | `client.estimateFee()` | `handle_estimate_fee` | 1, 2, 3 | Gas fee rate in atoms per byte |
+| `kovanica_getValidators` | `client.getValidators()` | `handle_get_validators` | 3 | Active validator set and stakes. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
+| `kovanica_getStake` | `client.getStake(addr)` | `handle_get_stake` | 3 | Bonded stake amount. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
+| `kovanica_getRewards` | `client.getRewards(addr)` | `handle_get_rewards` | 1, 2, 3 | Cumulative earned rewards |
+| `kovanica_getLeaderSchedule` | `client.getLeaderSchedule(count)` | `handle_get_leader_schedule` | 3 | Leader rounds schedule. Rejected with `-32600` on hybrid chains 1 & 2 (L1 #272) |
+| `kovanica_syncStatus` | `client.syncStatus()` | `handle_sync_status` | 1, 2, 3 | camelCase wire contract with peerId & reportedTipRound |
 | `kovanica_getMiningInfo` | `client.getMiningInfo()` | `handle_get_mining_info` | 1, 2 (Hybrid PoW) | Mining difficulty, DAA target |
 | `kovanica_getDagTips` | `client.getDagTips()` | `handle_get_dag_tips` | 1, 2 (Hybrid PoW) | Current DAG tip block hashes |
 
@@ -191,10 +191,9 @@ In Kovanica L1, **`catchingUp === false` alone is insufficient** to conclude a n
 | `1` | **Mainnet** | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
 | `2` | **Testnet** (`HYBRID_TESTNET` alias) | Hybrid PoW + GHOSTDAG (`K = 5`) | 4 s | Strict PRO-21 base32 (`kvnc...dag`, 64 chars) |
 | `3` | **Devnet** | Mysticeti | 4 s | PRO-21 base32 and legacy hex allowed |
-| `1337` | **Local Devnet** | Mysticeti | 4 s | PRO-21 base32 and legacy hex allowed |
 
 > [!NOTE]
-> Per `crates/kovanica-params/src/lib.rs` and `crates/kovanica-types/src/signing.rs`, both Mainnet (`1`) and Testnet (`2`, alias `HYBRID_TESTNET = 2`) execute Hybrid PoW + GHOSTDAG mining (`is_hybrid(chain_id) == true`, `K = 5`, target 4 s, KovanicaHash) and enforce strict PRO-21 base32 addresses (`isLegacyAddressAllowed(chainId) == false`). Devnet (`3`) and Local networks (`1337`) use development parameter profiles and allow legacy hex addresses.
+> Per `crates/kovanica-params/src/lib.rs` and `crates/kovanica-types/src/signing.rs`, both Mainnet (`1`) and Testnet (`2`, alias `HYBRID_TESTNET = 2`) execute Hybrid PoW + GHOSTDAG mining (`is_hybrid(chain_id) == true`, `K = 5`, target 4 s, KovanicaHash) and enforce strict PRO-21 base32 addresses (`isLegacyAddressAllowed(chainId) == false`). Devnet (`3`) uses a development parameter profile (also for local testing) and allows legacy hex addresses.
 
 ---
 
@@ -252,7 +251,7 @@ The deterministic test suite (`tests/transport-contracts.test.ts`) verifies clie
 
 1. **Read-Only Surface:** This SDK implements the read-only JSON-RPC query surface. It does not construct or sign state-mutating transactions, light client proofs, or submit mining blocks.
 2. **Hybrid PoW Chains (1 & 2) for Mining:** `client.getMiningInfo()` and `client.getDagTips()` are supported on Mainnet (Chain ID 1) and Testnet (Chain ID 2, Hybrid PoW + GHOSTDAG). On non-hybrid chains, the node rejects these methods with code `-32600` or `-32601`.
-3. **Hybrid PoW Chains (1 & 2) Have No Staking:** `client.getValidators()`, `client.getStake()`, and `client.getLeaderSchedule()` are legacy (Mysticeti) methods. Since L1 #272 the node rejects them with code `-32600` (`InvalidRequest`) on Chains 1 & 2, and the SDK propagates a `KovanicaRpcError` (`err.isInvalidRequest() === true`) instead of returning `[]` or `0n`. They remain available on Devnet (`3`) and Local (`1337`).
+3. **Hybrid PoW Chains (1 & 2) Have No Staking:** `client.getValidators()`, `client.getStake()`, and `client.getLeaderSchedule()` are legacy (Mysticeti) methods. Since L1 #272 the node rejects them with code `-32600` (`InvalidRequest`) on Chains 1 & 2, and the SDK propagates a `KovanicaRpcError` (`err.isInvalidRequest() === true`) instead of returning `[]` or `0n`. They remain available on Devnet (`3`).
 4. **Lossless Precision Range:** Integers on the wire up to `u64::MAX` (`18446744073709551615`) and 128-bit balances are parsed losslessly into `bigint`. Direct JavaScript `number` literals exceeding `Number.MAX_SAFE_INTEGER` will throw `TypeError` to guard against precision corruption.
 
 ---

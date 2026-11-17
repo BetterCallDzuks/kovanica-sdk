@@ -8,7 +8,6 @@ export const CHAIN_IDS = {
   TESTNET: 2,
   HYBRID_TESTNET: 2,
   DEVNET: 3,
-  LOCAL: 1337,
 } as const;
 
 export type ChainId = (typeof CHAIN_IDS)[keyof typeof CHAIN_IDS] | number;
@@ -60,18 +59,8 @@ export const KNOWN_CHAINS: Record<number, ChainConfig> = {
     consensus: "Mysticeti",
     targetBlockTimeMs: 4000,
     allowsLegacyAddress: true,
-    description: "Devnet environment. Legacy hex addresses allowed.",
-  },
-  [CHAIN_IDS.LOCAL]: {
-    chainId: CHAIN_IDS.LOCAL,
-    name: "Local Devnet",
-    ticker: "KVNC",
-    decimals: 9,
-    consensus: "Mysticeti",
-    targetBlockTimeMs: 4000,
-    allowsLegacyAddress: true,
     defaultRpcUrl: "http://127.0.0.1:8545/rpc",
-    description: "Single-node or local cluster testing (Mysticeti). Legacy hex addresses allowed.",
+    description: "Devnet / local cluster testing environment (Mysticeti). Legacy hex addresses allowed.",
   },
 };
 
@@ -87,8 +76,5 @@ export function getChainConfig(chainId: number): ChainConfig | undefined {
  * Based on `legacy_address_allowed(chain_id)` in `kovanica-types/src/address.rs`.
  */
 export function isLegacyAddressAllowed(chainId: number): boolean {
-  return (
-    chainId === CHAIN_IDS.DEVNET ||
-    chainId === CHAIN_IDS.LOCAL
-  );
+  return chainId === CHAIN_IDS.DEVNET;
 }

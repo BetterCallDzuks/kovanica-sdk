@@ -59,10 +59,10 @@ describe("PRO-21 address handling", () => {
     );
   });
 
-  it("allows legacy hex addresses only on Devnet (3) and Local (1337) and rejects uppercase 0X prefix", () => {
+  it("allows legacy hex addresses only on Devnet (3) and rejects uppercase 0X prefix", () => {
     const hex = "0x" + "01".repeat(32);
     expect(isValidAddress(hex, CHAIN_IDS.DEVNET)).toBe(true);
-    expect(isValidAddress(hex, CHAIN_IDS.LOCAL)).toBe(true);
+    expect(isValidAddress(hex, 1337)).toBe(false);
     expect(isValidAddress(hex, CHAIN_IDS.TESTNET)).toBe(false);
     expect(isValidAddress(hex, 4)).toBe(false);
     expect(isValidAddress(hex, 5)).toBe(false);
@@ -70,7 +70,6 @@ describe("PRO-21 address handling", () => {
     // Uppercase 0X prefix is strictly rejected per L1 kovanica-types/src/address.rs
     const upperHex = "0X" + "01".repeat(32);
     expect(isValidAddress(upperHex, CHAIN_IDS.DEVNET)).toBe(false);
-    expect(isValidAddress(upperHex, CHAIN_IDS.LOCAL)).toBe(false);
 
     const parsed = parseAddressForChain(hex, CHAIN_IDS.DEVNET);
     expect(parsed).toEqual(new Uint8Array(32).fill(1));

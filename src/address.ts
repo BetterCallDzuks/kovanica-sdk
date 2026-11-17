@@ -143,7 +143,7 @@ export function decodeAddress(address: string): Uint8Array {
 /**
  * Validates whether an address string is valid for a given chain ID.
  * Strict PRO-21 base32 on Mainnet (1) and Testnet (2); legacy hex formats are strictly rejected on Mainnet (1) and Testnet (2).
- * Legacy hex formats are accepted only on Devnet (3) and Local (1337).
+ * Legacy hex formats are accepted only on Devnet (3).
  */
 export function isValidAddress(address: string, chainId: number): boolean {
   try {
