@@ -15,6 +15,17 @@ export {
   type Transport,
   parseLosslessJson,
 } from "./transport";
+export {
+  KovanicaWsClient,
+  type KovanicaWsClientOptions,
+  type WsCommittedLeaderEvent,
+  type WsExecutionEvent,
+  type WsLogFilter,
+  type WsLogReceipt,
+  type WsNewHeadEvent,
+  type WsSubscriptionCallback,
+  type WsSubscriptionNotification,
+} from "./ws";
 
 // Types & Schemas
 export type {
@@ -147,3 +158,42 @@ export {
   u128le,
   wireCallKindBytes,
 } from "./contracts";
+
+// Contract State & Record Bincode Decoders + Storage Slot Derivation
+export {
+  BincodeReader,
+  KovanicaDecodeError,
+  STORAGE_KEY_PREFIXES,
+  type DecodeErrorCode,
+  type EscrowRecord,
+  type EscrowStatus,
+  type HtlcRecord,
+  type HtlcStatus,
+  type MultisigPendingTx,
+  type MultisigState,
+  type NameRecord,
+  type NftMetadata,
+  type NftTokenEntry,
+  type StorageSlotContract,
+  type StorageSlotKey,
+  type TokenAllowanceEntry,
+  type TokenBalanceEntry,
+  type TokenMetadata,
+  type TokenPoolState,
+  type VaultRecord,
+  type VaultSchedule,
+  decodeEscrowRecord,
+  decodeHtlcRecord,
+  decodeMultisigPendingTx,
+  decodeMultisigState,
+  decodeNameRecord,
+  decodeNftMetadata,
+  decodeNftState,
+  decodeTokenMetadata,
+  decodeTokenPool,
+  decodeTokenState,
+  decodeVaultRecord,
+  derivePrefixedStorageSlot,
+  deriveStorageSlot,
+  deriveStorageSlotHex,
+} from "./decoders";
