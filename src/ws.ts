@@ -20,6 +20,8 @@ const WS_CLOSED = 3;
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
+const DEFAULT_HEARTBEAT_METHOD = "kovanica_chainId";
 
 export interface KovanicaWsClientOptions {
   /** Full WebSocket URL of the Kovanica RPC endpoint (e.g. "ws://127.0.0.1:8545/ws"). */
@@ -34,6 +36,22 @@ export interface KovanicaWsClientOptions {
   WebSocketImpl?: typeof WebSocket;
   /** Timeout in milliseconds for subscribe/unsubscribe RPC requests. Default: 10000. */
   requestTimeoutMs?: number;
+  /**
+   * Optional interval in milliseconds between JSON-RPC liveness probes.
+   * Disabled by default (`0` / `undefined`). When set to a positive number, periodically
+   * sends `heartbeatMethod` while connected to detect half-open TCP drops.
+   */
+  heartbeatIntervalMs?: number;
+  /**
+   * Maximum time in milliseconds to wait for a message/response after sending a heartbeat
+   * probe before force-closing the socket and triggering reconnection. Default: 5000.
+   */
+  heartbeatTimeoutMs?: number;
+  /**
+   * Lightweight JSON-RPC method sent for periodic heartbeat liveness probes.
+   * Default: `"kovanica_chainId"`.
+   */
+  heartbeatMethod?: string;
   /** Optional error hook for asynchronous transport, protocol, or callback errors. */
   onError?: (error: Error) => void;
 }
@@ -118,6 +136,9 @@ export class KovanicaWsClient {
   private readonly maxReconnectDelayMs: number;
   private readonly webSocketImpl?: typeof WebSocket;
   private readonly requestTimeoutMs: number;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatTimeoutMs: number;
+  private readonly heartbeatMethod: string;
   private readonly onError?: (error: Error) => void;
 
   private ws: WebSocket | null = null;
@@ -126,8 +147,11 @@ export class KovanicaWsClient {
   private idCounter = 1;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatIntervalTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly pendingRequests = new Map<number, PendingRequest>();
+  private readonly heartbeatRequestIds = new Set<number>();
   private readonly subscriptionsByClientId = new Map<string, ActiveSubscription>();
   private readonly subscriptionsByServerId = new Map<string, ActiveSubscription>();
 
@@ -135,12 +159,31 @@ export class KovanicaWsClient {
     if (!options.url || options.url.trim().length === 0) {
       throw new Error("WebSocket client requires a non-empty URL");
     }
+    if (
+      options.heartbeatIntervalMs !== undefined &&
+      (!Number.isFinite(options.heartbeatIntervalMs) || options.heartbeatIntervalMs < 0)
+    ) {
+      throw new RangeError("heartbeatIntervalMs must be a non-negative finite number");
+    }
+    if (
+      options.heartbeatTimeoutMs !== undefined &&
+      (!Number.isFinite(options.heartbeatTimeoutMs) || options.heartbeatTimeoutMs <= 0)
+    ) {
+      throw new RangeError("heartbeatTimeoutMs must be a positive finite number");
+    }
+    if (options.heartbeatMethod !== undefined && options.heartbeatMethod.trim().length === 0) {
+      throw new Error("heartbeatMethod must be a non-empty string");
+    }
+
     this.url = options.url.trim();
     this.reconnectEnabled = options.reconnect ?? false;
     this.reconnectDelayMs = options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
     this.webSocketImpl = options.WebSocketImpl;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 0;
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
+    this.heartbeatMethod = options.heartbeatMethod?.trim() ?? DEFAULT_HEARTBEAT_METHOD;
     this.onError = options.onError;
   }
 
@@ -178,6 +221,7 @@ export class KovanicaWsClient {
 
     this.closedByUser = false;
     this.clearReconnectTimer();
+    this.clearHeartbeatTimers();
 
     const promise = new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -200,6 +244,7 @@ export class KovanicaWsClient {
         if (this.ws !== socket) return;
         this.connectPromise = null;
         this.reconnectAttempt = 0;
+        this.scheduleNextHeartbeat();
         if (!settled) {
           settled = true;
           resolve();
@@ -219,6 +264,7 @@ export class KovanicaWsClient {
         if (!settled) {
           settled = true;
           this.connectPromise = null;
+          this.clearHeartbeatTimers();
           this.detachSocket(socket);
           this.ws = null;
           reject(transportErr);
@@ -229,6 +275,7 @@ export class KovanicaWsClient {
 
       socket.onclose = (event: CloseEvent) => {
         if (this.ws !== socket) return;
+        this.clearHeartbeatTimers();
         this.detachSocket(socket);
         this.ws = null;
         this.connectPromise = null;
@@ -269,6 +316,7 @@ export class KovanicaWsClient {
   close(): void {
     this.closedByUser = true;
     this.clearReconnectTimer();
+    this.clearHeartbeatTimers();
     this.connectPromise = null;
 
     this.rejectAllPending(new KovanicaTransportError("WebSocket connection closed"));
@@ -454,6 +502,11 @@ export class KovanicaWsClient {
       return;
     }
 
+    // Any valid JSON-RPC 2.0 message from the server confirms socket liveness
+    if (this.heartbeatIntervalMs > 0 && this.isConnected) {
+      this.scheduleNextHeartbeat();
+    }
+
     // Push notification: { jsonrpc: "2.0", method: "kovanica_subscription", params: { subscription, result } }
     if (
       (record.method === "kovanica_subscription" || record.method === "eth_subscription") &&
@@ -484,6 +537,11 @@ export class KovanicaWsClient {
           this.emitError(new KovanicaRpcError(errObj.code, errObj.message, errObj.data));
         }
       }
+      return;
+    }
+
+    // Consume heartbeat probe responses silently
+    if (this.heartbeatRequestIds.delete(rpcRes.id)) {
       return;
     }
 
@@ -594,6 +652,89 @@ export class KovanicaWsClient {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private scheduleNextHeartbeat(): void {
+    this.clearHeartbeatTimers();
+    if (this.heartbeatIntervalMs <= 0 || this.closedByUser || !this.isConnected) {
+      return;
+    }
+    const socket = this.ws;
+    if (!socket) return;
+
+    this.heartbeatIntervalTimer = setTimeout(() => {
+      this.heartbeatIntervalTimer = null;
+      this.sendHeartbeatProbe(socket);
+    }, this.heartbeatIntervalMs);
+  }
+
+  private sendHeartbeatProbe(socket: WebSocket): void {
+    if (this.closedByUser || this.ws !== socket || socket.readyState !== WS_OPEN) {
+      return;
+    }
+
+    const id = this.idCounter++;
+    this.heartbeatRequestIds.add(id);
+    const req: JsonRpcRequest = {
+      jsonrpc: "2.0",
+      method: this.heartbeatMethod,
+      params: [],
+      id,
+    };
+
+    this.heartbeatTimeoutTimer = setTimeout(() => {
+      this.heartbeatTimeoutTimer = null;
+      this.handleHeartbeatTimeout(socket);
+    }, this.heartbeatTimeoutMs);
+
+    try {
+      socket.send(JSON.stringify(req));
+    } catch (err) {
+      this.handleHeartbeatTimeout(socket, err);
+    }
+  }
+
+  private handleHeartbeatTimeout(socket: WebSocket, cause?: unknown): void {
+    if (this.ws !== socket || this.closedByUser) {
+      return;
+    }
+    this.clearHeartbeatTimers();
+    this.heartbeatRequestIds.clear();
+
+    const err = new KovanicaTransportError(
+      `WebSocket heartbeat timed out after ${this.heartbeatTimeoutMs}ms`,
+      cause !== undefined ? { cause } : undefined,
+    );
+    this.emitError(err);
+
+    this.detachSocket(socket);
+    this.ws = null;
+    this.connectPromise = null;
+
+    if (socket.readyState !== WS_CLOSING && socket.readyState !== WS_CLOSED) {
+      try {
+        socket.close(4000, "Heartbeat timeout");
+      } catch {
+        // Ignore errors when force-closing a half-open socket
+      }
+    }
+
+    this.rejectAllPending(err);
+
+    if (!this.closedByUser && this.reconnectEnabled) {
+      this.scheduleReconnect();
+    }
+  }
+
+  private clearHeartbeatTimers(): void {
+    if (this.heartbeatIntervalTimer !== null) {
+      clearTimeout(this.heartbeatIntervalTimer);
+      this.heartbeatIntervalTimer = null;
+    }
+    if (this.heartbeatTimeoutTimer !== null) {
+      clearTimeout(this.heartbeatTimeoutTimer);
+      this.heartbeatTimeoutTimer = null;
     }
   }
 

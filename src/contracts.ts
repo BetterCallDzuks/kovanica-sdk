@@ -5,9 +5,11 @@
 
 import { blake3 } from "@noble/hashes/blake3.js";
 import { sha512 } from "@noble/hashes/sha2.js";
-import { decodeAddress } from "./address";
+import { decodeAddress, encodeAddress } from "./address";
 import { CHAIN_IDS } from "./chains";
+import { KovanicaDecodeError } from "./decoders";
 import type { RequestOptions } from "./types";
+import { toHexQuantity } from "./units";
 
 // --- Domain Tags & Gas Limits ---
 
@@ -896,5 +898,163 @@ export async function estimateAndBuildCall(
     gasLimit: resolvedGasLimit,
     nonce: explicitNonce ?? fetchedNonce,
     chainId: options.chainId ?? CHAIN_IDS.MAINNET,
+  };
+}
+
+// --- Read-Only Contract Simulation (`kovanica_call` Dry-Run Helper) ---
+
+/**
+ * Minimal client interface required by {@link dryRunCall}.
+ * Satisfied by {@link KovanicaClient}.
+ */
+export interface DryRunCallClient {
+  call<TResult = unknown>(
+    method: string,
+    params?: unknown,
+    options?: RequestOptions,
+  ): Promise<TResult>;
+}
+
+export interface DryRunCallOptions<TDecoded = undefined> {
+  /**
+   * Optional simulated caller address (PRO-21 `kvnc...dag` / `tknc...dag`, 32-byte hex, or 32-byte `Uint8Array`).
+   * Validated as a 32-byte public key and formatted as a canonical 64-character PRO-21 `kvnc...dag` address.
+   */
+  from?: Uint8Array | string;
+  /**
+   * Optional call value override in atoms (defaults to `call.call_value` / `call.value` / `0n`).
+   */
+  value?: bigint | number;
+  /**
+   * Optional gas limit override (defaults to `call.gas_limit` / `call.gasLimit` / {@link DEFAULT_CALL_GAS_LIMIT}).
+   */
+  gasLimit?: bigint | number;
+  /**
+   * Optional Bincode / binary response decoder invoked on `rawBytes` when `kovanica_call` succeeds.
+   */
+  decoder?: (bytes: Uint8Array) => TDecoded;
+  /**
+   * Optional RPC request options (`timeoutMs`, `signal`) forwarded to `kovanica_call`.
+   */
+  requestOptions?: RequestOptions;
+}
+
+export interface DryRunCallResult<TDecoded = undefined> {
+  /** Normalized `0x`-prefixed lowercase hex string returned by `kovanica_call` (e.g. `"0x..."` or `"0x"`). */
+  rawHex: string;
+  /** Raw return bytes decoded from `rawHex`. */
+  rawBytes: Uint8Array;
+  /** Typed decoded value produced by `options.decoder(rawBytes)` when a `decoder` is provided. */
+  decoded?: TDecoded;
+}
+
+/**
+ * Simulates a read-only contract call against current node state via `kovanica_call`.
+ *
+ * - Validates and normalizes `call` (contract address, non-empty method, `Uint8Array` args, value, and gas limit)
+ *   plus any optional `from`, `value`, or `gasLimit` overrides before making the RPC request.
+ * - Encodes the canonical `kovanica_call` request object (`{ to, from?, entry, method, data, value, gas }`).
+ * - Decodes the `0x`-prefixed hex response into `rawBytes` and `rawHex`.
+ * - When `options.decoder` is provided, decodes `rawBytes` into typed `TDecoded` (surfacing {@link KovanicaDecodeError} cleanly if malformed).
+ */
+export async function dryRunCall<TDecoded>(
+  client: DryRunCallClient,
+  call: CallTxKind | CallTxKindInput,
+  options: DryRunCallOptions<TDecoded> & { decoder: (bytes: Uint8Array) => TDecoded },
+): Promise<DryRunCallResult<TDecoded> & { decoded: TDecoded }>;
+export async function dryRunCall<TDecoded = undefined>(
+  client: DryRunCallClient,
+  call: CallTxKind | CallTxKindInput,
+  options?: DryRunCallOptions<TDecoded>,
+): Promise<DryRunCallResult<TDecoded>>;
+export async function dryRunCall<TDecoded = undefined>(
+  client: DryRunCallClient,
+  call: CallTxKind | CallTxKindInput,
+  options: DryRunCallOptions<TDecoded> = {},
+): Promise<DryRunCallResult<TDecoded>> {
+  if (!call || typeof call !== "object") {
+    throw new TypeError("dryRunCall requires a valid call object");
+  }
+  if (typeof call.method !== "string" || call.method.trim().length === 0) {
+    throw new Error("Call method must be a non-empty string");
+  }
+  if (!(call.args instanceof Uint8Array)) {
+    throw new TypeError("Call args must be a Uint8Array");
+  }
+
+  const resolvedInput: CallTxKindInput = {
+    contract: call.contract,
+    method: call.method.trim(),
+    args: call.args,
+    call_value: options.value !== undefined ? options.value : (call.call_value ?? call.value),
+    gas_limit:
+      options.gasLimit !== undefined ? options.gasLimit : (call.gas_limit ?? call.gasLimit),
+  };
+
+  const builtCall = buildCallTxKind(resolvedInput);
+  if (builtCall.call_value > 0xffffffffffffffffn) {
+    throw new RangeError(`call_value out of range for u64: ${builtCall.call_value}`);
+  }
+
+  let fromAddress: string | undefined;
+  if (options.from !== undefined) {
+    const fromBytes = parseContractAddress(options.from);
+    fromAddress = encodeAddress(fromBytes);
+  }
+
+  const toAddress = encodeAddress(builtCall.contract);
+  const dataHex = `0x${bytesToHex(builtCall.args)}`;
+
+  const rpcCallObj: Record<string, string> = {
+    to: toAddress,
+    entry: builtCall.method,
+    method: builtCall.method,
+    data: dataHex,
+    value: toHexQuantity(builtCall.call_value),
+    gas: toHexQuantity(builtCall.gas_limit),
+  };
+  if (fromAddress !== undefined) {
+    rpcCallObj.from = fromAddress;
+  }
+
+  const rawResult = await client.call<unknown>(
+    "kovanica_call",
+    [rpcCallObj],
+    options.requestOptions,
+  );
+
+  if (typeof rawResult !== "string") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "kovanica_call: expected hex string response",
+    );
+  }
+
+  const trimmed = rawResult.trim();
+  const cleanHex =
+    trimmed.startsWith("0x") || trimmed.startsWith("0X") ? trimmed.slice(2) : trimmed;
+
+  if (cleanHex.length > 0 && (cleanHex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(cleanHex))) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "kovanica_call: invalid hex string in response",
+    );
+  }
+
+  const rawBytes = cleanHex.length === 0 ? new Uint8Array(0) : hexToBytes(cleanHex);
+  const rawHex = `0x${cleanHex.toLowerCase()}`;
+
+  if (options.decoder) {
+    const decoded = options.decoder(rawBytes);
+    return {
+      rawHex,
+      rawBytes,
+      decoded,
+    };
+  }
+
+  return {
+    rawHex,
+    rawBytes,
   };
 }

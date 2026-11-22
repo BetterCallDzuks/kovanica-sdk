@@ -10,8 +10,8 @@ Typed, lightweight TypeScript client and developer toolkit for the **Kovanica (K
 ## Features
 
 - **Standard JSON-RPC 2.0 Transport:** Configurable endpoint URL, automatic request IDs, configurable timeouts, caller-controlled cancellation (`AbortSignal`), and typed error classes.
-- **Real-Time WebSocket Subscriptions (`KovanicaWsClient`):** Typed JSON-RPC 2.0 WebSocket client (`GET /ws`) supporting `newHeads`, `newCommittedLeader`, and filtered `logs` subscriptions with automatic exponential-backoff reconnection and transparent re-subscription.
-- **Transaction Construction, Estimation & Broadcasting:** High-level `KovanicaWallet` and `KovanicaClient` support for estimating fees/gas (`estimateAndBuildCall`), constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`.
+- **Real-Time WebSocket Subscriptions (`KovanicaWsClient`):** Typed JSON-RPC 2.0 WebSocket client (`GET /ws`) supporting `newHeads`, `newCommittedLeader`, and filtered `logs` subscriptions with automatic exponential-backoff reconnection, transparent re-subscription, and optional heartbeat / idle liveness detection (`heartbeatIntervalMs`, `heartbeatTimeoutMs`, `heartbeatMethod`).
+- **Transaction Construction, Estimation, Dry-Run Simulation & Broadcasting:** High-level `KovanicaWallet` and `KovanicaClient` support for estimating fees/gas (`estimateAndBuildCall`), read-only contract dry-run simulation with typed Bincode decoding (`dryRunCall`), constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`.
 - **HD Wallet & Key Derivation (BIP-39 / SLIP-0010):** Standard BIP-44 path derivation with hardened Ed25519 (`m/44'/3007'/0'/0/0`), seed derivation, message signing, and network-aware address formatting.
 - **Canonical Smart Contract Argument Builders:** Deterministic Bincode encoders for core Wasmi contracts (`name_register`, `htlc_create`, `nft_mint`, `escrow_create`, `token_transfer`, `vault_create`) matching L1 node and playground specifications.
 - **Typed Bincode Contract ABI Decoders & Storage Slot Derivation:** Bounds-checked `BincodeReader`, typed `KovanicaDecodeError`, canonical state/record decoders for HTLC, Vault, Multisig, Token/Pool, Name Registry, NFT, and Escrow contracts, plus BLAKE3 storage slot derivation (`deriveStorageSlot`, `deriveStorageSlotHex`) for `kovanica_getStorageAt`.
@@ -240,6 +240,38 @@ console.log(`Tx ${txHash} (${prepared.estimatedTxSize} bytes, fee ${prepared.fee
 - `chainId`: Chain ID attached to the returned `PreparedCallTransaction` (default: `CHAIN_IDS.MAINNET`).
 - `requestOptions`: Optional `{ timeoutMs, signal }` forwarded to `estimateFee` and `getNonce`.
 
+#### Read-Only Contract Dry-Run Simulation (`dryRunCall`)
+
+`dryRunCall` (available both as a standalone helper and as `client.dryRunCall(call, options?)`) simulates a read-only contract call against current node state via `kovanica_call` and optionally decodes the returned bytes with a typed Bincode decoder:
+
+```typescript
+import {
+  KovanicaClient,
+  decodeNameRecord,
+  dryRunCall,
+  encodeBincodeString,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+
+// Simulate a read-only contract call and decode the Bincode response
+const simulation = await client.dryRunCall(
+  {
+    contract: "0x" + "11".repeat(32),
+    method: "name_lookup",
+    args: encodeBincodeString("alice"),
+  },
+  {
+    from: "0x" + "22".repeat(32),
+    gasLimit: 150_000n,
+    decoder: decodeNameRecord,
+  },
+);
+
+console.log(`Raw hex: ${simulation.rawHex} (${simulation.rawBytes.length} bytes)`);
+console.log(`Decoded owner: ${simulation.decoded.ownerHex}`);
+```
+
 ### 8. Real-Time WebSocket Subscriptions (`KovanicaWsClient`)
 
 `KovanicaWsClient` connects to a node's JSON-RPC WebSocket endpoint (`GET /ws`) and implements `kovanica_subscribe` / `kovanica_unsubscribe` and `kovanica_subscription` push notifications:
@@ -253,6 +285,9 @@ const ws = new KovanicaWsClient({
   reconnectDelayMs: 1_000,
   maxReconnectDelayMs: 30_000,
   requestTimeoutMs: 10_000,
+  heartbeatIntervalMs: 15_000,
+  heartbeatTimeoutMs: 5_000,
+  heartbeatMethod: "kovanica_chainId",
   onError: (err) => console.error("WS error:", err),
 });
 
@@ -294,7 +329,8 @@ ws.close();
 - `connect()` deduplicates concurrent connection attempts and resolves when the socket enters `OPEN`.
 - `isConnected` and `activeSubscriptionCount` expose live connection and subscription state.
 - When `reconnect: true`, unexpected disconnects schedule exponential backoff (`reconnectDelayMs` doubling up to `maxReconnectDelayMs`). On reconnect, all active subscriptions are automatically re-subscribed and incoming server subscription IDs are transparently remapped to the original client subscription IDs.
-- Calling `close()` stops reconnection, rejects any in-flight RPC requests with `KovanicaTransportError`, and clears local subscriptions.
+- When `heartbeatIntervalMs` is set to a positive number (disabled by default), the client periodically sends a lightweight JSON-RPC liveness probe (`heartbeatMethod`, default `"kovanica_chainId"`). If no message or response arrives within `heartbeatTimeoutMs` (default `5000` ms), the half-open socket is force-closed and reconnection is triggered automatically.
+- Calling `close()` stops reconnection, clears heartbeat timers, rejects any in-flight RPC requests with `KovanicaTransportError`, and clears local subscriptions.
 - In Node.js environments without a global `WebSocket` (or in tests), pass a custom constructor via `WebSocketImpl`.
 
 ### 9. Typed Bincode Contract ABI Decoders & Storage Slot Derivation

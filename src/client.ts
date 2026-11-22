@@ -21,10 +21,13 @@ import { parseQuantity, toHexQuantity } from "./units";
 import {
   type CallTxKind,
   type CallTxKindInput,
+  type DryRunCallOptions,
+  type DryRunCallResult,
   type EstimateAndBuildCallOptions,
   type PreparedCallTransaction,
   type SignedTxResult,
   buildCallTxKind,
+  dryRunCall,
   estimateAndBuildCall,
   signCallContractTransaction,
 } from "./contracts";
@@ -300,6 +303,25 @@ export class KovanicaClient {
     options?: EstimateAndBuildCallOptions,
   ): Promise<PreparedCallTransaction> {
     return estimateAndBuildCall(this, call, options);
+  }
+
+  /**
+   * Simulates a read-only contract call against current node state via `kovanica_call`,
+   * optionally decoding the returned bytes with a typed Bincode decoder.
+   */
+  async dryRunCall<TDecoded>(
+    call: CallTxKind | CallTxKindInput,
+    options: DryRunCallOptions<TDecoded> & { decoder: (bytes: Uint8Array) => TDecoded },
+  ): Promise<DryRunCallResult<TDecoded> & { decoded: TDecoded }>;
+  async dryRunCall<TDecoded = undefined>(
+    call: CallTxKind | CallTxKindInput,
+    options?: DryRunCallOptions<TDecoded>,
+  ): Promise<DryRunCallResult<TDecoded>>;
+  async dryRunCall<TDecoded = undefined>(
+    call: CallTxKind | CallTxKindInput,
+    options?: DryRunCallOptions<TDecoded>,
+  ): Promise<DryRunCallResult<TDecoded>> {
+    return dryRunCall(this, call, options);
   }
 
   /**
