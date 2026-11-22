@@ -21,8 +21,11 @@ import { parseQuantity, toHexQuantity } from "./units";
 import {
   type CallTxKind,
   type CallTxKindInput,
+  type EstimateAndBuildCallOptions,
+  type PreparedCallTransaction,
   type SignedTxResult,
   buildCallTxKind,
+  estimateAndBuildCall,
   signCallContractTransaction,
 } from "./contracts";
 import { getPublicKey } from "./wallet";
@@ -286,6 +289,17 @@ export class KovanicaClient {
    */
   buildCallTransaction(call: CallTxKindInput): CallTxKind {
     return buildCallTxKind(call);
+  }
+
+  /**
+   * Estimates fee/gas parameters for a contract call and builds a validated,
+   * ready-to-sign call transaction payload with configurable safety margins.
+   */
+  async estimateAndBuildCall(
+    call: CallTxKind | CallTxKindInput,
+    options?: EstimateAndBuildCallOptions,
+  ): Promise<PreparedCallTransaction> {
+    return estimateAndBuildCall(this, call, options);
   }
 
   /**

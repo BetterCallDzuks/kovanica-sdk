@@ -2,6 +2,20 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
+## [0.4.0] - 2026-11-22
+
+### Added
+- **WebSocket Subscription Client (`KovanicaWsClient`)** (`ws.ts`):
+  - Typed JSON-RPC 2.0 WebSocket client for `/ws` endpoints supporting `subscribeNewHeads` (`newHeads`), `subscribeCommittedLeaders` (`newCommittedLeader`), `subscribeLogs` (`logs` with optional address/topic `WsLogFilter`), and `unsubscribe`.
+  - Lifecycle management (`connect`, `close`, `isConnected`, `activeSubscriptionCount`), automatic exponential-backoff reconnection with transparent subscription re-establishment and server ID remapping, configurable request timeouts, injectable `WebSocketImpl`, and `onError` hook.
+- **Typed Bincode Contract ABI Decoders & Storage Slot Derivation** (`decoders.ts`):
+  - Bounds-checked little-endian `BincodeReader` and typed `KovanicaDecodeError` (`TRUNCATED`, `TRAILING_BYTES`, `INVALID_BOOL`, `INVALID_VARIANT`, `INVALID_UTF8`, `LENGTH_OVERFLOW`, `INVALID_INPUT`).
+  - Canonical state and record decoders matching `kovanica-l1` Rust layouts: `decodeHtlcRecord`, `decodeVaultRecord`, `decodeMultisigState`, `decodeMultisigPendingTx`, `decodeTokenMetadata` / `decodeTokenState`, `decodeTokenPool`, `decodeNameRecord`, `decodeNftMetadata` / `decodeNftState`, and `decodeEscrowRecord`.
+  - BLAKE3 storage slot derivation helpers (`STORAGE_KEY_PREFIXES`, `derivePrefixedStorageSlot`, `deriveStorageSlot`, `deriveStorageSlotHex`) for `kovanica_getStorageAt`.
+- **Fee/Gas Estimation & Call Builder Helper** (`contracts.ts`, `client.ts`):
+  - Added `estimateAndBuildCall` (standalone and `client.estimateAndBuildCall(...)`) and `estimateCallTxSize`.
+  - Computes exact wire Call transaction size, fetches fee rate via `kovanica_estimateFee` (and optional sender nonce via `kovanica_getNonce` in parallel), applies configurable basis-point safety margins (`DEFAULT_FEE_SAFETY_MARGIN_BPS = 12_000`, `DEFAULT_GAS_SAFETY_MARGIN_BPS = 12_000`), enforces optional `minFee` floor / `maxFee` cap, and returns a validated `PreparedCallTransaction` ready for signing.
+
 ## [0.3.0] - 2026-11-17
 
 ### Added

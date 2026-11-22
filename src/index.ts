@@ -117,7 +117,10 @@ export {
 
 // Smart Contract Argument Builders, Bincode Encoders & Transaction Signers
 export {
+  CALL_TX_FIXED_WIRE_OVERHEAD,
   DEFAULT_CALL_GAS_LIMIT,
+  DEFAULT_FEE_SAFETY_MARGIN_BPS,
+  DEFAULT_GAS_SAFETY_MARGIN_BPS,
   DOMAIN_TAG_STR,
   KEYED_HASH_TAG_STR,
   MAX_TX_GAS_LIMIT,
@@ -125,6 +128,9 @@ export {
   TX_KEY,
   type CallTxKind,
   type CallTxKindInput,
+  type EstimateAndBuildCallClient,
+  type EstimateAndBuildCallOptions,
+  type PreparedCallTransaction,
   type SignedTxResult,
   asciiPad,
   buildCallTxKind,
@@ -148,6 +154,8 @@ export {
   encodeHtlcCreateArgs,
   encodeNameRegisterArgs,
   encodeNftMintArgs,
+  estimateAndBuildCall,
+  estimateCallTxSize,
   hexToBytes,
   parseContractAddress,
   signCallContractTransaction,

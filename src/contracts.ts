@@ -7,6 +7,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { sha512 } from "@noble/hashes/sha2.js";
 import { decodeAddress } from "./address";
 import { CHAIN_IDS } from "./chains";
+import type { RequestOptions } from "./types";
 
 // --- Domain Tags & Gas Limits ---
 
@@ -15,6 +16,13 @@ export const KEYED_HASH_TAG_STR = "KVNC-TX-v1";
 
 export const DEFAULT_CALL_GAS_LIMIT = 100_000n;
 export const MAX_TX_GAS_LIMIT = 10_000_000n;
+
+/** Default fee safety margin in basis points (12_000 = 1.20x / +20%). */
+export const DEFAULT_FEE_SAFETY_MARGIN_BPS = 12_000;
+/** Default gas limit safety margin in basis points (12_000 = 1.20x / +20%). */
+export const DEFAULT_GAS_SAFETY_MARGIN_BPS = 12_000;
+/** Fixed wire byte overhead for a signed Call transaction outside `wireCallKindBytes`: 32 (sender) + 8 (nonce) + 8 (fee) + 8 (sig len) + 64 (sig) + 32 (sighash). */
+export const CALL_TX_FIXED_WIRE_OVERHEAD = 152;
 
 export function asciiPad(str: string, len: number): Uint8Array {
   const buf = new Uint8Array(len);
@@ -680,5 +688,213 @@ export function signCallContractTransaction(params: {
     rawTxBytes,
     rawTxHex: bytesToHex(rawTxBytes),
     txSize: rawTxBytes.length,
+  };
+}
+
+// --- Fee/Gas Estimation & Prepared Call Builder ---
+
+/**
+ * Minimal client interface required by {@link estimateAndBuildCall}.
+ * Satisfied by {@link KovanicaClient}.
+ */
+export interface EstimateAndBuildCallClient {
+  estimateFee(options?: RequestOptions): Promise<bigint>;
+  getNonce(address: string, options?: RequestOptions): Promise<bigint>;
+}
+
+export interface EstimateAndBuildCallOptions {
+  /**
+   * Optional sender address (PRO-21 `kvnc...dag` / `tknc...dag` or 32-byte hex).
+   * When provided and `nonce` is omitted, fetches the sender's current nonce via `client.getNonce(sender)`.
+   */
+  sender?: string;
+  /**
+   * Explicit nonce override. Skips the `client.getNonce` RPC call when provided.
+   */
+  nonce?: bigint | number;
+  /**
+   * Explicit total fee override in atoms. Skips the `client.estimateFee` RPC call when provided.
+   */
+  fee?: bigint | number;
+  /**
+   * Fee safety margin in basis points (`10_000` = 1.0x, `12_000` = +20%).
+   * Applied to `feeRatePerByte * estimatedTxSize` when `fee` is not explicitly overridden.
+   * Default: {@link DEFAULT_FEE_SAFETY_MARGIN_BPS} (`12_000`).
+   */
+  feeMarginBps?: number;
+  /**
+   * Gas limit safety margin in basis points (`10_000` = 1.0x, `12_000` = +20%).
+   * Applied to the call's gas limit (clamped to {@link MAX_TX_GAS_LIMIT}) when `gasLimit` / `gas_limit`
+   * is not explicitly supplied on `call`, or whenever `gasMarginBps` is explicitly specified.
+   * Default: {@link DEFAULT_GAS_SAFETY_MARGIN_BPS} (`12_000`) for defaulted gas, or `10_000` (1.0x) when explicit gas was provided.
+   */
+  gasMarginBps?: number;
+  /**
+   * Minimum fee floor in atoms. Default: `0n`.
+   */
+  minFee?: bigint | number;
+  /**
+   * Optional maximum fee cap in atoms. Throws if the computed or overridden fee exceeds this cap.
+   */
+  maxFee?: bigint | number;
+  /**
+   * Chain ID to attach to the prepared call transaction. Default: `CHAIN_IDS.MAINNET`.
+   */
+  chainId?: number;
+  /**
+   * Optional RPC request options (`timeoutMs`, `signal`) forwarded to `estimateFee` and `getNonce`.
+   */
+  requestOptions?: RequestOptions;
+}
+
+export interface PreparedCallTransaction {
+  /** Validated `CallTxKind` with resolved gas limit, ready for `signCallContractTransaction` or `wallet.signCallTransaction`. */
+  call: CallTxKind;
+  /** Estimated or overridden total transaction fee in atoms (includes safety margin and `minFee` floor). */
+  fee: bigint;
+  /** Raw fee rate returned by `kovanica_estimateFee` in atoms per byte (`undefined` when `fee` was explicitly overridden). */
+  feeRatePerByte?: bigint;
+  /** Exact serialized wire size of the signed Call transaction in bytes. */
+  estimatedTxSize: number;
+  /** Resolved gas limit applied to `call.gas_limit` and `call.gasLimit`. */
+  gasLimit: bigint;
+  /** Resolved sender nonce (fetched via `client.getNonce` when `sender` is provided, or explicit override; `undefined` if neither was supplied). */
+  nonce?: bigint;
+  /** Chain ID attached for signing. */
+  chainId: number;
+}
+
+const BPS_DENOMINATOR = 10_000n;
+
+function validateMarginBps(value: number, name: string): bigint {
+  if (!Number.isInteger(value) || value < 10_000) {
+    throw new RangeError(`${name} must be an integer >= 10000 (1.0x), got ${value}`);
+  }
+  return BigInt(value);
+}
+
+function applyBpsCeil(amount: bigint, marginBps: bigint): bigint {
+  if (amount === 0n) return 0n;
+  return (amount * marginBps + (BPS_DENOMINATOR - 1n)) / BPS_DENOMINATOR;
+}
+
+/**
+ * Computes the exact serialized wire byte size of a signed Call transaction.
+ * Matches `signCallContractTransaction(...).txSize` byte-for-byte.
+ */
+export function estimateCallTxSize(call: CallTxKind | CallTxKindInput): number {
+  const callKind =
+    "call_value" in call && "gas_limit" in call && call.contract instanceof Uint8Array
+      ? (call as CallTxKind)
+      : buildCallTxKind(call);
+  return CALL_TX_FIXED_WIRE_OVERHEAD + wireCallKindBytes(callKind).length;
+}
+
+/**
+ * Estimates fee/gas parameters for a contract call and builds a validated,
+ * ready-to-sign {@link PreparedCallTransaction} payload with configurable safety margins.
+ *
+ * - Validates and normalizes `call` (applying `gasMarginBps` when gas is defaulted or explicitly requested, clamped to {@link MAX_TX_GAS_LIMIT}).
+ * - Computes exact wire transaction size via {@link estimateCallTxSize}.
+ * - Fetches `kovanica_estimateFee` (unless `options.fee` is provided) and `kovanica_getNonce` (when `options.sender` is provided and `options.nonce` is omitted) in parallel.
+ * - Applies `feeMarginBps` (default 12_000 = +20%) and enforces `minFee` floor / `maxFee` cap.
+ */
+export async function estimateAndBuildCall(
+  client: EstimateAndBuildCallClient,
+  call: CallTxKind | CallTxKindInput,
+  options: EstimateAndBuildCallOptions = {},
+): Promise<PreparedCallTransaction> {
+  const feeMarginBps = validateMarginBps(
+    options.feeMarginBps ?? DEFAULT_FEE_SAFETY_MARGIN_BPS,
+    "feeMarginBps",
+  );
+
+  const hasExplicitGas = call.gas_limit !== undefined || call.gasLimit !== undefined;
+  const gasMarginBps =
+    options.gasMarginBps !== undefined
+      ? validateMarginBps(options.gasMarginBps, "gasMarginBps")
+      : hasExplicitGas
+        ? BPS_DENOMINATOR
+        : BigInt(DEFAULT_GAS_SAFETY_MARGIN_BPS);
+
+  const minFee = options.minFee !== undefined ? BigInt(options.minFee) : 0n;
+  if (minFee < 0n) {
+    throw new RangeError(`minFee must be non-negative, got ${minFee}`);
+  }
+
+  const maxFee = options.maxFee !== undefined ? BigInt(options.maxFee) : undefined;
+  if (maxFee !== undefined && maxFee < 0n) {
+    throw new RangeError(`maxFee must be non-negative, got ${maxFee}`);
+  }
+  if (maxFee !== undefined && minFee > maxFee) {
+    throw new RangeError(`minFee (${minFee}) cannot exceed maxFee (${maxFee})`);
+  }
+
+  let explicitNonce: bigint | undefined;
+  if (options.nonce !== undefined) {
+    explicitNonce = BigInt(options.nonce);
+    if (explicitNonce < 0n) {
+      throw new RangeError(`nonce must be non-negative, got ${explicitNonce}`);
+    }
+  }
+
+  let explicitFee: bigint | undefined;
+  if (options.fee !== undefined) {
+    explicitFee = BigInt(options.fee);
+    if (explicitFee < 0n) {
+      throw new RangeError(`fee must be non-negative, got ${explicitFee}`);
+    }
+  }
+
+  // Validate and build the base call first so invalid inputs fail before any RPC I/O.
+  const baseCall = buildCallTxKind(call);
+  const marginedGas = applyBpsCeil(baseCall.gas_limit, gasMarginBps);
+  const resolvedGasLimit = marginedGas > MAX_TX_GAS_LIMIT ? MAX_TX_GAS_LIMIT : marginedGas;
+
+  const preparedCall: CallTxKind =
+    resolvedGasLimit === baseCall.gas_limit
+      ? baseCall
+      : {
+          ...baseCall,
+          gas_limit: resolvedGasLimit,
+          gasLimit: resolvedGasLimit,
+        };
+
+  const estimatedTxSize = estimateCallTxSize(preparedCall);
+
+  const needsFeeEstimate = explicitFee === undefined;
+  const needsNonce = explicitNonce === undefined && options.sender !== undefined;
+
+  const [feeRatePerByte, fetchedNonce] = await Promise.all([
+    needsFeeEstimate ? client.estimateFee(options.requestOptions) : Promise.resolve(undefined),
+    needsNonce
+      ? client.getNonce(options.sender!, options.requestOptions)
+      : Promise.resolve(undefined),
+  ]);
+
+  let fee: bigint;
+  if (explicitFee !== undefined) {
+    fee = explicitFee;
+  } else {
+    if (feeRatePerByte! < 0n) {
+      throw new RangeError(`Estimated fee rate must be non-negative, got ${feeRatePerByte}`);
+    }
+    const baseFee = feeRatePerByte! * BigInt(estimatedTxSize);
+    const marginedFee = applyBpsCeil(baseFee, feeMarginBps);
+    fee = marginedFee < minFee ? minFee : marginedFee;
+  }
+
+  if (maxFee !== undefined && fee > maxFee) {
+    throw new RangeError(`Computed fee ${fee} exceeds maxFee ${maxFee}`);
+  }
+
+  return {
+    call: preparedCall,
+    fee,
+    feeRatePerByte,
+    estimatedTxSize,
+    gasLimit: resolvedGasLimit,
+    nonce: explicitNonce ?? fetchedNonce,
+    chainId: options.chainId ?? CHAIN_IDS.MAINNET,
   };
 }
