@@ -69,6 +69,7 @@ import {
   readContractStorage,
 } from "./decoders";
 import { getPublicKey } from "./wallet";
+import { type MempoolFeeStats, parseMempoolFeeStats } from "./mempool-stats";
 
 export type { RpcRetryConfig } from "./types";
 
@@ -90,6 +91,7 @@ export const DEFAULT_IDEMPOTENT_RPC_METHODS: ReadonlyArray<string> = Object.free
   "kovanica_getTransactionByHash",
   "kovanica_getTransactionReceipt",
   "kovanica_getPendingTransactions",
+  "kovanica_mempoolStats",
   "kovanica_getLogs",
   "kovanica_getBlockByHash",
   "kovanica_getBlockByNumber",
@@ -774,6 +776,15 @@ export class KovanicaClient {
   async estimateFee(options?: RequestOptions): Promise<bigint> {
     const raw = await this.call<unknown>("kovanica_estimateFee", [], options);
     return parseQuantity(raw);
+  }
+
+  /**
+   * Returns live mempool occupancy and fee-per-byte distribution statistics.
+   * RPC: `kovanica_mempoolStats`
+   */
+  async getMempoolStats(options?: RequestOptions): Promise<MempoolFeeStats> {
+    const raw = await this.call<unknown>("kovanica_mempoolStats", [], options);
+    return parseMempoolFeeStats(raw);
   }
 
   /**
