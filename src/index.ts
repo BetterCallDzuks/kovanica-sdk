@@ -10,15 +10,22 @@ export {
   type KovanicaClientOptions,
   type RpcRetryConfig,
   computeRetryDelayMs,
+  createFailoverClient,
   isNodeSynced,
   parseSafeOptionalQuantity,
 } from "./client";
 export {
+  FailoverHttpTransport,
   HttpTransport,
   MAX_JSONRPC_BATCH_SIZE,
+  type FailoverEndpointHealth,
+  type FailoverEvent,
+  type FailoverHttpTransportOptions,
   type HttpTransportOptions,
   type Transport,
+  createFailoverHttpTransport,
   parseLosslessJson,
+  sanitizeRpcUrl,
 } from "./transport";
 export {
   KovanicaWsClient,
@@ -289,3 +296,22 @@ export {
   getContractLogHistory,
   subscribeContractEvents,
 } from "./events";
+
+// Fee-Buffer Estimation & Abortable Finality Watching
+export {
+  DEFAULT_FEE_BUFFER_MULTIPLIER_BPS,
+  DEFAULT_FINALITY_CONFIRMATIONS,
+  DEFAULT_FINALITY_POLL_INTERVAL_MS,
+  DEFAULT_FINALITY_TIMEOUT_MS,
+  type FeeBufferEstimate,
+  type FeeBufferOptions,
+  type FinalityClient,
+  type FinalityProgress,
+  type FinalityReceiptLike,
+  type FinalityResult,
+  type FinalityStatus,
+  type WaitForFinalityOptions,
+  applyFeeBuffer,
+  estimateTxFeeWithBuffer,
+  waitForTransactionFinality,
+} from "./finality";
