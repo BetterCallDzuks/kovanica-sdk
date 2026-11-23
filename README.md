@@ -643,6 +643,248 @@ const decodedLogs = decodeTransactionReceiptLogs(receipt, (log, index) => {
 
 ---
 
+## v0.5.0 Production Toolkit Examples
+
+All `v0.5.0` helpers are browser-safe (zero Node-only dependencies) and exported directly from `"kovanica-sdk"`.
+
+### 1. Multi-Endpoint Failover & Credential Sanitization
+
+Use `createFailoverClient` (or `FailoverHttpTransport` directly) for ordered endpoint failover with per-endpoint circuit-breaker cooldowns and automatic URL redaction via `sanitizeRpcUrl`:
+
+```typescript
+import {
+  FailoverHttpTransport,
+  KovanicaClient,
+  createFailoverClient,
+  sanitizeRpcUrl,
+} from "kovanica-sdk";
+
+// Sanitize URLs before logging (strips user:pass@, fragments, and token/api_key query params)
+console.log(sanitizeRpcUrl("https://user:secret@rpc.example.com/rpc?api_key=abc#frag"));
+// => "https://rpc.example.com/rpc"
+
+// Option A: High-level helper creating a KovanicaClient backed by FailoverHttpTransport
+const failoverClient = createFailoverClient(
+  [
+    "http://127.0.0.1:8545/rpc",
+    "http://127.0.0.1:8546/rpc",
+  ],
+  {
+    timeoutMs: 5_000,
+    maxRetriesPerEndpoint: 1,
+    baseBackoffMs: 150,
+    maxBackoffMs: 2_000,
+    cooldownMs: 15_000,
+    onFailover: (event) => {
+      console.warn(
+        `Failover ${event.fromUrl} -> ${event.toUrl ?? "none"} (${event.method}): ${event.reason}`,
+      );
+    },
+  },
+);
+
+const height = await failoverClient.blockNumber();
+console.log(`Committed height: ${height}`);
+
+// Option B: Direct FailoverHttpTransport when you also want endpoint health snapshots
+const transport = new FailoverHttpTransport({
+  urls: ["http://127.0.0.1:8545/rpc", "http://127.0.0.1:8546/rpc"],
+  cooldownMs: 15_000,
+});
+const client = new KovanicaClient({ transport });
+await client.blockNumber();
+for (const ep of transport.getEndpointHealth()) {
+  console.log(`${ep.url}: state=${ep.state}, healthy=${ep.healthy}, ok=${ep.totalSuccesses}`);
+}
+```
+
+### 2. Single-POST Header-Aware Node Capability Probe (`probeRpcNode`)
+
+`probeRpcNode` executes a single JSON-RPC 2.0 batch POST (`kovanica_chainId`, `kovanica_blockNumber`, `kovanica_estimateFee`) and validates the `X-Kovanica-Network-Tag`, `X-Kovanica-Rpc-Version`, and `X-Kovanica-Chain-Id` response headers:
+
+```typescript
+import { CHAIN_IDS, probeRpcNode } from "kovanica-sdk";
+
+const probe = await probeRpcNode("http://127.0.0.1:8545/rpc", {
+  expectedChainId: CHAIN_IDS.TESTNET,
+  timeoutMs: 5_000,
+});
+
+if (!probe.ok) {
+  throw new Error(`Node probe failed (${probe.url}): ${probe.error}`);
+}
+
+console.log({
+  url: probe.url,
+  chainId: probe.chainId,
+  headerChainId: probe.headerChainId, // from X-Kovanica-Chain-Id
+  networkTag: probe.networkTag,       // from X-Kovanica-Network-Tag
+  rpcVersion: probe.rpcVersion,       // from X-Kovanica-Rpc-Version
+  canonicalTagMatch: probe.canonicalTagMatch,
+  batchSupported: probe.batchSupported,
+  blockHeight: probe.blockHeight,
+  feeRate: probe.feeRate,
+  latencyMs: probe.latencyMs,
+});
+```
+
+### 3. Mempool Fee-Tier Recommendations & Abortable Finality
+
+Combine `client.getMempoolStats()`, `computeFeeRecommendations`, `applyFeeBuffer`, and `waitForTransactionFinality` for live fee-tier selection and multi-confirmation finality tracking:
+
+```typescript
+import {
+  KovanicaClient,
+  applyFeeBuffer,
+  computeFeeRecommendations,
+  waitForTransactionFinality,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+
+// 1. Fetch mempool fee distribution and compute monotonic economy/standard/priority tiers
+const stats = await client.getMempoolStats();
+const tiers = computeFeeRecommendations(stats, {
+  fallbackBaseFeePerByte: 10n,
+  safetyMultiplierBps: 12_000, // 1.2x safety buffer
+});
+console.log(`Fee tiers (${tiers.source}):`, {
+  economy: tiers.economy,
+  standard: tiers.standard,
+  priority: tiers.priority,
+});
+
+// 2. Apply a ceiling-rounded fee buffer with optional floor and cap
+const buffered = applyFeeBuffer(tiers.standard * 196n, {
+  safetyMultiplierBps: 11_500, // +15%
+  minFeePerByte: 1_000n,
+  maxFeeCap: 5_000_000n,
+});
+console.log(`Buffered total fee: ${buffered.bufferedFee} atoms (capped=${buffered.capped})`);
+
+// 3. Watch a transaction until it reaches target confirmations (with AbortSignal support)
+const controller = new AbortController();
+const finality = await waitForTransactionFinality(client, "0x" + "ab".repeat(32), {
+  confirmations: 3,
+  pollIntervalMs: 2_000,
+  timeoutMs: 60_000,
+  signal: controller.signal,
+  onProgress: (update) => {
+    console.log(
+      `[${update.status}] ${update.confirmations}/${update.targetConfirmations} confs (${update.elapsedMs}ms)`,
+    );
+  },
+});
+console.log(`Finalized at height ${finality.blockHeight} (tip ${finality.currentHeight})`);
+```
+
+### 4. Offline Transfer Signing, Auto-Decoding & RFC 8032 Ed25519 Verification
+
+Sign native transfers completely offline with `signTransferTransaction`, auto-detect and decode Transfer (variant `0`) or Call (variant `6`) payloads with `decodeSignedTransactionAuto`, and verify the Ed25519 signature with `verifySignedTransactionAuto`:
+
+```typescript
+import {
+  CHAIN_IDS,
+  decodeSignedTransactionAuto,
+  signTransferTransaction,
+  verifySignedTransactionAuto,
+} from "kovanica-sdk";
+
+const senderPrivateKey = new Uint8Array(32).fill(7);
+const recipientPubkey = new Uint8Array(32).fill(9);
+
+// 1. Sign a canonical 196-byte native Transfer transaction offline
+const signed = signTransferTransaction({
+  privateKey: senderPrivateKey,
+  to: recipientPubkey, // accepts 32-byte Uint8Array, PRO-21 address, or 0x hex
+  amount: 1_000_000_000n, // 1 KVNC in atoms
+  nonce: 0n,
+  fee: 10_000n,
+  chainId: CHAIN_IDS.TESTNET,
+});
+
+// 2. Auto-decode Transfer or Call wire bytes/hex and verify RFC 8032 Ed25519 signature
+const decoded = decodeSignedTransactionAuto(signed.rawTxHex, {
+  chainId: CHAIN_IDS.TESTNET,
+});
+const signatureValid = verifySignedTransactionAuto(decoded);
+
+if (decoded.kind === "transfer") {
+  console.log({
+    sender: decoded.tx.senderAddress,
+    recipient: decoded.tx.recipientAddress,
+    amount: decoded.tx.amount,
+    fee: decoded.tx.fee,
+    wireSizeBytes: decoded.tx.wireSizeBytes, // 196
+    signatureValid, // true
+  });
+}
+```
+
+### 5. PRO-21 Address Inspection & Batch Normalization
+
+Inspect arbitrary address inputs without throwing via `inspectAddress` and canonicalize/deduplicate recipient lists with `normalizeAddressList`:
+
+```typescript
+import {
+  CHAIN_IDS,
+  encodeAddress,
+  inspectAddress,
+  normalizeAddressList,
+} from "kovanica-sdk";
+
+const sampleAddr = encodeAddress(new Uint8Array(32).fill(1));
+
+// Inspect format, BLAKE3 checksum, canonical forms, and chain policy
+const info = inspectAddress(sampleAddr, CHAIN_IDS.MAINNET);
+console.log({
+  valid: info.valid,
+  format: info.format, // "pro21-mainnet"
+  checksumValid: info.checksumValid,
+  chainAllowed: info.chainAllowed,
+  canonicalMainnet: info.canonicalMainnet,
+  canonicalTestnet: info.canonicalTestnet,
+});
+
+// Validate, deduplicate, and canonicalize a batch of addresses
+const normalized = normalizeAddressList(
+  [sampleAddr, sampleAddr, "0x" + "11".repeat(32), "not-an-address"],
+  { expectedChainId: CHAIN_IDS.MAINNET },
+);
+console.log(`Valid (${normalized.valid.length}):`, normalized.valid);
+console.log(`Invalid (${normalized.invalid.length}):`, normalized.invalid);
+```
+
+### 6. Air-Gapped BLAKE3-Checksummed Transaction Envelopes
+
+Wrap signed transactions in compact, QR-friendly `kvnc-tx:v1:<base64url>` envelopes with an 8-byte BLAKE3 integrity checksum and canonical network-tag pinning for Mainnet (`1`) and Testnet (`2`):
+
+```typescript
+import {
+  CHAIN_IDS,
+  decodeAirgapTxEnvelope,
+  encodeAirgapTxEnvelope,
+} from "kovanica-sdk";
+
+// 1. Offline signer encodes the signed transaction into a checksummed envelope
+const { encoded, envelope } = encodeAirgapTxEnvelope({
+  chainId: CHAIN_IDS.TESTNET,
+  kind: "transfer",
+  rawTxHex: signed.rawTxHex,
+  signingHashHex: signed.signingHashHex,
+});
+console.log(`Air-gap payload (${encoded.length} chars):`, encoded);
+console.log(`Checksum: ${envelope.checksumHex}, Network Tag: ${envelope.networkTag}`);
+
+// 2. Online broadcaster decodes, verifies checksum + network tag + expected chain ID
+const verified = decodeAirgapTxEnvelope(encoded, {
+  expectedChainId: CHAIN_IDS.TESTNET,
+});
+console.log(`Ready to broadcast ${verified.kind} tx on chain ${verified.chainId}: ${verified.rawTxHex}`);
+```
+
+---
+
 ## Large Integer Representation & Lossless Quantities
 
 Kovanica JSON-RPC uses `0x`-prefixed minimal hex strings for integers (e.g. `"0x0"`, `"0x2540be400"` for 10 KVNC).
