@@ -3,7 +3,7 @@
 Typed, lightweight TypeScript client and developer toolkit for the **Kovanica (KVNC)** Layer-1 blockchain, suitable for modern browsers and Node.js (18+).
 
 > [!NOTE]
-> **Full Ecosystem Client (v0.4.0):** Features SLIP-0010 HD wallet derivation, canonical Wasmi smart contract call builders, fee/gas estimation (`estimateAndBuildCall`), deterministic Bincode encoders and typed contract ABI decoders, real-time WebSocket subscriptions (`KovanicaWsClient`), RFC 8032 Ed25519 signing under domain `KVNC/tx/v1`, lossless JSON-RPC 2.0 transport, and transaction broadcasting.
+> **Full Ecosystem Client (v0.4.0):** Features SLIP-0010 HD wallet derivation, canonical Wasmi smart contract call builders, single & multi-call batch fee/gas estimation (`estimateAndBuildCall`, `estimateBatchCalls`), deterministic Bincode encoders and typed contract ABI/log decoders (`decodeContractLog`), real-time WebSocket subscriptions (`KovanicaWsClient`), RFC 8032 Ed25519 signing under domain `KVNC/tx/v1`, lossless JSON-RPC 2.0 transport, and transaction broadcasting.
 
 ---
 
@@ -11,10 +11,10 @@ Typed, lightweight TypeScript client and developer toolkit for the **Kovanica (K
 
 - **Standard JSON-RPC 2.0 Transport:** Configurable endpoint URL, automatic request IDs, configurable timeouts, caller-controlled cancellation (`AbortSignal`), and typed error classes.
 - **Real-Time WebSocket Subscriptions (`KovanicaWsClient`):** Typed JSON-RPC 2.0 WebSocket client (`GET /ws`) supporting `newHeads`, `newCommittedLeader`, and filtered `logs` subscriptions with automatic exponential-backoff reconnection, transparent re-subscription, and optional heartbeat / idle liveness detection (`heartbeatIntervalMs`, `heartbeatTimeoutMs`, `heartbeatMethod`).
-- **Transaction Construction, Estimation, Dry-Run Simulation & Broadcasting:** High-level `KovanicaWallet` and `KovanicaClient` support for estimating fees/gas (`estimateAndBuildCall`), read-only contract dry-run simulation with typed Bincode decoding (`dryRunCall`), constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`.
+- **Transaction Construction, Estimation, Dry-Run Simulation & Broadcasting:** High-level `KovanicaWallet` and `KovanicaClient` support for estimating fees/gas for single calls (`estimateAndBuildCall`) and sequential-nonce batches (`estimateBatchCalls`), read-only contract dry-run simulation with typed Bincode decoding (`dryRunCall`), constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`.
 - **HD Wallet & Key Derivation (BIP-39 / SLIP-0010):** Standard BIP-44 path derivation with hardened Ed25519 (`m/44'/3007'/0'/0/0`), seed derivation, message signing, and network-aware address formatting.
 - **Canonical Smart Contract Argument Builders:** Deterministic Bincode encoders for core Wasmi contracts (`name_register`, `htlc_create`, `nft_mint`, `escrow_create`, `token_transfer`, `vault_create`) matching L1 node and playground specifications.
-- **Typed Bincode Contract ABI Decoders & Storage Slot Derivation:** Bounds-checked `BincodeReader`, typed `KovanicaDecodeError`, canonical state/record decoders for HTLC, Vault, Multisig, Token/Pool, Name Registry, NFT, and Escrow contracts, plus BLAKE3 storage slot derivation (`deriveStorageSlot`, `deriveStorageSlotHex`) for `kovanica_getStorageAt`.
+- **Typed Bincode Contract ABI & Log Decoders + Storage Slot Derivation:** Bounds-checked `BincodeReader`, typed `KovanicaDecodeError`, canonical state/record decoders and discriminated-union log dispatcher (`decodeContractLog`) for HTLC, Vault, Multisig, Token/Pool, Name Registry, NFT, and Escrow contracts, plus BLAKE3 storage slot derivation (`deriveStorageSlot`, `deriveStorageSlotHex`) for `kovanica_getStorageAt`.
 - **Domain-Tagged Ed25519 Signing:** Pure TypeScript RFC 8032 Ed25519 signature computation with BLAKE3 domain hashing (`KVNC/tx/v1`).
 - **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`566da35`](https://github.com/KovanicaDAG/kovanica-l1/commit/566da35).
 - **Lossless Precision (Large Integers):** Kovanica balances, heights, stakes, nonces, and gas rates are represented losslessly as native JavaScript `bigint`. Never coerced into IEEE-754 `Number`. Plain JSON integers up to `u64::MAX` are preserved losslessly.
@@ -240,6 +240,54 @@ console.log(`Tx ${txHash} (${prepared.estimatedTxSize} bytes, fee ${prepared.fee
 - `chainId`: Chain ID attached to the returned `PreparedCallTransaction` (default: `CHAIN_IDS.MAINNET`).
 - `requestOptions`: Optional `{ timeoutMs, signal }` forwarded to `estimateFee` and `getNonce`.
 
+#### Multi-Call Batch Estimation (`estimateBatchCalls`)
+
+`estimateBatchCalls` (available both as a standalone helper and as `client.estimateBatchCalls(calls, options?)`) validates a non-empty array of contract calls fail-closed before any RPC I/O, fetches `kovanica_estimateFee` and `kovanica_getNonce(sender)` in a single parallel RPC round-trip, assigns sequential nonces (`startNonce + BigInt(i)`), enforces `minFeePerCall` and an optional batch-wide `maxTotalFee` cap, and returns `PreparedBatchCallTransactions`:
+
+```typescript
+import {
+  KovanicaClient,
+  KovanicaWallet,
+  CHAIN_IDS,
+  buildNameRegisterCall,
+  buildTokenTransferCall,
+  estimateBatchCalls,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+const wallet = KovanicaWallet.fromMnemonic("your seed phrase ...", "", 0, 0, 0, undefined, {
+  chainId: CHAIN_IDS.TESTNET,
+  client,
+});
+
+const batch = await client.estimateBatchCalls(
+  [
+    {
+      contract: "0x" + "11".repeat(32),
+      method: "name_register",
+      args: buildNameRegisterCall("alice", wallet.publicKey, ["127.0.0.1:8000"]),
+    },
+    buildTokenTransferCall("0x" + "22".repeat(32), wallet.publicKey, 500_000n),
+  ],
+  {
+    sender: wallet.address,
+    chainId: CHAIN_IDS.TESTNET,
+    minFeePerCall: 10_000n,
+    maxTotalFee: 10_000_000n,
+  },
+);
+
+console.log(`Batch totalFee=${batch.totalFee} atoms, totalGas=${batch.totalGasLimit}, startNonce=${batch.startNonce}`);
+for (const item of batch.calls) {
+  const signed = wallet.signCallTransaction(item.call, {
+    nonce: item.nonce!,
+    fee: item.fee,
+    chainId: item.chainId,
+  });
+  await client.sendRawTransaction(`0x${signed.rawTxHex}`);
+}
+```
+
 #### Read-Only Contract Dry-Run Simulation (`dryRunCall`)
 
 `dryRunCall` (available both as a standalone helper and as `client.dryRunCall(call, options?)`) simulates a read-only contract call against current node state via `kovanica_call` and optionally decodes the returned bytes with a typed Bincode decoder:
@@ -377,6 +425,37 @@ try {
 | **Escrow** | `decodeEscrowRecord` | `EscrowRecord` (`status`: `"open" \| "released" \| "refunded"`) | `("escrow", escrowId32)` — `blake3("kvnc/v1/escrow/" \|\| escrowId32)` |
 
 For custom contract state layouts, use `BincodeReader` directly (`readU8`, `readU16`, `readU32`, `readU64`, `readU128`, `readBool`, `readFixedBytes`, `readBytes`, `readString`, `readOption`, `readVec`, `assertEof`) and `derivePrefixedStorageSlot(prefix, key)`. All decoders fail closed with `KovanicaDecodeError` (`TRUNCATED`, `TRAILING_BYTES`, `INVALID_BOOL`, `INVALID_VARIANT`, `INVALID_UTF8`, `LENGTH_OVERFLOW`, `INVALID_INPUT`).
+
+#### Typed Contract Event / Log Dispatcher (`decodeContractLog`)
+
+`decodeContractLog(logDataHexOrBytes, kind)` dispatches across all canonical Bincode contract record/event payloads (such as `WsExecutionEvent.data` from `KovanicaWsClient.subscribeLogs` or raw storage hex) and returns a discriminated union `{ kind, record }`:
+
+```typescript
+import { decodeContractLog, type ContractLogKind } from "kovanica-sdk";
+
+// Decode a specific known log kind (narrows return type to { kind: "htlc", record: HtlcRecord })
+const htlcEvent = decodeContractLog(event.data, "htlc");
+console.log(`HTLC status: ${htlcEvent.record.status}, amount: ${htlcEvent.record.amount}`);
+
+// Or switch over the discriminated union when dispatching dynamically
+function handleDecodedLog(rawHex: string, kind: ContractLogKind) {
+  const decoded = decodeContractLog(rawHex, kind);
+  switch (decoded.kind) {
+    case "htlc":
+      return decoded.record.hashLockHex;
+    case "vault":
+      return decoded.record.schedule.kind;
+    case "name":
+      return decoded.record.relayEndpoints;
+    case "escrow":
+      return decoded.record.status;
+    default:
+      return decoded.record;
+  }
+}
+```
+
+Supported `ContractLogKind` values: `"htlc"`, `"vault"`, `"multisig_state"`, `"multisig_tx"`, `"token_metadata"`, `"token_pool"`, `"name"`, `"nft_metadata"`, `"escrow"`.
 
 ---
 
