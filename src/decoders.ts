@@ -885,6 +885,147 @@ export function decodeContractLog(
   }
 }
 
+// --- Transaction Receipt Log Batch Decoder (`decodeTransactionReceiptLogs`) ---
+
+const VALID_CONTRACT_LOG_KINDS: ReadonlySet<ContractLogKind> = new Set<ContractLogKind>([
+  "htlc",
+  "vault",
+  "multisig_state",
+  "multisig_tx",
+  "token_metadata",
+  "token_pool",
+  "name",
+  "nft_metadata",
+  "escrow",
+]);
+
+/** Individual raw log entry inside a transaction receipt. */
+export interface ReceiptLogEntry {
+  address?: string;
+  topics?: ReadonlyArray<string>;
+  data: string | Uint8Array;
+}
+
+/** Minimal receipt interface accepted by {@link decodeTransactionReceiptLogs}. */
+export interface ReceiptWithLogs {
+  logs?: ReadonlyArray<ReceiptLogEntry> | null;
+}
+
+/**
+ * Resolver callback that inspects a receipt log and its 0-based index in `receipt.logs`
+ * and returns the {@link ContractLogKind} to decode it with, or `null` / `undefined` to skip it.
+ */
+export type ContractLogKindResolver<K extends ContractLogKind = ContractLogKind> = (
+  log: ReceiptLogEntry,
+  index: number,
+) => K | null | undefined;
+
+/**
+ * Decoded transaction receipt log entry narrowed by a specific {@link ContractLogKind} subset `K`.
+ */
+export type DecodedTransactionReceiptLogByKind<K extends ContractLogKind> = {
+  [P in K]: {
+    index: number;
+    address?: string;
+    topics?: ReadonlyArray<string>;
+    kind: P;
+    record: DecodedContractLogByKind<P>["record"];
+  };
+}[K];
+
+/**
+ * Discriminated union of all decoded transaction receipt log entries.
+ */
+export type DecodedTransactionReceiptLog =
+  DecodedTransactionReceiptLogByKind<ContractLogKind>;
+
+/**
+ * Decodes matching logs from a transaction receipt via {@link decodeContractLog}.
+ *
+ * - Accepts a receipt object with `logs?: ReadonlyArray<{ address?: string; topics?: ReadonlyArray<string>; data: string | Uint8Array }>`
+ *   and either a single {@link ContractLogKind} or a resolver `(log, index) => ContractLogKind | null | undefined`.
+ * - When a resolver returns `null` or `undefined` for a log, that log is skipped while preserving the original
+ *   0-based `index` of matching logs.
+ * - Returns an array of `{ index, address?, topics?, kind, record }`.
+ * - Fails closed with {@link KovanicaDecodeError} if `receipt`, `kindOrResolver`, or any matched log payload is malformed.
+ */
+export function decodeTransactionReceiptLogs<K extends ContractLogKind>(
+  receipt: ReceiptWithLogs,
+  kindOrResolver: K | ContractLogKindResolver<K>,
+): Array<DecodedTransactionReceiptLogByKind<K>>;
+export function decodeTransactionReceiptLogs(
+  receipt: ReceiptWithLogs,
+  kindOrResolver: ContractLogKind | ContractLogKindResolver,
+): DecodedTransactionReceiptLog[];
+export function decodeTransactionReceiptLogs(
+  receipt: ReceiptWithLogs,
+  kindOrResolver: ContractLogKind | ContractLogKindResolver,
+): DecodedTransactionReceiptLog[] {
+  if (!receipt || typeof receipt !== "object") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "decodeTransactionReceiptLogs: expected a receipt object",
+      { field: "receipt" },
+    );
+  }
+
+  const isResolver = typeof kindOrResolver === "function";
+  if (!isResolver) {
+    if (
+      typeof kindOrResolver !== "string" ||
+      !VALID_CONTRACT_LOG_KINDS.has(kindOrResolver)
+    ) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `Unknown contract log kind: ${String(kindOrResolver)}`,
+        { field: "kindOrResolver" },
+      );
+    }
+  }
+
+  if (receipt.logs === undefined || receipt.logs === null) {
+    return [];
+  }
+
+  if (!Array.isArray(receipt.logs)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "decodeTransactionReceiptLogs: receipt.logs must be an array when provided",
+      { field: "receipt.logs" },
+    );
+  }
+
+  const decodedLogs: DecodedTransactionReceiptLog[] = [];
+  for (let i = 0; i < receipt.logs.length; i += 1) {
+    const log = receipt.logs[i];
+    if (!log || typeof log !== "object") {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `decodeTransactionReceiptLogs: invalid log entry at index ${i}`,
+        { field: `receipt.logs[${i}]` },
+      );
+    }
+
+    const kind = isResolver ? kindOrResolver(log, i) : kindOrResolver;
+    if (kind === null || kind === undefined) {
+      continue;
+    }
+
+    const decoded = decodeContractLog(log.data, kind);
+    const entry: DecodedTransactionReceiptLog = {
+      index: i,
+      ...(log.address !== undefined ? { address: log.address } : {}),
+      ...(log.topics !== undefined ? { topics: log.topics } : {}),
+      kind: decoded.kind,
+      record: decoded.record,
+    } as DecodedTransactionReceiptLog;
+
+    decodedLogs.push(entry);
+  }
+
+  return decodedLogs;
+}
+
 // --- Storage Slot Key Derivation Helpers ---
 
 export type StorageSlotContract =

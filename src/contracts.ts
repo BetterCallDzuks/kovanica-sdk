@@ -8,7 +8,13 @@ import { sha512 } from "@noble/hashes/sha2.js";
 import { decodeAddress, encodeAddress } from "./address";
 import { CHAIN_IDS } from "./chains";
 import { KovanicaDecodeError } from "./decoders";
-import type { RequestOptions } from "./types";
+import {
+  KovanicaAbortError,
+  KovanicaRpcError,
+  KovanicaTimeoutError,
+  RpcErrorCode,
+} from "./errors";
+import type { RequestOptions, TransactionReceipt } from "./types";
 import { toHexQuantity } from "./units";
 
 // --- Domain Tags & Gas Limits ---
@@ -1299,4 +1305,170 @@ export async function dryRunCall<TDecoded = undefined>(
     rawHex,
     rawBytes,
   };
+}
+
+// --- Transaction Receipt Poller (`waitForTransactionReceipt`) ---
+
+/** Default polling interval in milliseconds for {@link waitForTransactionReceipt} (`1_000` ms). */
+export const DEFAULT_RECEIPT_POLL_INTERVAL_MS = 1_000;
+/** Default maximum wait timeout in milliseconds for {@link waitForTransactionReceipt} (`30_000` ms). */
+export const DEFAULT_RECEIPT_TIMEOUT_MS = 30_000;
+/** Minimum allowed polling interval in milliseconds for {@link waitForTransactionReceipt} (`10` ms). */
+export const MIN_RECEIPT_POLL_INTERVAL_MS = 10;
+
+/**
+ * Minimal client interface required by {@link waitForTransactionReceipt}.
+ * Satisfied by {@link KovanicaClient}.
+ */
+export interface WaitForTransactionReceiptClient {
+  getTransactionReceipt(
+    hash: string,
+    options?: RequestOptions,
+  ): Promise<TransactionReceipt | null>;
+}
+
+export interface WaitForTransactionReceiptOptions {
+  /**
+   * Polling interval in milliseconds between `getTransactionReceipt` calls.
+   * Must be an integer >= {@link MIN_RECEIPT_POLL_INTERVAL_MS} (`10` ms).
+   * Default: {@link DEFAULT_RECEIPT_POLL_INTERVAL_MS} (`1_000` ms).
+   */
+  pollIntervalMs?: number;
+  /**
+   * Maximum total wait time in milliseconds before throwing {@link KovanicaTimeoutError}.
+   * Must be a positive integer.
+   * Default: {@link DEFAULT_RECEIPT_TIMEOUT_MS} (`30_000` ms).
+   */
+  timeoutMs?: number;
+  /**
+   * Optional cancellation signal. Aborts immediately during poll wait sleep as well as RPC calls
+   * with {@link KovanicaAbortError}.
+   */
+  signal?: AbortSignal;
+  /**
+   * When `true` and the returned receipt indicates a reverted or failed execution
+   * (`receipt.success === false` or `receipt.status === 0`), throws a descriptive
+   * {@link KovanicaRpcError} (`RpcErrorCode.ExecutionError`, `-32000`).
+   * Default: `false`.
+   */
+  throwOnRevert?: boolean;
+}
+
+function normalizeAndValidateTxHash(txHash: string): string {
+  if (typeof txHash !== "string") {
+    throw new TypeError("Invalid transaction hash: expected a 32-byte hex string");
+  }
+  const trimmed = txHash.trim();
+  const clean =
+    trimmed.startsWith("0x") || trimmed.startsWith("0X") ? trimmed.slice(2) : trimmed;
+  if (clean.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(clean)) {
+    throw new Error(
+      `Invalid transaction hash: expected 32-byte (64-character) hex string, got "${txHash}"`,
+    );
+  }
+  return `0x${clean.toLowerCase()}`;
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new KovanicaAbortError());
+  }
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new KovanicaAbortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Polls `client.getTransactionReceipt(txHash)` until a non-null {@link TransactionReceipt}
+ * is returned or `options.timeoutMs` elapses.
+ *
+ * - Validates `txHash` as a 32-byte (64-character) hex string (with or without `0x` prefix).
+ * - Polls at `options.pollIntervalMs` (default `1_000` ms, minimum `10` ms) up to `options.timeoutMs` (default `30_000` ms).
+ * - Honors `options.signal` (`AbortSignal`), aborting immediately with {@link KovanicaAbortError} both during RPC requests and during poll sleep intervals.
+ * - When `options.throwOnRevert` is `true` and the receipt indicates reverted/failed status (`!receipt.success || receipt.status === 0`),
+ *   throws a descriptive {@link KovanicaRpcError} (`RpcErrorCode.ExecutionError`).
+ */
+export async function waitForTransactionReceipt(
+  client: WaitForTransactionReceiptClient,
+  txHash: string,
+  options: WaitForTransactionReceiptOptions = {},
+): Promise<TransactionReceipt> {
+  const normalizedHash = normalizeAndValidateTxHash(txHash);
+
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_RECEIPT_POLL_INTERVAL_MS;
+  if (
+    typeof pollIntervalMs !== "number" ||
+    !Number.isSafeInteger(pollIntervalMs) ||
+    pollIntervalMs < MIN_RECEIPT_POLL_INTERVAL_MS
+  ) {
+    throw new RangeError(
+      `pollIntervalMs must be an integer >= ${MIN_RECEIPT_POLL_INTERVAL_MS}, got ${pollIntervalMs}`,
+    );
+  }
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_RECEIPT_TIMEOUT_MS;
+  if (
+    typeof timeoutMs !== "number" ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0
+  ) {
+    throw new RangeError(`timeoutMs must be a positive integer, got ${timeoutMs}`);
+  }
+
+  const { signal, throwOnRevert = false } = options;
+  if (signal?.aborted) {
+    throw new KovanicaAbortError();
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  const requestOptions: RequestOptions | undefined = signal ? { signal } : undefined;
+
+  while (true) {
+    if (signal?.aborted) {
+      throw new KovanicaAbortError();
+    }
+
+    const receipt = await client.getTransactionReceipt(normalizedHash, requestOptions);
+
+    if (signal?.aborted) {
+      throw new KovanicaAbortError();
+    }
+
+    if (receipt !== null) {
+      if (throwOnRevert && (!receipt.success || receipt.status === 0)) {
+        throw new KovanicaRpcError(
+          RpcErrorCode.ExecutionError,
+          `Transaction ${normalizedHash} reverted or failed with status ${receipt.status} at block ${receipt.blockNumber}`,
+          { receipt, transactionHash: normalizedHash },
+        );
+      }
+      return receipt;
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new KovanicaTimeoutError(
+        timeoutMs,
+        `Timed out waiting for transaction receipt for ${normalizedHash} after ${timeoutMs}ms`,
+      );
+    }
+
+    const sleepMs = Math.min(pollIntervalMs, remainingMs);
+    await sleepWithAbort(sleepMs, signal);
+
+    if (Date.now() >= deadline) {
+      throw new KovanicaTimeoutError(
+        timeoutMs,
+        `Timed out waiting for transaction receipt for ${normalizedHash} after ${timeoutMs}ms`,
+      );
+    }
+  }
 }

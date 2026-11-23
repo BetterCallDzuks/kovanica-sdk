@@ -18,6 +18,7 @@ import {
   decodeTokenMetadata,
   decodeTokenPool,
   decodeTokenState,
+  decodeTransactionReceiptLogs,
   decodeVaultRecord,
   derivePrefixedStorageSlot,
   deriveStorageSlot,
@@ -808,5 +809,169 @@ describe("decodeContractLog Dispatcher", () => {
     );
     expectDecodeError(() => decodeContractLog("0x1234", "htlc"), "TRUNCATED");
     expectDecodeError(() => decodeContractLog("0xzz", "name"), "INVALID_INPUT");
+  });
+});
+
+describe("decodeTransactionReceiptLogs Batch Receipt Log Decoder", () => {
+  const sender = addr(0x11);
+  const claimer = addr(0x22);
+  const hashLock = blake3(new TextEncoder().encode("receipt-log-preimage"));
+
+  const htlcHex = `0x${bytesToHex(
+    concatBytes([
+      sender,
+      claimer,
+      u128le(750_000n),
+      hashLock,
+      u64le(9_000_000n),
+      Uint8Array.of(0),
+      Uint8Array.of(0),
+    ]),
+  )}`;
+
+  const nameHex = `0x${bytesToHex(
+    concatBytes([
+      sender,
+      claimer,
+      encodeBincodeStringVec(["https://relay1.kovanica.org", "https://relay2.kovanica.org"]),
+    ]),
+  )}`;
+
+  const poolHex = `0x${bytesToHex(
+    concatBytes([
+      u128le(5_000n),
+      u128le(10_000n),
+      u16le(30),
+      u128le(7_071n),
+      Uint8Array.of(0),
+    ]),
+  )}`;
+
+  it("decodes all logs in a receipt when given a single static ContractLogKind", () => {
+    const receipt = {
+      logs: [
+        {
+          address: "kvnc1111dag",
+          topics: ["0x" + "aa".repeat(32)],
+          data: htlcHex,
+        },
+        {
+          data: htlcHex,
+        },
+      ],
+    };
+
+    const decoded = decodeTransactionReceiptLogs(receipt, "htlc");
+    expect(decoded).toHaveLength(2);
+
+    expect(decoded[0]?.index).toBe(0);
+    expect(decoded[0]?.address).toBe("kvnc1111dag");
+    expect(decoded[0]?.topics).toEqual(["0x" + "aa".repeat(32)]);
+    expect(decoded[0]?.kind).toBe("htlc");
+    expect(decoded[0]?.record.amount).toBe(750_000n);
+    expect(decoded[0]?.record.status).toBe("open");
+
+    expect(decoded[1]?.index).toBe(1);
+    expect(decoded[1]?.address).toBeUndefined();
+    expect(decoded[1]?.topics).toBeUndefined();
+    expect(decoded[1]?.kind).toBe("htlc");
+    expect(decoded[1]?.record.expiry).toBe(9_000_000n);
+  });
+
+  it("filters and decodes heterogeneous receipt logs via a resolver callback while preserving original log indices", () => {
+    const receipt = {
+      logs: [
+        {
+          address: "kvnc_htlc_dag",
+          topics: ["0x01"],
+          data: htlcHex,
+        },
+        {
+          address: "kvnc_unknown_dag",
+          topics: ["0x99"],
+          data: "0xdeadbeef", // skipped by resolver, so not decoded
+        },
+        {
+          address: "kvnc_name_dag",
+          topics: ["0x02", "0x03"],
+          data: nameHex,
+        },
+        {
+          address: "kvnc_pool_dag",
+          data: poolHex,
+        },
+      ],
+    };
+
+    const decoded = decodeTransactionReceiptLogs(receipt, (log, index) => {
+      if (log.address === "kvnc_htlc_dag") return "htlc";
+      if (index === 2) return "name";
+      if (log.address === "kvnc_pool_dag") return "token_pool";
+      return null;
+    });
+
+    expect(decoded).toHaveLength(3);
+
+    expect(decoded[0]?.index).toBe(0);
+    expect(decoded[0]?.address).toBe("kvnc_htlc_dag");
+    expect(decoded[0]?.topics).toEqual(["0x01"]);
+    expect(decoded[0]?.kind).toBe("htlc");
+    if (decoded[0]?.kind === "htlc") {
+      expect(decoded[0].record.amount).toBe(750_000n);
+    }
+
+    expect(decoded[1]?.index).toBe(2);
+    expect(decoded[1]?.address).toBe("kvnc_name_dag");
+    expect(decoded[1]?.topics).toEqual(["0x02", "0x03"]);
+    expect(decoded[1]?.kind).toBe("name");
+    if (decoded[1]?.kind === "name") {
+      expect(decoded[1].record.relayEndpoints).toEqual([
+        "https://relay1.kovanica.org",
+        "https://relay2.kovanica.org",
+      ]);
+    }
+
+    expect(decoded[2]?.index).toBe(3);
+    expect(decoded[2]?.address).toBe("kvnc_pool_dag");
+    expect(decoded[2]?.kind).toBe("token_pool");
+    if (decoded[2]?.kind === "token_pool") {
+      expect(decoded[2].record.feeBps).toBe(30);
+    }
+  });
+
+  it("returns an empty array when receipt.logs is omitted, null, empty, or all entries are skipped", () => {
+    expect(decodeTransactionReceiptLogs({}, "htlc")).toEqual([]);
+    expect(decodeTransactionReceiptLogs({ logs: undefined }, "htlc")).toEqual([]);
+    expect(decodeTransactionReceiptLogs({ logs: null }, "htlc")).toEqual([]);
+    expect(decodeTransactionReceiptLogs({ logs: [] }, "htlc")).toEqual([]);
+    expect(
+      decodeTransactionReceiptLogs(
+        { logs: [{ data: "0x1234" }] },
+        () => undefined,
+      ),
+    ).toEqual([]);
+  });
+
+  it("fails closed with KovanicaDecodeError on invalid receipt, invalid kindOrResolver, or malformed log data", () => {
+    expectDecodeError(
+      () => decodeTransactionReceiptLogs(null as never, "htlc"),
+      "INVALID_INPUT",
+    );
+    expectDecodeError(
+      () => decodeTransactionReceiptLogs({}, "not_a_kind" as never),
+      "INVALID_INPUT",
+    );
+    expectDecodeError(
+      () => decodeTransactionReceiptLogs({ logs: "not_an_array" as never }, "htlc"),
+      "INVALID_INPUT",
+    );
+    expectDecodeError(
+      () => decodeTransactionReceiptLogs({ logs: [null as never] }, "htlc"),
+      "INVALID_INPUT",
+    );
+    expectDecodeError(
+      () => decodeTransactionReceiptLogs({ logs: [{ data: "0x1234" }] }, "htlc"),
+      "TRUNCATED",
+    );
   });
 });
