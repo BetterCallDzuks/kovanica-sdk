@@ -4,8 +4,12 @@
 
 // Client & Transport
 export {
+  DEFAULT_IDEMPOTENT_RPC_METHODS,
   KovanicaClient,
+  type KovanicaClientConfig,
   type KovanicaClientOptions,
+  type RpcRetryConfig,
+  computeRetryDelayMs,
   isNodeSynced,
   parseSafeOptionalQuantity,
 } from "./client";
@@ -243,3 +247,18 @@ export {
   deriveStorageSlotHex,
   readContractStorage,
 } from "./decoders";
+
+// Typed Contract Client Facades
+export {
+  ContractFacade,
+  EscrowClient,
+  HtlcClient,
+  NameRegistryClient,
+  TokenClient,
+  type ContractFacadeClient,
+  type EscrowCreateParams,
+  type HtlcCreateParams,
+  type NameRegisterParams,
+  type NameResolveOptions,
+  type TokenTransferParams,
+} from "./facades";
