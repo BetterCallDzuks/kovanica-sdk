@@ -14,6 +14,7 @@ import type {
   SyncStatus,
   TransactionKind,
   TransactionReceipt,
+  TransactionReceiptLog,
   TransactionResponse,
   ValidatorInfo,
 } from "./types";
@@ -28,11 +29,13 @@ import {
   type PreparedBatchCallTransactions,
   type PreparedCallTransaction,
   type SignedTxResult,
+  type WaitForTransactionReceiptOptions,
   buildCallTxKind,
   dryRunCall,
   estimateAndBuildCall,
   estimateBatchCalls,
   signCallContractTransaction,
+  waitForTransactionReceipt,
 } from "./contracts";
 import { getPublicKey } from "./wallet";
 
@@ -261,7 +264,19 @@ export class KovanicaClient {
       status: typeof raw.status === "number" ? raw.status : Number(parseQuantity(raw.status)),
       success: Boolean(raw.success),
       gasUsed: raw.gasUsed != null ? parseQuantity(raw.gasUsed) : undefined,
+      ...(Array.isArray(raw.logs) ? { logs: raw.logs } : {}),
     };
+  }
+
+  /**
+   * Polls `getTransactionReceipt(txHash)` until a non-null receipt is returned
+   * or `options.timeoutMs` elapses.
+   */
+  async waitForTransactionReceipt(
+    txHash: string,
+    options?: WaitForTransactionReceiptOptions,
+  ): Promise<TransactionReceipt> {
+    return waitForTransactionReceipt(this, txHash, options);
   }
 
   /**
@@ -655,6 +670,7 @@ interface RawTransactionReceipt {
   status: string | number;
   success: boolean;
   gasUsed?: string | number;
+  logs?: ReadonlyArray<TransactionReceiptLog>;
 }
 
 interface RawValidatorInfo {

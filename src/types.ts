@@ -84,6 +84,12 @@ export interface BlockResponse {
   signature: string;
 }
 
+export interface TransactionReceiptLog {
+  address?: string;
+  topics?: ReadonlyArray<string>;
+  data: string;
+}
+
 export interface TransactionReceipt {
   transactionHash: string;
   blockHash: string;
@@ -92,6 +98,7 @@ export interface TransactionReceipt {
   status: number;
   success: boolean;
   gasUsed?: bigint;
+  logs?: ReadonlyArray<TransactionReceiptLog>;
 }
 
 export interface ValidatorInfo {

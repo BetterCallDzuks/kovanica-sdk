@@ -4,6 +4,8 @@ import {
   DEFAULT_CALL_GAS_LIMIT,
   DEFAULT_FEE_SAFETY_MARGIN_BPS,
   DEFAULT_GAS_SAFETY_MARGIN_BPS,
+  DEFAULT_RECEIPT_POLL_INTERVAL_MS,
+  DEFAULT_RECEIPT_TIMEOUT_MS,
   CALL_TX_FIXED_WIRE_OVERHEAD,
   DOMAIN_TAG_STR,
   KEYED_HASH_TAG_STR,
@@ -16,9 +18,11 @@ import {
   KovanicaTransportError,
   KovanicaWallet,
   MAX_TX_GAS_LIMIT,
+  MIN_RECEIPT_POLL_INTERVAL_MS,
   RpcErrorCode,
   TX_DOMAIN,
   TX_KEY,
+  type TransactionReceipt,
   addressFromSeed,
   bip39Seed,
   buildCallTxKind,
@@ -55,6 +59,7 @@ import {
   u32le,
   u64le,
   u128le,
+  waitForTransactionReceipt,
 } from "../src/index";
 
 describe("Canonical Smart Contract Argument Builders & Bincode Encoders", () => {
@@ -1321,6 +1326,187 @@ describe("Canonical Smart Contract Argument Builders & Bincode Encoders", () => 
 
       expect(estimateFeeSpy).not.toHaveBeenCalled();
       expect(getNonceSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("waitForTransactionReceipt & client.waitForTransactionReceipt", () => {
+    const validTxHash = "0x" + "ab".repeat(32);
+    const validRawTxHash = "CD".repeat(32);
+
+    const makeReceipt = (overrides: Partial<TransactionReceipt> = {}): TransactionReceipt => ({
+      transactionHash: validTxHash,
+      blockHash: "0x" + "11".repeat(32),
+      blockNumber: 42n,
+      transactionIndex: 0n,
+      status: 1,
+      success: true,
+      gasUsed: 21_000n,
+      ...overrides,
+    });
+
+    it("exposes default polling constants and returns immediately on first receipt hit", async () => {
+      expect(DEFAULT_RECEIPT_POLL_INTERVAL_MS).toBe(1_000);
+      expect(DEFAULT_RECEIPT_TIMEOUT_MS).toBe(30_000);
+      expect(MIN_RECEIPT_POLL_INTERVAL_MS).toBe(10);
+
+      const client = new KovanicaClient("http://localhost:8545");
+      const expectedReceipt = makeReceipt();
+      const receiptSpy = vi
+        .spyOn(client, "getTransactionReceipt")
+        .mockResolvedValueOnce(expectedReceipt);
+
+      const receipt = await waitForTransactionReceipt(client, validRawTxHash);
+      expect(receipt).toEqual(expectedReceipt);
+      expect(receiptSpy).toHaveBeenCalledTimes(1);
+      expect(receiptSpy).toHaveBeenCalledWith(`0x${validRawTxHash.toLowerCase()}`, undefined);
+    });
+
+    it("polls across multiple null responses until a receipt is returned via client.waitForTransactionReceipt", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const expectedReceipt = makeReceipt({ blockNumber: 105n });
+      const receiptSpy = vi
+        .spyOn(client, "getTransactionReceipt")
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(expectedReceipt);
+
+      const receipt = await client.waitForTransactionReceipt(validTxHash, {
+        pollIntervalMs: 10,
+        timeoutMs: 1_000,
+      });
+
+      expect(receipt).toEqual(expectedReceipt);
+      expect(receiptSpy).toHaveBeenCalledTimes(3);
+    });
+
+    it("throws KovanicaTimeoutError when timeoutMs elapses before a receipt is available", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const receiptSpy = vi.spyOn(client, "getTransactionReceipt").mockResolvedValue(null);
+
+      await expect(
+        waitForTransactionReceipt(client, validTxHash, {
+          pollIntervalMs: 10,
+          timeoutMs: 35,
+        }),
+      ).rejects.toThrow(KovanicaTimeoutError);
+
+      expect(receiptSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("aborts immediately with KovanicaAbortError when AbortSignal fires during poll sleep or before start", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const receiptSpy = vi.spyOn(client, "getTransactionReceipt").mockResolvedValue(null);
+
+      // 1. Pre-aborted signal rejects before making any RPC request
+      const preAborted = new AbortController();
+      preAborted.abort();
+      await expect(
+        waitForTransactionReceipt(client, validTxHash, {
+          pollIntervalMs: 10,
+          signal: preAborted.signal,
+        }),
+      ).rejects.toThrow(KovanicaAbortError);
+      expect(receiptSpy).not.toHaveBeenCalled();
+
+      // 2. Signal aborted mid-sleep cancels immediately without waiting for pollIntervalMs
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 15);
+      const start = Date.now();
+      await expect(
+        client.waitForTransactionReceipt(validTxHash, {
+          pollIntervalMs: 500,
+          timeoutMs: 5_000,
+          signal: controller.signal,
+        }),
+      ).rejects.toThrow(KovanicaAbortError);
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeLessThan(250);
+      expect(receiptSpy).toHaveBeenCalledTimes(1);
+      expect(receiptSpy).toHaveBeenCalledWith(validTxHash, { signal: controller.signal });
+    });
+
+    it("throws KovanicaRpcError when throwOnRevert is true and receipt indicates reverted/failed execution", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const revertedReceipt = makeReceipt({ status: 0, success: false });
+      const receiptSpy = vi
+        .spyOn(client, "getTransactionReceipt")
+        .mockResolvedValue(revertedReceipt);
+
+      // Default throwOnRevert: false returns the reverted receipt as-is
+      const returned = await waitForTransactionReceipt(client, validTxHash, {
+        pollIntervalMs: 10,
+      });
+      expect(returned).toEqual(revertedReceipt);
+
+      // throwOnRevert: true throws KovanicaRpcError(ExecutionError)
+      await expect(
+        waitForTransactionReceipt(client, validTxHash, {
+          pollIntervalMs: 10,
+          throwOnRevert: true,
+        }),
+      ).rejects.toThrow(KovanicaRpcError);
+
+      try {
+        await client.waitForTransactionReceipt(validTxHash, {
+          pollIntervalMs: 10,
+          throwOnRevert: true,
+        });
+        expect.fail("Expected waitForTransactionReceipt to throw on reverted receipt");
+      } catch (err) {
+        expect(err).toBeInstanceOf(KovanicaRpcError);
+        const rpcErr = err as KovanicaRpcError;
+        expect(rpcErr.code).toBe(RpcErrorCode.ExecutionError);
+        expect(rpcErr.message).toMatch(/reverted or failed/);
+        expect(rpcErr.data).toEqual({
+          receipt: revertedReceipt,
+          transactionHash: validTxHash,
+        });
+      }
+
+      expect(receiptSpy).toHaveBeenCalledTimes(3);
+    });
+
+    it("rejects invalid txHash and invalid pollIntervalMs/timeoutMs options before any RPC call", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const receiptSpy = vi.spyOn(client, "getTransactionReceipt");
+
+      // Invalid txHash inputs
+      await expect(waitForTransactionReceipt(client, "")).rejects.toThrow(
+        /Invalid transaction hash/,
+      );
+      await expect(waitForTransactionReceipt(client, "0x1234")).rejects.toThrow(
+        /Invalid transaction hash/,
+      );
+      await expect(
+        waitForTransactionReceipt(client, "0x" + "zz".repeat(32)),
+      ).rejects.toThrow(/Invalid transaction hash/);
+      await expect(
+        waitForTransactionReceipt(client, "0x" + "aa".repeat(31)),
+      ).rejects.toThrow(/Invalid transaction hash/);
+      await expect(
+        waitForTransactionReceipt(client, "0x" + "aa".repeat(33)),
+      ).rejects.toThrow(/Invalid transaction hash/);
+      await expect(
+        waitForTransactionReceipt(client, 12345 as unknown as string),
+      ).rejects.toThrow(TypeError);
+
+      // Invalid pollIntervalMs (< 10 or non-integer)
+      await expect(
+        waitForTransactionReceipt(client, validTxHash, { pollIntervalMs: 5 }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        waitForTransactionReceipt(client, validTxHash, { pollIntervalMs: 15.5 }),
+      ).rejects.toThrow(RangeError);
+
+      // Invalid timeoutMs (<= 0 or non-integer)
+      await expect(
+        waitForTransactionReceipt(client, validTxHash, { timeoutMs: 0 }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        waitForTransactionReceipt(client, validTxHash, { timeoutMs: -100 }),
+      ).rejects.toThrow(RangeError);
+
+      expect(receiptSpy).not.toHaveBeenCalled();
     });
   });
 });
