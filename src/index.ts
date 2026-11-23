@@ -15,6 +15,17 @@ export {
   type Transport,
   parseLosslessJson,
 } from "./transport";
+export {
+  KovanicaWsClient,
+  type KovanicaWsClientOptions,
+  type WsCommittedLeaderEvent,
+  type WsExecutionEvent,
+  type WsLogFilter,
+  type WsLogReceipt,
+  type WsNewHeadEvent,
+  type WsSubscriptionCallback,
+  type WsSubscriptionNotification,
+} from "./ws";
 
 // Types & Schemas
 export type {
@@ -106,7 +117,10 @@ export {
 
 // Smart Contract Argument Builders, Bincode Encoders & Transaction Signers
 export {
+  CALL_TX_FIXED_WIRE_OVERHEAD,
   DEFAULT_CALL_GAS_LIMIT,
+  DEFAULT_FEE_SAFETY_MARGIN_BPS,
+  DEFAULT_GAS_SAFETY_MARGIN_BPS,
   DOMAIN_TAG_STR,
   KEYED_HASH_TAG_STR,
   MAX_TX_GAS_LIMIT,
@@ -114,6 +128,12 @@ export {
   TX_KEY,
   type CallTxKind,
   type CallTxKindInput,
+  type DryRunCallClient,
+  type DryRunCallOptions,
+  type DryRunCallResult,
+  type EstimateAndBuildCallClient,
+  type EstimateAndBuildCallOptions,
+  type PreparedCallTransaction,
   type SignedTxResult,
   asciiPad,
   buildCallTxKind,
@@ -130,6 +150,7 @@ export {
   bytesToHex,
   computeCallTransactionSigningHash,
   concatBytes,
+  dryRunCall,
   encodeBincodeBytes32Vec,
   encodeBincodeString,
   encodeBincodeStringVec,
@@ -137,6 +158,8 @@ export {
   encodeHtlcCreateArgs,
   encodeNameRegisterArgs,
   encodeNftMintArgs,
+  estimateAndBuildCall,
+  estimateCallTxSize,
   hexToBytes,
   parseContractAddress,
   signCallContractTransaction,
@@ -147,3 +170,42 @@ export {
   u128le,
   wireCallKindBytes,
 } from "./contracts";
+
+// Contract State & Record Bincode Decoders + Storage Slot Derivation
+export {
+  BincodeReader,
+  KovanicaDecodeError,
+  STORAGE_KEY_PREFIXES,
+  type DecodeErrorCode,
+  type EscrowRecord,
+  type EscrowStatus,
+  type HtlcRecord,
+  type HtlcStatus,
+  type MultisigPendingTx,
+  type MultisigState,
+  type NameRecord,
+  type NftMetadata,
+  type NftTokenEntry,
+  type StorageSlotContract,
+  type StorageSlotKey,
+  type TokenAllowanceEntry,
+  type TokenBalanceEntry,
+  type TokenMetadata,
+  type TokenPoolState,
+  type VaultRecord,
+  type VaultSchedule,
+  decodeEscrowRecord,
+  decodeHtlcRecord,
+  decodeMultisigPendingTx,
+  decodeMultisigState,
+  decodeNameRecord,
+  decodeNftMetadata,
+  decodeNftState,
+  decodeTokenMetadata,
+  decodeTokenPool,
+  decodeTokenState,
+  decodeVaultRecord,
+  derivePrefixedStorageSlot,
+  deriveStorageSlot,
+  deriveStorageSlotHex,
+} from "./decoders";

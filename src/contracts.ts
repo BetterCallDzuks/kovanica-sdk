@@ -5,8 +5,11 @@
 
 import { blake3 } from "@noble/hashes/blake3.js";
 import { sha512 } from "@noble/hashes/sha2.js";
-import { decodeAddress } from "./address";
+import { decodeAddress, encodeAddress } from "./address";
 import { CHAIN_IDS } from "./chains";
+import { KovanicaDecodeError } from "./decoders";
+import type { RequestOptions } from "./types";
+import { toHexQuantity } from "./units";
 
 // --- Domain Tags & Gas Limits ---
 
@@ -15,6 +18,13 @@ export const KEYED_HASH_TAG_STR = "KVNC-TX-v1";
 
 export const DEFAULT_CALL_GAS_LIMIT = 100_000n;
 export const MAX_TX_GAS_LIMIT = 10_000_000n;
+
+/** Default fee safety margin in basis points (12_000 = 1.20x / +20%). */
+export const DEFAULT_FEE_SAFETY_MARGIN_BPS = 12_000;
+/** Default gas limit safety margin in basis points (12_000 = 1.20x / +20%). */
+export const DEFAULT_GAS_SAFETY_MARGIN_BPS = 12_000;
+/** Fixed wire byte overhead for a signed Call transaction outside `wireCallKindBytes`: 32 (sender) + 8 (nonce) + 8 (fee) + 8 (sig len) + 64 (sig) + 32 (sighash). */
+export const CALL_TX_FIXED_WIRE_OVERHEAD = 152;
 
 export function asciiPad(str: string, len: number): Uint8Array {
   const buf = new Uint8Array(len);
@@ -680,5 +690,371 @@ export function signCallContractTransaction(params: {
     rawTxBytes,
     rawTxHex: bytesToHex(rawTxBytes),
     txSize: rawTxBytes.length,
+  };
+}
+
+// --- Fee/Gas Estimation & Prepared Call Builder ---
+
+/**
+ * Minimal client interface required by {@link estimateAndBuildCall}.
+ * Satisfied by {@link KovanicaClient}.
+ */
+export interface EstimateAndBuildCallClient {
+  estimateFee(options?: RequestOptions): Promise<bigint>;
+  getNonce(address: string, options?: RequestOptions): Promise<bigint>;
+}
+
+export interface EstimateAndBuildCallOptions {
+  /**
+   * Optional sender address (PRO-21 `kvnc...dag` / `tknc...dag` or 32-byte hex).
+   * When provided and `nonce` is omitted, fetches the sender's current nonce via `client.getNonce(sender)`.
+   */
+  sender?: string;
+  /**
+   * Explicit nonce override. Skips the `client.getNonce` RPC call when provided.
+   */
+  nonce?: bigint | number;
+  /**
+   * Explicit total fee override in atoms. Skips the `client.estimateFee` RPC call when provided.
+   */
+  fee?: bigint | number;
+  /**
+   * Fee safety margin in basis points (`10_000` = 1.0x, `12_000` = +20%).
+   * Applied to `feeRatePerByte * estimatedTxSize` when `fee` is not explicitly overridden.
+   * Default: {@link DEFAULT_FEE_SAFETY_MARGIN_BPS} (`12_000`).
+   */
+  feeMarginBps?: number;
+  /**
+   * Gas limit safety margin in basis points (`10_000` = 1.0x, `12_000` = +20%).
+   * Applied to the call's gas limit (clamped to {@link MAX_TX_GAS_LIMIT}) when `gasLimit` / `gas_limit`
+   * is not explicitly supplied on `call`, or whenever `gasMarginBps` is explicitly specified.
+   * Default: {@link DEFAULT_GAS_SAFETY_MARGIN_BPS} (`12_000`) for defaulted gas, or `10_000` (1.0x) when explicit gas was provided.
+   */
+  gasMarginBps?: number;
+  /**
+   * Minimum fee floor in atoms. Default: `0n`.
+   */
+  minFee?: bigint | number;
+  /**
+   * Optional maximum fee cap in atoms. Throws if the computed or overridden fee exceeds this cap.
+   */
+  maxFee?: bigint | number;
+  /**
+   * Chain ID to attach to the prepared call transaction. Default: `CHAIN_IDS.MAINNET`.
+   */
+  chainId?: number;
+  /**
+   * Optional RPC request options (`timeoutMs`, `signal`) forwarded to `estimateFee` and `getNonce`.
+   */
+  requestOptions?: RequestOptions;
+}
+
+export interface PreparedCallTransaction {
+  /** Validated `CallTxKind` with resolved gas limit, ready for `signCallContractTransaction` or `wallet.signCallTransaction`. */
+  call: CallTxKind;
+  /** Estimated or overridden total transaction fee in atoms (includes safety margin and `minFee` floor). */
+  fee: bigint;
+  /** Raw fee rate returned by `kovanica_estimateFee` in atoms per byte (`undefined` when `fee` was explicitly overridden). */
+  feeRatePerByte?: bigint;
+  /** Exact serialized wire size of the signed Call transaction in bytes. */
+  estimatedTxSize: number;
+  /** Resolved gas limit applied to `call.gas_limit` and `call.gasLimit`. */
+  gasLimit: bigint;
+  /** Resolved sender nonce (fetched via `client.getNonce` when `sender` is provided, or explicit override; `undefined` if neither was supplied). */
+  nonce?: bigint;
+  /** Chain ID attached for signing. */
+  chainId: number;
+}
+
+const BPS_DENOMINATOR = 10_000n;
+
+function validateMarginBps(value: number, name: string): bigint {
+  if (!Number.isInteger(value) || value < 10_000) {
+    throw new RangeError(`${name} must be an integer >= 10000 (1.0x), got ${value}`);
+  }
+  return BigInt(value);
+}
+
+function applyBpsCeil(amount: bigint, marginBps: bigint): bigint {
+  if (amount === 0n) return 0n;
+  return (amount * marginBps + (BPS_DENOMINATOR - 1n)) / BPS_DENOMINATOR;
+}
+
+/**
+ * Computes the exact serialized wire byte size of a signed Call transaction.
+ * Matches `signCallContractTransaction(...).txSize` byte-for-byte.
+ */
+export function estimateCallTxSize(call: CallTxKind | CallTxKindInput): number {
+  const callKind =
+    "call_value" in call && "gas_limit" in call && call.contract instanceof Uint8Array
+      ? (call as CallTxKind)
+      : buildCallTxKind(call);
+  return CALL_TX_FIXED_WIRE_OVERHEAD + wireCallKindBytes(callKind).length;
+}
+
+/**
+ * Estimates fee/gas parameters for a contract call and builds a validated,
+ * ready-to-sign {@link PreparedCallTransaction} payload with configurable safety margins.
+ *
+ * - Validates and normalizes `call` (applying `gasMarginBps` when gas is defaulted or explicitly requested, clamped to {@link MAX_TX_GAS_LIMIT}).
+ * - Computes exact wire transaction size via {@link estimateCallTxSize}.
+ * - Fetches `kovanica_estimateFee` (unless `options.fee` is provided) and `kovanica_getNonce` (when `options.sender` is provided and `options.nonce` is omitted) in parallel.
+ * - Applies `feeMarginBps` (default 12_000 = +20%) and enforces `minFee` floor / `maxFee` cap.
+ */
+export async function estimateAndBuildCall(
+  client: EstimateAndBuildCallClient,
+  call: CallTxKind | CallTxKindInput,
+  options: EstimateAndBuildCallOptions = {},
+): Promise<PreparedCallTransaction> {
+  const feeMarginBps = validateMarginBps(
+    options.feeMarginBps ?? DEFAULT_FEE_SAFETY_MARGIN_BPS,
+    "feeMarginBps",
+  );
+
+  const hasExplicitGas = call.gas_limit !== undefined || call.gasLimit !== undefined;
+  const gasMarginBps =
+    options.gasMarginBps !== undefined
+      ? validateMarginBps(options.gasMarginBps, "gasMarginBps")
+      : hasExplicitGas
+        ? BPS_DENOMINATOR
+        : BigInt(DEFAULT_GAS_SAFETY_MARGIN_BPS);
+
+  const minFee = options.minFee !== undefined ? BigInt(options.minFee) : 0n;
+  if (minFee < 0n) {
+    throw new RangeError(`minFee must be non-negative, got ${minFee}`);
+  }
+
+  const maxFee = options.maxFee !== undefined ? BigInt(options.maxFee) : undefined;
+  if (maxFee !== undefined && maxFee < 0n) {
+    throw new RangeError(`maxFee must be non-negative, got ${maxFee}`);
+  }
+  if (maxFee !== undefined && minFee > maxFee) {
+    throw new RangeError(`minFee (${minFee}) cannot exceed maxFee (${maxFee})`);
+  }
+
+  let explicitNonce: bigint | undefined;
+  if (options.nonce !== undefined) {
+    explicitNonce = BigInt(options.nonce);
+    if (explicitNonce < 0n) {
+      throw new RangeError(`nonce must be non-negative, got ${explicitNonce}`);
+    }
+  }
+
+  let explicitFee: bigint | undefined;
+  if (options.fee !== undefined) {
+    explicitFee = BigInt(options.fee);
+    if (explicitFee < 0n) {
+      throw new RangeError(`fee must be non-negative, got ${explicitFee}`);
+    }
+  }
+
+  // Validate and build the base call first so invalid inputs fail before any RPC I/O.
+  const baseCall = buildCallTxKind(call);
+  const marginedGas = applyBpsCeil(baseCall.gas_limit, gasMarginBps);
+  const resolvedGasLimit = marginedGas > MAX_TX_GAS_LIMIT ? MAX_TX_GAS_LIMIT : marginedGas;
+
+  const preparedCall: CallTxKind =
+    resolvedGasLimit === baseCall.gas_limit
+      ? baseCall
+      : {
+          ...baseCall,
+          gas_limit: resolvedGasLimit,
+          gasLimit: resolvedGasLimit,
+        };
+
+  const estimatedTxSize = estimateCallTxSize(preparedCall);
+
+  const needsFeeEstimate = explicitFee === undefined;
+  const needsNonce = explicitNonce === undefined && options.sender !== undefined;
+
+  const [feeRatePerByte, fetchedNonce] = await Promise.all([
+    needsFeeEstimate ? client.estimateFee(options.requestOptions) : Promise.resolve(undefined),
+    needsNonce
+      ? client.getNonce(options.sender!, options.requestOptions)
+      : Promise.resolve(undefined),
+  ]);
+
+  let fee: bigint;
+  if (explicitFee !== undefined) {
+    fee = explicitFee;
+  } else {
+    if (feeRatePerByte! < 0n) {
+      throw new RangeError(`Estimated fee rate must be non-negative, got ${feeRatePerByte}`);
+    }
+    const baseFee = feeRatePerByte! * BigInt(estimatedTxSize);
+    const marginedFee = applyBpsCeil(baseFee, feeMarginBps);
+    fee = marginedFee < minFee ? minFee : marginedFee;
+  }
+
+  if (maxFee !== undefined && fee > maxFee) {
+    throw new RangeError(`Computed fee ${fee} exceeds maxFee ${maxFee}`);
+  }
+
+  return {
+    call: preparedCall,
+    fee,
+    feeRatePerByte,
+    estimatedTxSize,
+    gasLimit: resolvedGasLimit,
+    nonce: explicitNonce ?? fetchedNonce,
+    chainId: options.chainId ?? CHAIN_IDS.MAINNET,
+  };
+}
+
+// --- Read-Only Contract Simulation (`kovanica_call` Dry-Run Helper) ---
+
+/**
+ * Minimal client interface required by {@link dryRunCall}.
+ * Satisfied by {@link KovanicaClient}.
+ */
+export interface DryRunCallClient {
+  call<TResult = unknown>(
+    method: string,
+    params?: unknown,
+    options?: RequestOptions,
+  ): Promise<TResult>;
+}
+
+export interface DryRunCallOptions<TDecoded = undefined> {
+  /**
+   * Optional simulated caller address (PRO-21 `kvnc...dag` / `tknc...dag`, 32-byte hex, or 32-byte `Uint8Array`).
+   * Validated as a 32-byte public key and formatted as a canonical 64-character PRO-21 `kvnc...dag` address.
+   */
+  from?: Uint8Array | string;
+  /**
+   * Optional call value override in atoms (defaults to `call.call_value` / `call.value` / `0n`).
+   */
+  value?: bigint | number;
+  /**
+   * Optional gas limit override (defaults to `call.gas_limit` / `call.gasLimit` / {@link DEFAULT_CALL_GAS_LIMIT}).
+   */
+  gasLimit?: bigint | number;
+  /**
+   * Optional Bincode / binary response decoder invoked on `rawBytes` when `kovanica_call` succeeds.
+   */
+  decoder?: (bytes: Uint8Array) => TDecoded;
+  /**
+   * Optional RPC request options (`timeoutMs`, `signal`) forwarded to `kovanica_call`.
+   */
+  requestOptions?: RequestOptions;
+}
+
+export interface DryRunCallResult<TDecoded = undefined> {
+  /** Normalized `0x`-prefixed lowercase hex string returned by `kovanica_call` (e.g. `"0x..."` or `"0x"`). */
+  rawHex: string;
+  /** Raw return bytes decoded from `rawHex`. */
+  rawBytes: Uint8Array;
+  /** Typed decoded value produced by `options.decoder(rawBytes)` when a `decoder` is provided. */
+  decoded?: TDecoded;
+}
+
+/**
+ * Simulates a read-only contract call against current node state via `kovanica_call`.
+ *
+ * - Validates and normalizes `call` (contract address, non-empty method, `Uint8Array` args, value, and gas limit)
+ *   plus any optional `from`, `value`, or `gasLimit` overrides before making the RPC request.
+ * - Encodes the canonical `kovanica_call` request object (`{ to, from?, entry, method, data, value, gas }`).
+ * - Decodes the `0x`-prefixed hex response into `rawBytes` and `rawHex`.
+ * - When `options.decoder` is provided, decodes `rawBytes` into typed `TDecoded` (surfacing {@link KovanicaDecodeError} cleanly if malformed).
+ */
+export async function dryRunCall<TDecoded>(
+  client: DryRunCallClient,
+  call: CallTxKind | CallTxKindInput,
+  options: DryRunCallOptions<TDecoded> & { decoder: (bytes: Uint8Array) => TDecoded },
+): Promise<DryRunCallResult<TDecoded> & { decoded: TDecoded }>;
+export async function dryRunCall<TDecoded = undefined>(
+  client: DryRunCallClient,
+  call: CallTxKind | CallTxKindInput,
+  options?: DryRunCallOptions<TDecoded>,
+): Promise<DryRunCallResult<TDecoded>>;
+export async function dryRunCall<TDecoded = undefined>(
+  client: DryRunCallClient,
+  call: CallTxKind | CallTxKindInput,
+  options: DryRunCallOptions<TDecoded> = {},
+): Promise<DryRunCallResult<TDecoded>> {
+  if (!call || typeof call !== "object") {
+    throw new TypeError("dryRunCall requires a valid call object");
+  }
+  if (typeof call.method !== "string" || call.method.trim().length === 0) {
+    throw new Error("Call method must be a non-empty string");
+  }
+  if (!(call.args instanceof Uint8Array)) {
+    throw new TypeError("Call args must be a Uint8Array");
+  }
+
+  const resolvedInput: CallTxKindInput = {
+    contract: call.contract,
+    method: call.method.trim(),
+    args: call.args,
+    call_value: options.value !== undefined ? options.value : (call.call_value ?? call.value),
+    gas_limit:
+      options.gasLimit !== undefined ? options.gasLimit : (call.gas_limit ?? call.gasLimit),
+  };
+
+  const builtCall = buildCallTxKind(resolvedInput);
+  if (builtCall.call_value > 0xffffffffffffffffn) {
+    throw new RangeError(`call_value out of range for u64: ${builtCall.call_value}`);
+  }
+
+  let fromAddress: string | undefined;
+  if (options.from !== undefined) {
+    const fromBytes = parseContractAddress(options.from);
+    fromAddress = encodeAddress(fromBytes);
+  }
+
+  const toAddress = encodeAddress(builtCall.contract);
+  const dataHex = `0x${bytesToHex(builtCall.args)}`;
+
+  const rpcCallObj: Record<string, string> = {
+    to: toAddress,
+    entry: builtCall.method,
+    method: builtCall.method,
+    data: dataHex,
+    value: toHexQuantity(builtCall.call_value),
+    gas: toHexQuantity(builtCall.gas_limit),
+  };
+  if (fromAddress !== undefined) {
+    rpcCallObj.from = fromAddress;
+  }
+
+  const rawResult = await client.call<unknown>(
+    "kovanica_call",
+    [rpcCallObj],
+    options.requestOptions,
+  );
+
+  if (typeof rawResult !== "string") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "kovanica_call: expected hex string response",
+    );
+  }
+
+  const trimmed = rawResult.trim();
+  const cleanHex =
+    trimmed.startsWith("0x") || trimmed.startsWith("0X") ? trimmed.slice(2) : trimmed;
+
+  if (cleanHex.length > 0 && (cleanHex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(cleanHex))) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "kovanica_call: invalid hex string in response",
+    );
+  }
+
+  const rawBytes = cleanHex.length === 0 ? new Uint8Array(0) : hexToBytes(cleanHex);
+  const rawHex = `0x${cleanHex.toLowerCase()}`;
+
+  if (options.decoder) {
+    const decoded = options.decoder(rawBytes);
+    return {
+      rawHex,
+      rawBytes,
+      decoded,
+    };
+  }
+
+  return {
+    rawHex,
+    rawBytes,
   };
 }

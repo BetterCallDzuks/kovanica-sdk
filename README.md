@@ -3,16 +3,18 @@
 Typed, lightweight TypeScript client and developer toolkit for the **Kovanica (KVNC)** Layer-1 blockchain, suitable for modern browsers and Node.js (18+).
 
 > [!NOTE]
-> **Full Ecosystem Client (v0.3.0):** Features SLIP-0010 HD wallet derivation, canonical Wasmi smart contract call builders, deterministic Bincode encoders, RFC 8032 Ed25519 signing under domain `KVNC/tx/v1`, lossless JSON-RPC 2.0 transport, and transaction broadcasting.
+> **Full Ecosystem Client (v0.4.0):** Features SLIP-0010 HD wallet derivation, canonical Wasmi smart contract call builders, fee/gas estimation (`estimateAndBuildCall`), deterministic Bincode encoders and typed contract ABI decoders, real-time WebSocket subscriptions (`KovanicaWsClient`), RFC 8032 Ed25519 signing under domain `KVNC/tx/v1`, lossless JSON-RPC 2.0 transport, and transaction broadcasting.
 
 ---
 
 ## Features
 
 - **Standard JSON-RPC 2.0 Transport:** Configurable endpoint URL, automatic request IDs, configurable timeouts, caller-controlled cancellation (`AbortSignal`), and typed error classes.
-- **Transaction Construction & Broadcasting:** High-level `KovanicaWallet` and `KovanicaClient` support for constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`.
+- **Real-Time WebSocket Subscriptions (`KovanicaWsClient`):** Typed JSON-RPC 2.0 WebSocket client (`GET /ws`) supporting `newHeads`, `newCommittedLeader`, and filtered `logs` subscriptions with automatic exponential-backoff reconnection, transparent re-subscription, and optional heartbeat / idle liveness detection (`heartbeatIntervalMs`, `heartbeatTimeoutMs`, `heartbeatMethod`).
+- **Transaction Construction, Estimation, Dry-Run Simulation & Broadcasting:** High-level `KovanicaWallet` and `KovanicaClient` support for estimating fees/gas (`estimateAndBuildCall`), read-only contract dry-run simulation with typed Bincode decoding (`dryRunCall`), constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`.
 - **HD Wallet & Key Derivation (BIP-39 / SLIP-0010):** Standard BIP-44 path derivation with hardened Ed25519 (`m/44'/3007'/0'/0/0`), seed derivation, message signing, and network-aware address formatting.
 - **Canonical Smart Contract Argument Builders:** Deterministic Bincode encoders for core Wasmi contracts (`name_register`, `htlc_create`, `nft_mint`, `escrow_create`, `token_transfer`, `vault_create`) matching L1 node and playground specifications.
+- **Typed Bincode Contract ABI Decoders & Storage Slot Derivation:** Bounds-checked `BincodeReader`, typed `KovanicaDecodeError`, canonical state/record decoders for HTLC, Vault, Multisig, Token/Pool, Name Registry, NFT, and Escrow contracts, plus BLAKE3 storage slot derivation (`deriveStorageSlot`, `deriveStorageSlotHex`) for `kovanica_getStorageAt`.
 - **Domain-Tagged Ed25519 Signing:** Pure TypeScript RFC 8032 Ed25519 signature computation with BLAKE3 domain hashing (`KVNC/tx/v1`).
 - **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`566da35`](https://github.com/KovanicaDAG/kovanica-l1/commit/566da35).
 - **Lossless Precision (Large Integers):** Kovanica balances, heights, stakes, nonces, and gas rates are represented losslessly as native JavaScript `bigint`. Never coerced into IEEE-754 `Number`. Plain JSON integers up to `u64::MAX` are preserved losslessly.
@@ -180,6 +182,201 @@ const signedTx = wallet.signCallTransaction(
 const txHash = await client.sendRawTransaction(signedTx.wireHex);
 console.log(`Broadcasted transaction hash: ${txHash}`);
 ```
+
+### 7. Estimating Fees/Gas & Building Calls (`estimateAndBuildCall`)
+
+`estimateAndBuildCall` (available both as a standalone helper and as `client.estimateAndBuildCall(...)`) validates a contract call, computes its exact serialized wire size (`estimateCallTxSize`), fetches `kovanica_estimateFee` and (optionally) the sender's nonce via `kovanica_getNonce` in parallel, applies configurable basis-point safety margins (`DEFAULT_FEE_SAFETY_MARGIN_BPS = 12_000`, `DEFAULT_GAS_SAFETY_MARGIN_BPS = 12_000`), and returns a ready-to-sign `PreparedCallTransaction`:
+
+```typescript
+import {
+  KovanicaClient,
+  KovanicaWallet,
+  CHAIN_IDS,
+  buildNameRegisterCall,
+  estimateAndBuildCall,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+const wallet = KovanicaWallet.fromMnemonic("your seed phrase ...", "", 0, 0, 0, undefined, {
+  chainId: CHAIN_IDS.TESTNET,
+  client,
+});
+
+// 1. Estimate fee & fetch nonce with +25% fee margin and a safety cap
+const prepared = await estimateAndBuildCall(
+  client,
+  {
+    contract: "0x" + "11".repeat(32),
+    method: "name_register",
+    args: buildNameRegisterCall("alice", wallet.publicKey, ["127.0.0.1:8000"]),
+  },
+  {
+    sender: wallet.address,
+    chainId: CHAIN_IDS.TESTNET,
+    feeMarginBps: 12_500, // +25% over feeRatePerByte * estimatedTxSize
+    minFee: 10_000n,      // floor in atoms
+    maxFee: 5_000_000n,   // fail closed if estimated fee exceeds cap
+  },
+);
+
+// 2. Sign using the prepared call, nonce, fee, and chainId
+const signed = wallet.signCallTransaction(prepared.call, {
+  nonce: prepared.nonce!,
+  fee: prepared.fee,
+  chainId: prepared.chainId,
+});
+
+// 3. Broadcast to node
+const txHash = await client.sendRawTransaction(`0x${signed.rawTxHex}`);
+console.log(`Tx ${txHash} (${prepared.estimatedTxSize} bytes, fee ${prepared.fee} atoms)`);
+```
+
+**Options (`EstimateAndBuildCallOptions`):**
+- `sender`: When provided without `nonce`, fetches the account nonce via `client.getNonce(sender)` in parallel with `client.estimateFee()`.
+- `nonce` / `fee`: Explicit overrides that skip the corresponding RPC calls.
+- `feeMarginBps`: Basis-point multiplier (`>= 10_000`, default `12_000` = `+20%`) applied with ceiling division to `feeRatePerByte * estimatedTxSize`.
+- `gasMarginBps`: Basis-point multiplier (`>= 10_000`, clamped to `MAX_TX_GAS_LIMIT`). Defaults to `12_000` when `gasLimit`/`gas_limit` is omitted on the call input, or `10_000` (preserves caller value) when gas is explicitly specified.
+- `minFee` / `maxFee`: Optional fee floor and fail-closed upper cap in atoms.
+- `chainId`: Chain ID attached to the returned `PreparedCallTransaction` (default: `CHAIN_IDS.MAINNET`).
+- `requestOptions`: Optional `{ timeoutMs, signal }` forwarded to `estimateFee` and `getNonce`.
+
+#### Read-Only Contract Dry-Run Simulation (`dryRunCall`)
+
+`dryRunCall` (available both as a standalone helper and as `client.dryRunCall(call, options?)`) simulates a read-only contract call against current node state via `kovanica_call` and optionally decodes the returned bytes with a typed Bincode decoder:
+
+```typescript
+import {
+  KovanicaClient,
+  decodeNameRecord,
+  dryRunCall,
+  encodeBincodeString,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+
+// Simulate a read-only contract call and decode the Bincode response
+const simulation = await client.dryRunCall(
+  {
+    contract: "0x" + "11".repeat(32),
+    method: "name_lookup",
+    args: encodeBincodeString("alice"),
+  },
+  {
+    from: "0x" + "22".repeat(32),
+    gasLimit: 150_000n,
+    decoder: decodeNameRecord,
+  },
+);
+
+console.log(`Raw hex: ${simulation.rawHex} (${simulation.rawBytes.length} bytes)`);
+console.log(`Decoded owner: ${simulation.decoded.ownerHex}`);
+```
+
+### 8. Real-Time WebSocket Subscriptions (`KovanicaWsClient`)
+
+`KovanicaWsClient` connects to a node's JSON-RPC WebSocket endpoint (`GET /ws`) and implements `kovanica_subscribe` / `kovanica_unsubscribe` and `kovanica_subscription` push notifications:
+
+```typescript
+import { KovanicaWsClient } from "kovanica-sdk";
+
+const ws = new KovanicaWsClient({
+  url: "ws://127.0.0.1:8545/ws",
+  reconnect: true,
+  reconnectDelayMs: 1_000,
+  maxReconnectDelayMs: 30_000,
+  requestTimeoutMs: 10_000,
+  heartbeatIntervalMs: 15_000,
+  heartbeatTimeoutMs: 5_000,
+  heartbeatMethod: "kovanica_chainId",
+  onError: (err) => console.error("WS error:", err),
+});
+
+await ws.connect();
+
+// 1. Subscribe to newly produced/accepted DAG blocks
+const headsSubId = await ws.subscribeNewHeads((head) => {
+  console.log(`New head: ${head.hash} (round ${head.round})`);
+});
+
+// 2. Subscribe to committed leader sub-DAGs
+const leaderSubId = await ws.subscribeCommittedLeaders((event) => {
+  console.log(`Committed leader round=${event.leaderRound}, blocks=${event.blocks.length}`);
+});
+
+// 3. Subscribe to contract execution logs (optional address/topic filter)
+const logsSubId = await ws.subscribeLogs(
+  {
+    address: "kvnc...dag",
+    topics: ["0x" + "aa".repeat(32)],
+  },
+  (receipts) => {
+    for (const receipt of receipts) {
+      console.log(`Tx ${receipt.tx_hash}: success=${receipt.success}, events=${receipt.events.length}`);
+    }
+  },
+);
+
+// Unsubscribe individually when no longer needed
+await ws.unsubscribe(headsSubId);
+await ws.unsubscribe(leaderSubId);
+await ws.unsubscribe(logsSubId);
+
+// Cleanly close socket, cancel reconnect timers, and clear state
+ws.close();
+```
+
+**Lifecycle & Reconnection:**
+- `connect()` deduplicates concurrent connection attempts and resolves when the socket enters `OPEN`.
+- `isConnected` and `activeSubscriptionCount` expose live connection and subscription state.
+- When `reconnect: true`, unexpected disconnects schedule exponential backoff (`reconnectDelayMs` doubling up to `maxReconnectDelayMs`). On reconnect, all active subscriptions are automatically re-subscribed and incoming server subscription IDs are transparently remapped to the original client subscription IDs.
+- When `heartbeatIntervalMs` is set to a positive number (disabled by default), the client periodically sends a lightweight JSON-RPC liveness probe (`heartbeatMethod`, default `"kovanica_chainId"`). If no message or response arrives within `heartbeatTimeoutMs` (default `5000` ms), the half-open socket is force-closed and reconnection is triggered automatically.
+- Calling `close()` stops reconnection, clears heartbeat timers, rejects any in-flight RPC requests with `KovanicaTransportError`, and clears local subscriptions.
+- In Node.js environments without a global `WebSocket` (or in tests), pass a custom constructor via `WebSocketImpl`.
+
+### 9. Typed Bincode Contract ABI Decoders & Storage Slot Derivation
+
+The SDK provides bounds-checked Bincode 1.x decoders matching canonical `kovanica-l1` Rust contract state layouts, along with BLAKE3 storage slot derivation for `kovanica_getStorageAt`:
+
+```typescript
+import {
+  KovanicaClient,
+  KovanicaDecodeError,
+  decodeNameRecord,
+  decodeHtlcRecord,
+  deriveStorageSlotHex,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+const registryContract = "0x" + "11".repeat(32);
+
+// 1. Derive canonical BLAKE3 storage slot: blake3("kvnc/v1/name/" || "alice")
+const slotHex = deriveStorageSlotHex("name", "alice");
+
+// 2. Fetch raw bincode bytes from contract storage and decode into a typed record
+const rawHex = await client.getStorageAt(registryContract, slotHex);
+try {
+  const record = decodeNameRecord(rawHex);
+  console.log(`Owner: ${record.ownerHex}, endpoints: ${record.relayEndpoints.join(", ")}`);
+} catch (err) {
+  if (err instanceof KovanicaDecodeError) {
+    console.error(`Decode failed [${err.code}] at offset ${err.offset}: ${err.message}`);
+  }
+}
+```
+
+**Supported Contract Decoders & Storage Slot Keys:**
+
+| Contract | Decoder Function(s) | Return Type | Storage Slot Helper (`deriveStorageSlot` / `deriveStorageSlotHex`) |
+| :--- | :--- | :--- | :--- |
+| **HTLC** | `decodeHtlcRecord` | `HtlcRecord` (`status`: `"open" \| "claimed" \| "refunded"`) | `("htlc", swapId32)` — `blake3("kvnc/v1/htlc/" \|\| swapId32)` |
+| **Vault** | `decodeVaultRecord` | `VaultRecord` (`schedule`: `VaultSchedule`) | `("vault", vaultId32)` — `blake3("kvnc/v1/vault/" \|\| vaultId32)` |
+| **Multisig** | `decodeMultisigState`, `decodeMultisigPendingTx` | `MultisigState`, `MultisigPendingTx` | `("multisig")` (`kvnc/v1/state`), `("multisig_tx", txId)` (`kvnc/v1/mtx/` \|\| `u64le(txId)`) |
+| **Token / AMM Pool** | `decodeTokenMetadata` (alias `decodeTokenState`), `decodeTokenPool` | `TokenMetadata`, `TokenPoolState` | `("token")` (`kvnc/v1/state`), `("token_pool")` (`kvnc/v1/pool`), `("token_lp", addr32)` (`kvnc/v1/lp/`) |
+| **Name Registry** | `decodeNameRecord` | `NameRecord` | `("name", name)` — `blake3("kvnc/v1/name/" \|\| lowercaseName)` |
+| **NFT** | `decodeNftMetadata` (alias `decodeNftState`) | `NftMetadata` (`tokens: NftTokenEntry[]`) | `("nft")` — `blake3("kvnc/v1/state")` |
+| **Escrow** | `decodeEscrowRecord` | `EscrowRecord` (`status`: `"open" \| "released" \| "refunded"`) | `("escrow", escrowId32)` — `blake3("kvnc/v1/escrow/" \|\| escrowId32)` |
+
+For custom contract state layouts, use `BincodeReader` directly (`readU8`, `readU16`, `readU32`, `readU64`, `readU128`, `readBool`, `readFixedBytes`, `readBytes`, `readString`, `readOption`, `readVec`, `assertEof`) and `derivePrefixedStorageSlot(prefix, key)`. All decoders fail closed with `KovanicaDecodeError` (`TRUNCATED`, `TRAILING_BYTES`, `INVALID_BOOL`, `INVALID_VARIANT`, `INVALID_UTF8`, `LENGTH_OVERFLOW`, `INVALID_INPUT`).
 
 ---
 

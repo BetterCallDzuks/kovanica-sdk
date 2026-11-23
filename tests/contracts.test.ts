@@ -2,12 +2,21 @@ import { describe, expect, it, vi } from "vitest";
 import {
   CHAIN_IDS,
   DEFAULT_CALL_GAS_LIMIT,
+  DEFAULT_FEE_SAFETY_MARGIN_BPS,
+  DEFAULT_GAS_SAFETY_MARGIN_BPS,
+  CALL_TX_FIXED_WIRE_OVERHEAD,
   DOMAIN_TAG_STR,
   KEYED_HASH_TAG_STR,
   KOVANICA_COIN_TYPE,
+  KovanicaAbortError,
   KovanicaClient,
+  KovanicaDecodeError,
+  KovanicaRpcError,
+  KovanicaTimeoutError,
+  KovanicaTransportError,
   KovanicaWallet,
   MAX_TX_GAS_LIMIT,
+  RpcErrorCode,
   TX_DOMAIN,
   TX_KEY,
   addressFromSeed,
@@ -26,6 +35,10 @@ import {
   bytesToHex,
   computeCallTransactionSigningHash,
   concatBytes,
+  decodeHtlcRecord,
+  decodeNameRecord,
+  dryRunCall,
+  encodeAddress,
   encodeBincodeBytes32Vec,
   encodeBincodeString,
   encodeBincodeStringVec,
@@ -33,6 +46,8 @@ import {
   encodeHtlcCreateArgs,
   encodeNameRegisterArgs,
   encodeNftMintArgs,
+  estimateAndBuildCall,
+  estimateCallTxSize,
   hexToBytes,
   signCallContractTransaction,
   signEd25519,
@@ -522,6 +537,544 @@ describe("Canonical Smart Contract Argument Builders & Bincode Encoders", () => 
 
       await client.sendRawTransaction("0xaabbcc");
       expect(callSpy).toHaveBeenCalledWith("kovanica_sendRawTransaction", ["0xaabbcc"], undefined);
+    });
+  });
+
+  describe("estimateCallTxSize & estimateAndBuildCall", () => {
+    const contractHex = "0x" + "11".repeat(32);
+
+    it("computes exact serialized wire size matching signCallContractTransaction", () => {
+      const call = buildNameRegisterCallTx(
+        contractHex,
+        "alice",
+        acc1.publicKey,
+        ["https://relay1.kovanica.org"],
+      );
+      const estimatedSize = estimateCallTxSize(call);
+
+      const signed = signCallContractTransaction({
+        sender: acc0.publicKey,
+        secretKey: acc0.secretKey,
+        call,
+        nonce: 1n,
+        fee: 25_000n,
+        chainId: CHAIN_IDS.TESTNET,
+      });
+
+      expect(estimatedSize).toBe(signed.txSize);
+      expect(estimatedSize).toBeGreaterThan(CALL_TX_FIXED_WIRE_OVERHEAD);
+    });
+
+    it("estimates fee and builds ready-to-sign call with default safety margins", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const estimateFeeSpy = vi.spyOn(client, "estimateFee").mockResolvedValue(100n);
+      const getNonceSpy = vi.spyOn(client, "getNonce");
+
+      const args = buildNameRegisterCall("alice", acc1.publicKey, ["127.0.0.1:8000"]);
+      const prepared = await estimateAndBuildCall(client, {
+        contract: contractHex,
+        method: "name_register",
+        args,
+      });
+
+      expect(estimateFeeSpy).toHaveBeenCalledTimes(1);
+      expect(getNonceSpy).not.toHaveBeenCalled();
+
+      // Default gas limit (100_000n) * 12_000 / 10_000 = 120_000n
+      expect(DEFAULT_GAS_SAFETY_MARGIN_BPS).toBe(12_000);
+      expect(DEFAULT_FEE_SAFETY_MARGIN_BPS).toBe(12_000);
+      expect(prepared.gasLimit).toBe(120_000n);
+      expect(prepared.call.gas_limit).toBe(120_000n);
+      expect(prepared.call.gasLimit).toBe(120_000n);
+
+      // Fee = ceil(feeRatePerByte * estimatedTxSize * 12_000 / 10_000)
+      const expectedBaseFee = 100n * BigInt(prepared.estimatedTxSize);
+      const expectedFee = (expectedBaseFee * 12_000n + 9_999n) / 10_000n;
+      expect(prepared.feeRatePerByte).toBe(100n);
+      expect(prepared.fee).toBe(expectedFee);
+      expect(prepared.nonce).toBeUndefined();
+      expect(prepared.chainId).toBe(CHAIN_IDS.MAINNET);
+
+      // End-to-end signing verifies exact wire size match
+      const wallet = new KovanicaWallet(acc0.secretKey, { chainId: prepared.chainId });
+      const signed = wallet.signCallTransaction(prepared.call, {
+        nonce: 0n,
+        fee: prepared.fee,
+        chainId: prepared.chainId,
+      });
+      expect(signed.txSize).toBe(prepared.estimatedTxSize);
+    });
+
+    it("fetches fee and sender nonce in parallel via client.estimateAndBuildCall and forwards requestOptions", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const estimateFeeSpy = vi.spyOn(client, "estimateFee").mockResolvedValue(50n);
+      const getNonceSpy = vi.spyOn(client, "getNonce").mockResolvedValue(7n);
+      const controller = new AbortController();
+      const requestOptions = { timeoutMs: 2500, signal: controller.signal };
+
+      const prepared = await client.estimateAndBuildCall(
+        {
+          contract: contractHex,
+          method: "htlc_create",
+          args: buildHtlcCreateCall(hexToBytes("22".repeat(32)), 1_750_000_000n, acc1.publicKey),
+        },
+        {
+          sender: acc0.address,
+          chainId: CHAIN_IDS.TESTNET,
+          requestOptions,
+        },
+      );
+
+      expect(estimateFeeSpy).toHaveBeenCalledWith(requestOptions);
+      expect(getNonceSpy).toHaveBeenCalledWith(acc0.address, requestOptions);
+      expect(prepared.nonce).toBe(7n);
+      expect(prepared.chainId).toBe(CHAIN_IDS.TESTNET);
+      expect(prepared.feeRatePerByte).toBe(50n);
+    });
+
+    it("supports explicit overrides for fee, nonce, gasLimit, margins, minFee, and maxFee", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const estimateFeeSpy = vi.spyOn(client, "estimateFee").mockResolvedValue(10n);
+      const getNonceSpy = vi.spyOn(client, "getNonce").mockResolvedValue(99n);
+
+      // 1. Explicit fee and nonce skip both RPC calls; explicit gasLimit is preserved
+      const overridden = await estimateAndBuildCall(
+        client,
+        {
+          contract: contractHex,
+          method: "token_transfer",
+          args: concatBytes([acc1.publicKey, u128le(500n)]),
+          gasLimit: 250_000n,
+        },
+        {
+          sender: acc0.address,
+          nonce: 12n,
+          fee: 50_000n,
+          maxFee: 100_000n,
+          chainId: CHAIN_IDS.DEVNET,
+        },
+      );
+
+      expect(estimateFeeSpy).not.toHaveBeenCalled();
+      expect(getNonceSpy).not.toHaveBeenCalled();
+      expect(overridden.fee).toBe(50_000n);
+      expect(overridden.feeRatePerByte).toBeUndefined();
+      expect(overridden.nonce).toBe(12n);
+      expect(overridden.gasLimit).toBe(250_000n);
+      expect(overridden.chainId).toBe(CHAIN_IDS.DEVNET);
+
+      // 2. Explicit gasMarginBps applies to explicit gas and clamps to MAX_TX_GAS_LIMIT; minFee floor applies
+      const clampedAndFloored = await estimateAndBuildCall(
+        client,
+        {
+          contract: contractHex,
+          method: "token_transfer",
+          args: concatBytes([acc1.publicKey, u128le(1n)]),
+          gas_limit: 9_000_000n,
+        },
+        {
+          feeMarginBps: 15_000,
+          gasMarginBps: 15_000,
+          minFee: 100_000n,
+          maxFee: 200_000n,
+        },
+      );
+
+      expect(estimateFeeSpy).toHaveBeenCalledTimes(1);
+      expect(clampedAndFloored.gasLimit).toBe(MAX_TX_GAS_LIMIT);
+      expect(clampedAndFloored.call.gas_limit).toBe(MAX_TX_GAS_LIMIT);
+      expect(clampedAndFloored.fee).toBe(100_000n); // minFee floor > 10 * txSize * 1.5
+    });
+
+    it("preserves gas limit on pre-built CallTxKind unless gasMarginBps is explicitly set", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      vi.spyOn(client, "estimateFee").mockResolvedValue(10n);
+
+      const prebuilt = buildTokenTransferCall(contractHex, acc1.publicKey, 42n, 150_000n);
+      const preserved = await estimateAndBuildCall(client, prebuilt);
+      expect(preserved.gasLimit).toBe(150_000n);
+
+      const margined = await estimateAndBuildCall(client, prebuilt, { gasMarginBps: 12_500 });
+      expect(margined.gasLimit).toBe(187_500n);
+    });
+
+    it("rejects invalid options, fee cap breaches, and invalid call inputs before RPC", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const estimateFeeSpy = vi.spyOn(client, "estimateFee").mockResolvedValue(1_000n);
+      const validCall = {
+        contract: contractHex,
+        method: "test",
+        args: new Uint8Array([1, 2, 3]),
+      };
+
+      // Invalid margins (< 10_000 or non-integer)
+      await expect(
+        estimateAndBuildCall(client, validCall, { feeMarginBps: 9_999 }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateAndBuildCall(client, validCall, { feeMarginBps: 12_000.5 }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateAndBuildCall(client, validCall, { gasMarginBps: 500 }),
+      ).rejects.toThrow(RangeError);
+
+      // Negative fee, nonce, minFee, maxFee, or minFee > maxFee
+      await expect(
+        estimateAndBuildCall(client, validCall, { fee: -1n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateAndBuildCall(client, validCall, { nonce: -1n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateAndBuildCall(client, validCall, { minFee: -1n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateAndBuildCall(client, validCall, { maxFee: -1n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateAndBuildCall(client, validCall, { minFee: 100n, maxFee: 50n }),
+      ).rejects.toThrow(RangeError);
+
+      // Invalid call (bad contract address or gas > MAX_TX_GAS_LIMIT) fails before RPC
+      await expect(
+        estimateAndBuildCall(client, {
+          contract: "0x1234",
+          method: "test",
+          args: new Uint8Array(),
+        }),
+      ).rejects.toThrow(/Expected 32-byte contract address/);
+      await expect(
+        estimateAndBuildCall(client, {
+          contract: contractHex,
+          method: "test",
+          args: new Uint8Array(),
+          gas_limit: MAX_TX_GAS_LIMIT + 1n,
+        }),
+      ).rejects.toThrow(/exceeds maximum allowed/);
+      expect(estimateFeeSpy).not.toHaveBeenCalled();
+
+      // Exceeding maxFee throws RangeError (both estimated and explicit)
+      await expect(
+        estimateAndBuildCall(client, validCall, { maxFee: 10n }),
+      ).rejects.toThrow(/exceeds maxFee/);
+      await expect(
+        estimateAndBuildCall(client, validCall, { fee: 500n, maxFee: 100n }),
+      ).rejects.toThrow(/exceeds maxFee/);
+
+      // Negative fee rate from RPC fails closed
+      estimateFeeSpy.mockResolvedValueOnce(-5n);
+      await expect(estimateAndBuildCall(client, validCall)).rejects.toThrow(
+        /Estimated fee rate must be non-negative/,
+      );
+    });
+
+    it("propagates RPC, transport, timeout, and abort errors without converting to 0n", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const call = {
+        contract: contractHex,
+        method: "test",
+        args: new Uint8Array(),
+      };
+
+      const estimateFeeSpy = vi.spyOn(client, "estimateFee");
+      const getNonceSpy = vi.spyOn(client, "getNonce");
+
+      estimateFeeSpy.mockRejectedValueOnce(
+        new KovanicaRpcError(RpcErrorCode.InternalError, "fee estimator unavailable"),
+      );
+      await expect(estimateAndBuildCall(client, call)).rejects.toThrow(KovanicaRpcError);
+
+      estimateFeeSpy.mockRejectedValueOnce(new KovanicaTransportError("socket hang up"));
+      await expect(estimateAndBuildCall(client, call)).rejects.toThrow(KovanicaTransportError);
+
+      estimateFeeSpy.mockRejectedValueOnce(new KovanicaTimeoutError(5000));
+      await expect(estimateAndBuildCall(client, call)).rejects.toThrow(KovanicaTimeoutError);
+
+      estimateFeeSpy.mockResolvedValueOnce(10n);
+      getNonceSpy.mockRejectedValueOnce(new KovanicaAbortError());
+      await expect(
+        estimateAndBuildCall(client, call, { sender: acc0.address }),
+      ).rejects.toThrow(KovanicaAbortError);
+    });
+  });
+
+  describe("dryRunCall & client.dryRunCall", () => {
+    const contractBytes = hexToBytes("11".repeat(32));
+    const contractHex = "0x" + "11".repeat(32);
+    const contractPro21 = encodeAddress(contractBytes);
+
+    it("executes a raw dry-run call via kovanica_call and returns rawHex and rawBytes", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const callSpy = vi.spyOn(client, "call").mockResolvedValue("0xDeAdBeEf");
+
+      const args = encodeBincodeString("alice");
+      const result = await dryRunCall(client, {
+        contract: contractHex,
+        method: "name_lookup",
+        args,
+      });
+
+      expect(callSpy).toHaveBeenCalledTimes(1);
+      expect(callSpy).toHaveBeenCalledWith(
+        "kovanica_call",
+        [
+          {
+            to: contractPro21,
+            entry: "name_lookup",
+            method: "name_lookup",
+            data: `0x${bytesToHex(args)}`,
+            value: "0x0",
+            gas: "0x186a0", // DEFAULT_CALL_GAS_LIMIT = 100_000n
+          },
+        ],
+        undefined,
+      );
+      expect(result.rawHex).toBe("0xdeadbeef");
+      expect(result.rawBytes).toEqual(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+      expect(result.decoded).toBeUndefined();
+
+      // Empty "0x" response returns empty Uint8Array
+      callSpy.mockResolvedValueOnce("0x");
+      const emptyRes = await client.dryRunCall({
+        contract: contractBytes,
+        method: "noop",
+        args: new Uint8Array(0),
+      });
+      expect(emptyRes.rawHex).toBe("0x");
+      expect(emptyRes.rawBytes).toEqual(new Uint8Array(0));
+    });
+
+    it("supports from, value, gasLimit, and requestOptions overrides on client.dryRunCall", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const callSpy = vi.spyOn(client, "call").mockResolvedValue("0x0102");
+      const controller = new AbortController();
+      const requestOptions = { timeoutMs: 3_000, signal: controller.signal };
+
+      const prebuilt = buildTokenTransferCall(contractHex, acc1.publicKey, 1_000n, 120_000n);
+      const res = await client.dryRunCall(prebuilt, {
+        from: acc0.publicKey,
+        value: 500n,
+        gasLimit: 250_000n,
+        requestOptions,
+      });
+
+      expect(callSpy).toHaveBeenCalledWith(
+        "kovanica_call",
+        [
+          {
+            to: contractPro21,
+            from: encodeAddress(acc0.publicKey),
+            entry: "token_transfer",
+            method: "token_transfer",
+            data: `0x${bytesToHex(prebuilt.args)}`,
+            value: "0x1f4",
+            gas: "0x3d090",
+          },
+        ],
+        requestOptions,
+      );
+      expect(res.rawBytes).toEqual(new Uint8Array([1, 2]));
+    });
+
+    it("dispatches typed Bincode decoders (e.g. decodeNameRecord, decodeHtlcRecord) and surfaces KovanicaDecodeError on malformed bytes", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const owner = acc0.publicKey;
+      const targetPubkey = acc1.publicKey;
+      const endpoints = ["https://relay1.kovanica.org", "https://relay2.kovanica.org"];
+
+      // NameEntry layout: owner ([u8; 32]) || pubkey ([u8; 32]) || relay_endpoints (Vec<String>)
+      const encodedNameRecord = concatBytes([
+        owner,
+        targetPubkey,
+        encodeBincodeStringVec(endpoints),
+      ]);
+
+      const callSpy = vi
+        .spyOn(client, "call")
+        .mockResolvedValueOnce(`0x${bytesToHex(encodedNameRecord)}`);
+
+      const result = await client.dryRunCall(
+        {
+          contract: contractHex,
+          method: "name_lookup",
+          args: encodeBincodeString("alice"),
+        },
+        {
+          decoder: decodeNameRecord,
+        },
+      );
+
+      expect(result.rawBytes).toEqual(encodedNameRecord);
+      expect(result.decoded).toBeDefined();
+      expect(result.decoded.owner).toEqual(owner);
+      expect(result.decoded.ownerHex).toBe(bytesToHex(owner));
+      expect(result.decoded.pubkey).toEqual(targetPubkey);
+      expect(result.decoded.pubkeyHex).toBe(bytesToHex(targetPubkey));
+      expect(result.decoded.relayEndpoints).toEqual(endpoints);
+
+      // Malformed / truncated Bincode payload surfaces KovanicaDecodeError cleanly
+      callSpy.mockResolvedValueOnce("0x112233");
+      await expect(
+        client.dryRunCall(
+          {
+            contract: contractHex,
+            method: "name_lookup",
+            args: encodeBincodeString("alice"),
+          },
+          {
+            decoder: decodeNameRecord,
+          },
+        ),
+      ).rejects.toThrow(KovanicaDecodeError);
+
+      // Malformed RPC return type or invalid hex string surfaces KovanicaDecodeError("INVALID_INPUT")
+      callSpy.mockResolvedValueOnce(12345 as unknown as string);
+      await expect(
+        dryRunCall(client, {
+          contract: contractHex,
+          method: "name_lookup",
+          args: new Uint8Array(0),
+        }),
+      ).rejects.toThrow(KovanicaDecodeError);
+
+      callSpy.mockResolvedValueOnce("0xzz11");
+      await expect(
+        dryRunCall(client, {
+          contract: contractHex,
+          method: "name_lookup",
+          args: new Uint8Array(0),
+        }),
+      ).rejects.toThrow(KovanicaDecodeError);
+
+      // Also verify decodeHtlcRecord dispatch
+      const sender = acc0.publicKey;
+      const recipient = acc1.publicKey;
+      const hashlock = hexToBytes("aa".repeat(32));
+      const encodedHtlc = concatBytes([
+        sender,
+        recipient,
+        u128le(50_000_000_000n),
+        hashlock,
+        u64le(1_800_000_000n),
+        Uint8Array.of(0), // claimed: false
+        Uint8Array.of(0), // refunded: false
+      ]);
+      callSpy.mockResolvedValueOnce(`0x${bytesToHex(encodedHtlc)}`);
+
+      const htlcSim = await dryRunCall(
+        client,
+        {
+          contract: contractHex,
+          method: "htlc_get",
+          args: hexToBytes("bb".repeat(32)),
+        },
+        { decoder: decodeHtlcRecord },
+      );
+      expect(htlcSim.decoded.status).toBe("open");
+      expect(htlcSim.decoded.amount).toBe(50_000_000_000n);
+      expect(htlcSim.decoded.expiry).toBe(1_800_000_000n);
+    });
+
+    it("propagates execution revert (KovanicaRpcError), transport, timeout, and abort errors", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const callSpy = vi.spyOn(client, "call");
+      const validCall = {
+        contract: contractHex,
+        method: "vault_withdraw",
+        args: new Uint8Array([1, 2, 3]),
+      };
+
+      callSpy.mockRejectedValueOnce(
+        new KovanicaRpcError(-32000, "Execution reverted or failed: Trap: unreachable"),
+      );
+      await expect(
+        client.dryRunCall(validCall, { decoder: decodeNameRecord }),
+      ).rejects.toThrow(/Execution reverted or failed/);
+
+      callSpy.mockRejectedValueOnce(new KovanicaTransportError("connection reset"));
+      await expect(dryRunCall(client, validCall)).rejects.toThrow(KovanicaTransportError);
+
+      callSpy.mockRejectedValueOnce(new KovanicaTimeoutError(5_000));
+      await expect(dryRunCall(client, validCall)).rejects.toThrow(KovanicaTimeoutError);
+
+      callSpy.mockRejectedValueOnce(new KovanicaAbortError());
+      await expect(dryRunCall(client, validCall)).rejects.toThrow(KovanicaAbortError);
+    });
+
+    it("rejects invalid call inputs and options before making any RPC request", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const callSpy = vi.spyOn(client, "call");
+
+      // Empty method
+      await expect(
+        dryRunCall(client, {
+          contract: contractHex,
+          method: "   ",
+          args: new Uint8Array(0),
+        }),
+      ).rejects.toThrow(/Call method must be a non-empty string/);
+
+      // Invalid contract address
+      await expect(
+        dryRunCall(client, {
+          contract: "0x1234",
+          method: "test",
+          args: new Uint8Array(0),
+        }),
+      ).rejects.toThrow(/Expected 32-byte contract address/);
+
+      // Invalid from address
+      await expect(
+        dryRunCall(
+          client,
+          {
+            contract: contractHex,
+            method: "test",
+            args: new Uint8Array(0),
+          },
+          { from: "not-an-address" },
+        ),
+      ).rejects.toThrow();
+
+      // Negative value or value exceeding u64::MAX
+      await expect(
+        dryRunCall(
+          client,
+          {
+            contract: contractHex,
+            method: "test",
+            args: new Uint8Array(0),
+          },
+          { value: -1n },
+        ),
+      ).rejects.toThrow(/call_value must be non-negative/);
+
+      await expect(
+        dryRunCall(
+          client,
+          {
+            contract: contractHex,
+            method: "test",
+            args: new Uint8Array(0),
+          },
+          { value: 0xffffffffffffffffn + 1n },
+        ),
+      ).rejects.toThrow(RangeError);
+
+      // Gas limit out of range
+      await expect(
+        dryRunCall(
+          client,
+          {
+            contract: contractHex,
+            method: "test",
+            args: new Uint8Array(0),
+          },
+          { gasLimit: MAX_TX_GAS_LIMIT + 1n },
+        ),
+      ).rejects.toThrow(/exceeds maximum allowed/);
+
+      expect(callSpy).not.toHaveBeenCalled();
     });
   });
 });
