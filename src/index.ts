@@ -331,3 +331,29 @@ export {
   type RpcNodeProbeResult,
   probeRpcNode,
 } from "./probe";
+
+// Offline Transfer Transaction Signer, Decoder & Ed25519 Verifier
+export {
+  TRANSFER_TX_SIGNING_TAG,
+  TRANSFER_TX_VARIANT,
+  TRANSFER_TX_WIRE_SIZE,
+  type DecodeSignedTransferTransactionOptions,
+  type DecodedSignedTransferTransaction,
+  type SignTransferTxParams,
+  type SignedTransferTxResult,
+  type TransferSigningHashParams,
+  computeTransferTransactionSigningHash,
+  decodeSignedTransferTransaction,
+  signTransferTransaction,
+  verifyTransferTransactionSignature,
+} from "./transfer-tx";
+
+// Address Checksum & Chain-Policy Inspector
+export {
+  type AddressFormat,
+  type AddressInspectionResult,
+  type NormalizeAddressListOptions,
+  type NormalizeAddressListResult,
+  inspectAddress,
+  normalizeAddressList,
+} from "./address-inspect";
