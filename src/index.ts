@@ -357,3 +357,25 @@ export {
   inspectAddress,
   normalizeAddressList,
 } from "./address-inspect";
+
+// Universal Offline Transaction Auto-Decoder
+export {
+  type DecodeSignedTransactionAutoOptions,
+  type DecodedSignedTransactionAuto,
+  decodeSignedTransactionAuto,
+  peekTransactionVariant,
+  verifySignedTransactionAuto,
+} from "./tx-auto-decode";
+
+// Air-Gapped Tx Envelope Encoder/Decoder
+export {
+  AIRGAP_ENVELOPE_PREFIX,
+  AIRGAP_ENVELOPE_VERSION,
+  type AirgapTxEnvelope,
+  type AirgapTxKind,
+  type DecodeAirgapTxEnvelopeOptions,
+  type EncodeAirgapTxEnvelopeInput,
+  type EncodedAirgapTxEnvelope,
+  decodeAirgapTxEnvelope,
+  encodeAirgapTxEnvelope,
+} from "./airgap";
