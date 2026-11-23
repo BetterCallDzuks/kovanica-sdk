@@ -9,10 +9,17 @@ import {
   KovanicaTimeoutError,
   KovanicaTransportError,
 } from "./errors";
-import { HttpTransport, type HttpTransportOptions, type Transport } from "./transport";
+import {
+  HttpTransport,
+  type HttpTransportOptions,
+  type Transport,
+  validateJsonRpcBatchRequests,
+} from "./transport";
 import type {
   BlockResponse,
   DagTips,
+  JsonRpcBatchItemResult,
+  JsonRpcBatchRequestItem,
   LeaderSlot,
   MiningInfo,
   RequestOptions,
@@ -401,6 +408,78 @@ export class KovanicaClient {
 
       try {
         return await activeTransport.send<TResult>(method, params, options);
+      } catch (err: unknown) {
+        if (attempt >= maxRetries || !isTransientRpcError(err)) {
+          throw err;
+        }
+
+        if (this.transports.length > 1) {
+          this.activeEndpointIndex = (endpointIndex + 1) % this.transports.length;
+        }
+
+        const delayMs = computeRetryDelayMs(attempt, this.retryBackoff);
+        attempt += 1;
+
+        if (delayMs > 0) {
+          await sleepWithAbort(delayMs, options?.signal);
+        } else if (options?.signal?.aborted) {
+          throw new KovanicaAbortError("Request was aborted during retry backoff");
+        }
+      }
+    }
+  }
+
+  /**
+   * Executes a bounded JSON-RPC 2.0 batch request (1..=32 items) in a single HTTP round-trip
+   * when supported by the active transport, or falls back to parallel `transport.send` calls
+   * for custom transports without `sendBatch`.
+   *
+   * Per-item JSON-RPC errors are isolated into `{ ok: false, error: KovanicaRpcError }` entries
+   * rather than rejecting the entire batch.
+   *
+   * Automatic retry and multi-endpoint failover on transient transport/timeout/5xx errors are
+   * enabled ONLY when EVERY method in the batch is allowlisted in `retryableMethods`
+   * (batches containing `kovanica_sendRawTransaction` are never auto-retried by default).
+   */
+  async callBatch<TResult = unknown>(
+    requests: ReadonlyArray<JsonRpcBatchRequestItem>,
+    options?: RequestOptions,
+  ): Promise<Array<JsonRpcBatchItemResult<TResult>>> {
+    validateJsonRpcBatchRequests(requests);
+
+    const canRetryBatch = requests.every((req) => this.retryableMethods.has(req.method));
+    const maxRetries = canRetryBatch ? this.maxRetries : 0;
+
+    let attempt = 0;
+    while (true) {
+      if (options?.signal?.aborted) {
+        throw new KovanicaAbortError("Request was already aborted");
+      }
+
+      const endpointIndex = this.activeEndpointIndex;
+      const activeTransport = this.transports[endpointIndex]!;
+
+      try {
+        if (typeof activeTransport.sendBatch === "function") {
+          return await activeTransport.sendBatch<TResult>(requests, options);
+        }
+        return await Promise.all(
+          requests.map(async (req): Promise<JsonRpcBatchItemResult<TResult>> => {
+            try {
+              const result = await activeTransport.send<TResult>(
+                req.method,
+                req.params,
+                options,
+              );
+              return { ok: true, result };
+            } catch (itemErr: unknown) {
+              if (itemErr instanceof KovanicaRpcError) {
+                return { ok: false, error: itemErr };
+              }
+              throw itemErr;
+            }
+          }),
+        );
       } catch (err: unknown) {
         if (attempt >= maxRetries || !isTransientRpcError(err)) {
           throw err;
