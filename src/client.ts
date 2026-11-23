@@ -20,8 +20,11 @@ import type {
 } from "./types";
 import { parseQuantity, toHexQuantity } from "./units";
 import {
+  type BatchDryRunResult,
   type CallTxKind,
   type CallTxKindInput,
+  type DryRunBatchCallItem,
+  type DryRunBatchCallsOptions,
   type DryRunCallOptions,
   type DryRunCallResult,
   type EstimateAndBuildCallOptions,
@@ -31,12 +34,24 @@ import {
   type SignedTxResult,
   type WaitForTransactionReceiptOptions,
   buildCallTxKind,
+  dryRunBatchCalls,
   dryRunCall,
   estimateAndBuildCall,
   estimateBatchCalls,
   signCallContractTransaction,
   waitForTransactionReceipt,
 } from "./contracts";
+import {
+  type ContractLogKind,
+  type ContractStorageReadResult,
+  type ContractStorageTarget,
+  type DecodedContractLogByKind,
+  type DefaultDecodedStorageByKind,
+  type ReadContractStorageOptions,
+  type StorageSlotKey,
+  type StorageSlotKind,
+  readContractStorage,
+} from "./decoders";
 import { getPublicKey } from "./wallet";
 
 export interface KovanicaClientOptions extends HttpTransportOptions {
@@ -218,6 +233,102 @@ export class KovanicaClient {
     return this.call<string>("kovanica_getStorageAt", [address, slotArg], options);
   }
 
+  /**
+   * Reads a contract storage slot via `kovanica_getStorageAt`, automatically deriving
+   * canonical or prefixed BLAKE3 storage slots, detecting empty/zero slots, and optionally
+   * decoding Bincode state records.
+   */
+  async readContractStorage<TDecoded>(
+    contract: Uint8Array | string,
+    target: {
+      slotHex: string;
+      decoder: (bytes: Uint8Array) => TDecoded;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<TDecoded>>;
+  async readContractStorage<K extends ContractLogKind>(
+    contract: Uint8Array | string,
+    target: {
+      slotHex: string;
+      decoder: K;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<DecodedContractLogByKind<K>["record"]>>;
+  async readContractStorage<TDecoded = undefined>(
+    contract: Uint8Array | string,
+    target: {
+      slotHex: string;
+      decoder?: undefined;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<TDecoded>>;
+  async readContractStorage<TDecoded>(
+    contract: Uint8Array | string,
+    target: {
+      kind: StorageSlotKind;
+      key?: StorageSlotKey;
+      decoder: (bytes: Uint8Array) => TDecoded;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<TDecoded>>;
+  async readContractStorage<K extends ContractLogKind>(
+    contract: Uint8Array | string,
+    target: {
+      kind: StorageSlotKind;
+      key?: StorageSlotKey;
+      decoder: K;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<DecodedContractLogByKind<K>["record"]>>;
+  async readContractStorage<S extends StorageSlotKind>(
+    contract: Uint8Array | string,
+    target: {
+      kind: S;
+      key?: StorageSlotKey;
+      decoder?: undefined;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<DefaultDecodedStorageByKind<S>>>;
+  async readContractStorage<TDecoded>(
+    contract: Uint8Array | string,
+    target: {
+      prefix: string | Uint8Array;
+      key?: string | Uint8Array;
+      decoder: (bytes: Uint8Array) => TDecoded;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<TDecoded>>;
+  async readContractStorage<K extends ContractLogKind>(
+    contract: Uint8Array | string,
+    target: {
+      prefix: string | Uint8Array;
+      key?: string | Uint8Array;
+      decoder: K;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<DecodedContractLogByKind<K>["record"]>>;
+  async readContractStorage<TDecoded = undefined>(
+    contract: Uint8Array | string,
+    target: {
+      prefix: string | Uint8Array;
+      key?: string | Uint8Array;
+      decoder?: undefined;
+    },
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<TDecoded>>;
+  async readContractStorage<TDecoded = unknown>(
+    contract: Uint8Array | string,
+    target: ContractStorageTarget<TDecoded>,
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<TDecoded>>;
+  async readContractStorage<TDecoded = unknown>(
+    contract: Uint8Array | string,
+    target: ContractStorageTarget<TDecoded>,
+    options?: ReadContractStorageOptions,
+  ): Promise<ContractStorageReadResult<TDecoded>> {
+    return readContractStorage<TDecoded>(this, contract, target, options);
+  }
+
   // ==========================================================================
   // Transaction & Mempool Methods
   // ==========================================================================
@@ -351,6 +462,17 @@ export class KovanicaClient {
     options?: DryRunCallOptions<TDecoded>,
   ): Promise<DryRunCallResult<TDecoded>> {
     return dryRunCall(this, call, options);
+  }
+
+  /**
+   * Simulates a non-empty batch of read-only contract calls via `dryRunCall`,
+   * validating all inputs fail-closed before RPC I/O and returning aggregate batch counts.
+   */
+  async dryRunBatchCalls<TDecoded = unknown>(
+    calls: ReadonlyArray<DryRunBatchCallItem<TDecoded>>,
+    options?: DryRunBatchCallsOptions,
+  ): Promise<BatchDryRunResult<TDecoded>> {
+    return dryRunBatchCalls(this, calls, options);
   }
 
   /**

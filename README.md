@@ -3,7 +3,7 @@
 Typed, lightweight TypeScript client and developer toolkit for the **Kovanica (KVNC)** Layer-1 blockchain, suitable for modern browsers and Node.js (18+).
 
 > [!NOTE]
-> **Full Ecosystem Client (v0.4.0):** Features SLIP-0010 HD wallet derivation, canonical Wasmi smart contract call builders, single & multi-call batch fee/gas estimation (`estimateAndBuildCall`, `estimateBatchCalls`), transaction receipt polling (`waitForTransactionReceipt`), deterministic Bincode encoders and typed contract ABI/log decoders (`decodeContractLog`, `decodeTransactionReceiptLogs`), real-time WebSocket subscriptions (`KovanicaWsClient`), RFC 8032 Ed25519 signing under domain `KVNC/tx/v1`, lossless JSON-RPC 2.0 transport, and transaction broadcasting.
+> **Full Ecosystem Client (v0.4.0):** Features SLIP-0010 HD wallet derivation, canonical Wasmi smart contract call builders, single & multi-call batch fee/gas estimation (`estimateAndBuildCall`, `estimateBatchCalls`), single & batch read-only contract dry-run simulation (`dryRunCall`, `dryRunBatchCalls`), transaction receipt polling (`waitForTransactionReceipt`), deterministic Bincode encoders, typed contract ABI/log decoders (`decodeContractLog`, `decodeTransactionReceiptLogs`), and typed contract storage reading (`readContractStorage`), real-time WebSocket subscriptions (`KovanicaWsClient`), RFC 8032 Ed25519 signing under domain `KVNC/tx/v1`, lossless JSON-RPC 2.0 transport, and transaction broadcasting.
 
 ---
 
@@ -11,10 +11,10 @@ Typed, lightweight TypeScript client and developer toolkit for the **Kovanica (K
 
 - **Standard JSON-RPC 2.0 Transport:** Configurable endpoint URL, automatic request IDs, configurable timeouts, caller-controlled cancellation (`AbortSignal`), and typed error classes.
 - **Real-Time WebSocket Subscriptions (`KovanicaWsClient`):** Typed JSON-RPC 2.0 WebSocket client (`GET /ws`) supporting `newHeads`, `newCommittedLeader`, and filtered `logs` subscriptions with automatic exponential-backoff reconnection, transparent re-subscription, and optional heartbeat / idle liveness detection (`heartbeatIntervalMs`, `heartbeatTimeoutMs`, `heartbeatMethod`).
-- **Transaction Construction, Estimation, Dry-Run Simulation, Broadcasting & Receipt Polling:** High-level `KovanicaWallet` and `KovanicaClient` support for estimating fees/gas for single calls (`estimateAndBuildCall`) and sequential-nonce batches (`estimateBatchCalls`), read-only contract dry-run simulation with typed Bincode decoding (`dryRunCall`), constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`, and polling until execution finality (`waitForTransactionReceipt`).
+- **Transaction Construction, Estimation, Dry-Run Simulation, Broadcasting & Receipt Polling:** High-level `KovanicaWallet` and `KovanicaClient` support for estimating fees/gas for single calls (`estimateAndBuildCall`) and sequential-nonce batches (`estimateBatchCalls`), single and batch read-only contract dry-run simulation with typed Bincode decoding (`dryRunCall`, `dryRunBatchCalls`), constructing, signing, and broadcasting smart contract call transactions via `sendRawTransaction`, and polling until execution finality (`waitForTransactionReceipt`).
 - **HD Wallet & Key Derivation (BIP-39 / SLIP-0010):** Standard BIP-44 path derivation with hardened Ed25519 (`m/44'/3007'/0'/0/0`), seed derivation, message signing, and network-aware address formatting.
 - **Canonical Smart Contract Argument Builders:** Deterministic Bincode encoders for core Wasmi contracts (`name_register`, `htlc_create`, `nft_mint`, `escrow_create`, `token_transfer`, `vault_create`) matching L1 node and playground specifications.
-- **Typed Bincode Contract ABI & Log Decoders + Storage Slot Derivation:** Bounds-checked `BincodeReader`, typed `KovanicaDecodeError`, canonical state/record decoders, single-event log dispatcher (`decodeContractLog`), and batch receipt log decoder (`decodeTransactionReceiptLogs`) for HTLC, Vault, Multisig, Token/Pool, Name Registry, NFT, and Escrow contracts, plus BLAKE3 storage slot derivation (`deriveStorageSlot`, `deriveStorageSlotHex`) for `kovanica_getStorageAt`.
+- **Typed Bincode Contract ABI & Log Decoders + Storage Slot Derivation & Reader:** Bounds-checked `BincodeReader`, typed `KovanicaDecodeError`, canonical state/record decoders, single-event log dispatcher (`decodeContractLog`), batch receipt log decoder (`decodeTransactionReceiptLogs`), and typed storage slot reader (`readContractStorage`) for HTLC, Vault, Multisig, Token/Pool, Name Registry, NFT, and Escrow contracts, plus BLAKE3 storage slot derivation (`deriveStorageSlot`, `deriveStorageSlotHex`) for `kovanica_getStorageAt`.
 - **Domain-Tagged Ed25519 Signing:** Pure TypeScript RFC 8032 Ed25519 signature computation with BLAKE3 domain hashing (`KVNC/tx/v1`).
 - **Read-Only Verified Methods:** Full set of query methods verified against actual `crates/kovanica-rpc` Rust handlers at commit [`566da35`](https://github.com/KovanicaDAG/kovanica-l1/commit/566da35).
 - **Lossless Precision (Large Integers):** Kovanica balances, heights, stakes, nonces, and gas rates are represented losslessly as native JavaScript `bigint`. Never coerced into IEEE-754 `Number`. Plain JSON integers up to `u64::MAX` are preserved losslessly.
@@ -320,6 +320,56 @@ console.log(`Raw hex: ${simulation.rawHex} (${simulation.rawBytes.length} bytes)
 console.log(`Decoded owner: ${simulation.decoded.ownerHex}`);
 ```
 
+#### Batch Read-Only Contract Dry-Run Simulation (`dryRunBatchCalls`)
+
+`dryRunBatchCalls` (available both as a standalone helper and as `client.dryRunBatchCalls(calls, options?)`) validates all calls fail-closed before any RPC I/O, executes `dryRunCall` for each item sequentially by default (or concurrently when `options?.parallel === true`), captures individual `{ ok: true, result }` or `{ ok: false, error }` outcomes when `options?.continueOnError !== false` (or throws on first error when `continueOnError === false`), and returns `BatchDryRunResult` (`{ results, totalCalls, passedCount, failedCount }`):
+
+```typescript
+import {
+  KovanicaClient,
+  decodeNameRecord,
+  dryRunBatchCalls,
+  encodeBincodeString,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+
+const batchSim = await client.dryRunBatchCalls(
+  [
+    {
+      call: {
+        contract: "0x" + "11".repeat(32),
+        method: "name_lookup",
+        args: encodeBincodeString("alice"),
+      },
+      options: { decoder: decodeNameRecord },
+    },
+    {
+      call: {
+        contract: "0x" + "11".repeat(32),
+        method: "name_lookup",
+        args: encodeBincodeString("bob"),
+      },
+      options: { decoder: decodeNameRecord },
+    },
+  ],
+  {
+    parallel: true,
+    continueOnError: true,
+    gasLimit: 150_000n,
+  },
+);
+
+console.log(`Batch dry-run: ${batchSim.passedCount}/${batchSim.totalCalls} succeeded`);
+for (const item of batchSim.results) {
+  if (item.ok) {
+    console.log("Decoded owner:", item.result.decoded?.ownerHex);
+  } else {
+    console.warn("Call failed:", item.error.message);
+  }
+}
+```
+
 #### Polling for Transaction Receipts (`waitForTransactionReceipt`)
 
 `waitForTransactionReceipt` (available both as a standalone helper and as `client.waitForTransactionReceipt(txHash, options?)`) validates `txHash` as a 32-byte hex string, polls `client.getTransactionReceipt(txHash)` at `pollIntervalMs` (default `1_000` ms, minimum `10` ms) until a non-null `TransactionReceipt` is returned or `timeoutMs` (default `30_000` ms) elapses, honors `AbortSignal` cancellation during both RPC calls and poll wait sleep, and optionally throws `KovanicaRpcError` (`RpcErrorCode.ExecutionError`) when `throwOnRevert: true`:
@@ -445,6 +495,43 @@ try {
 | **Escrow** | `decodeEscrowRecord` | `EscrowRecord` (`status`: `"open" \| "released" \| "refunded"`) | `("escrow", escrowId32)` — `blake3("kvnc/v1/escrow/" \|\| escrowId32)` |
 
 For custom contract state layouts, use `BincodeReader` directly (`readU8`, `readU16`, `readU32`, `readU64`, `readU128`, `readBool`, `readFixedBytes`, `readBytes`, `readString`, `readOption`, `readVec`, `assertEof`) and `derivePrefixedStorageSlot(prefix, key)`. All decoders fail closed with `KovanicaDecodeError` (`TRUNCATED`, `TRAILING_BYTES`, `INVALID_BOOL`, `INVALID_VARIANT`, `INVALID_UTF8`, `LENGTH_OVERFLOW`, `INVALID_INPUT`).
+
+#### Typed Contract Storage Reader (`readContractStorage`)
+
+`readContractStorage` (available both as a standalone helper and as `client.readContractStorage(contract, target, options?)`) validates the contract address (`encodeAddress`), derives or validates the 32-byte storage `slotHex`, queries `client.getStorageAt`, detects empty/zero storage slots (`null`, `"0x"`, `"0x0"`, or 32 zero bytes -> `isEmpty: true, rawHex: "0x", rawBytes: new Uint8Array(0)`), and automatically decodes non-empty Bincode payloads into `decoded?: T`:
+
+```typescript
+import {
+  BincodeReader,
+  KovanicaClient,
+  STORAGE_KEY_PREFIXES,
+  readContractStorage,
+} from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+const registryContract = "0x" + "11".repeat(32);
+
+// 1. Canonical { kind, key } target with automatic Bincode decoding (NameRecord)
+const nameStorage = await client.readContractStorage(registryContract, {
+  kind: "name",
+  key: "alice",
+});
+if (!nameStorage.isEmpty && nameStorage.decoded) {
+  console.log(`Alice owner: ${nameStorage.decoded.ownerHex}`);
+}
+
+// 2. Custom { prefix, key } target with custom decoder function
+const lpStorage = await client.readContractStorage(registryContract, {
+  prefix: STORAGE_KEY_PREFIXES.LP,
+  key: new Uint8Array(32),
+  decoder: (bytes) => new BincodeReader(bytes).readU128(),
+});
+
+// 3. Explicit 32-byte { slotHex } target
+const rawSlot = await readContractStorage(client, registryContract, {
+  slotHex: "0x" + "aa".repeat(32),
+});
+```
 
 #### Typed Contract Event / Log Dispatcher (`decodeContractLog`)
 

@@ -1,7 +1,8 @@
 import { blake3 } from "@noble/hashes/blake3.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   BincodeReader,
+  KovanicaClient,
   KovanicaDecodeError,
   KovanicaError,
   STORAGE_KEY_PREFIXES,
@@ -23,9 +24,11 @@ import {
   derivePrefixedStorageSlot,
   deriveStorageSlot,
   deriveStorageSlotHex,
+  encodeAddress,
   encodeBincodeBytes32Vec,
   encodeBincodeString,
   encodeBincodeStringVec,
+  readContractStorage,
   u32le,
   u64le,
   u128le,
@@ -973,5 +976,251 @@ describe("decodeTransactionReceiptLogs Batch Receipt Log Decoder", () => {
       () => decodeTransactionReceiptLogs({ logs: [{ data: "0x1234" }] }, "htlc"),
       "TRUNCATED",
     );
+  });
+});
+
+describe("readContractStorage & client.readContractStorage", () => {
+  const contractBytes = addr(0x77);
+  const contractHex = `0x${bytesToHex(contractBytes)}`;
+  const contractPro21 = encodeAddress(contractBytes);
+  const owner = addr(0x11);
+  const targetPubkey = addr(0x22);
+
+  it("reads an explicit slotHex without decoder and with custom / ContractLogKind decoders", async () => {
+    const client = new KovanicaClient("http://localhost:8545");
+    const explicitSlot = "aa".repeat(32);
+    const nameBytes = concatBytes([
+      owner,
+      targetPubkey,
+      encodeBincodeStringVec(["https://relay1.kovanica.org"]),
+    ]);
+    const getStorageSpy = vi
+      .spyOn(client, "getStorageAt")
+      .mockResolvedValue(`0x${bytesToHex(nameBytes)}`);
+
+    // 1. Raw read without decoder
+    const rawRes = await readContractStorage(client, contractHex, {
+      slotHex: explicitSlot,
+    });
+    expect(getStorageSpy).toHaveBeenCalledWith(contractPro21, `0x${explicitSlot}`, undefined);
+    expect(rawRes.contract).toBe(contractPro21);
+    expect(rawRes.slotHex).toBe(`0x${explicitSlot}`);
+    expect(rawRes.isEmpty).toBe(false);
+    expect(rawRes.rawHex).toBe(`0x${bytesToHex(nameBytes)}`);
+    expect(rawRes.rawBytes).toEqual(nameBytes);
+    expect(rawRes.decoded).toBeUndefined();
+
+    // 2. Explicit slotHex with ContractLogKind string decoder
+    const kindDecoded = await client.readContractStorage(contractBytes, {
+      slotHex: `0x${explicitSlot.toUpperCase()}`,
+      decoder: "name",
+    });
+    expect(kindDecoded.isEmpty).toBe(false);
+    expect(kindDecoded.decoded?.ownerHex).toBe(bytesToHex(owner));
+    expect(kindDecoded.decoded?.relayEndpoints).toEqual(["https://relay1.kovanica.org"]);
+
+    // 3. Explicit slotHex with custom decoder function
+    const customDecoded = await readContractStorage(client, contractPro21, {
+      slotHex: `0x${explicitSlot}`,
+      decoder: (bytes) => new BincodeReader(bytes).readFixedBytes(32),
+    });
+    expect(customDecoded.decoded).toEqual(owner);
+  });
+
+  it("derives canonical { kind, key } BLAKE3 slots and automatically decodes Bincode records", async () => {
+    const client = new KovanicaClient("http://localhost:8545");
+    const getStorageSpy = vi.spyOn(client, "getStorageAt");
+    const controller = new AbortController();
+    const requestOptions = { timeoutMs: 2_000, signal: controller.signal };
+
+    // 1. Name Registry slot ("name", "Alice") -> auto-decodes NameRecord
+    const nameBytes = concatBytes([
+      owner,
+      targetPubkey,
+      encodeBincodeStringVec(["https://relay1.kovanica.org", "https://relay2.kovanica.org"]),
+    ]);
+    getStorageSpy.mockResolvedValueOnce(`0x${bytesToHex(nameBytes)}`);
+
+    const nameRes = await client.readContractStorage(
+      contractHex,
+      { kind: "name", key: "Alice" },
+      { requestOptions },
+    );
+    const expectedNameSlot = `0x${deriveStorageSlotHex("name", "Alice")}`;
+    expect(getStorageSpy).toHaveBeenCalledWith(contractPro21, expectedNameSlot, requestOptions);
+    expect(nameRes.slotHex).toBe(expectedNameSlot);
+    expect(nameRes.isEmpty).toBe(false);
+    expect(nameRes.decoded?.ownerHex).toBe(bytesToHex(owner));
+    expect(nameRes.decoded?.pubkeyHex).toBe(bytesToHex(targetPubkey));
+    expect(nameRes.decoded?.relayEndpoints).toEqual([
+      "https://relay1.kovanica.org",
+      "https://relay2.kovanica.org",
+    ]);
+
+    // 2. HTLC slot ("htlc", swapId) -> auto-decodes HtlcRecord
+    const swapId = addr(0x99);
+    const hashLock = blake3(new TextEncoder().encode("storage-preimage"));
+    const htlcBytes = concatBytes([
+      owner,
+      targetPubkey,
+      u128le(123_456_789n),
+      hashLock,
+      u64le(5_000_000n),
+      Uint8Array.of(0),
+      Uint8Array.of(1),
+    ]);
+    getStorageSpy.mockResolvedValueOnce(`0x${bytesToHex(htlcBytes)}`);
+
+    const htlcRes = await readContractStorage(client, contractPro21, {
+      kind: "htlc",
+      key: swapId,
+    });
+    expect(htlcRes.slotHex).toBe(`0x${deriveStorageSlotHex("htlc", swapId)}`);
+    expect(htlcRes.decoded?.status).toBe("refunded");
+    expect(htlcRes.decoded?.amount).toBe(123_456_789n);
+
+    // 3. Token Pool singleton ("token_pool") -> auto-decodes TokenPoolState
+    const poolBytes = concatBytes([
+      u128le(10_000n),
+      u128le(20_000n),
+      u16le(30),
+      u128le(14_142n),
+      Uint8Array.of(0),
+    ]);
+    getStorageSpy.mockResolvedValueOnce(`0x${bytesToHex(poolBytes)}`);
+
+    const poolRes = await client.readContractStorage(contractBytes, {
+      kind: "token_pool",
+    });
+    expect(poolRes.slotHex).toBe(`0x${deriveStorageSlotHex("token_pool")}`);
+    expect(poolRes.decoded?.kunaReserve).toBe(10_000n);
+    expect(poolRes.decoded?.feeBps).toBe(30);
+
+    // 4. Generic "state" kind without explicit decoder leaves decoded undefined; with custom decoder decodes
+    getStorageSpy.mockResolvedValueOnce("0x2a00000000000000");
+    const stateRaw = await readContractStorage(client, contractHex, { kind: "state" });
+    expect(stateRaw.isEmpty).toBe(false);
+    expect(stateRaw.decoded).toBeUndefined();
+
+    getStorageSpy.mockResolvedValueOnce("0x2a00000000000000");
+    const stateCustom = await readContractStorage(client, contractHex, {
+      kind: "state",
+      decoder: (bytes) => new BincodeReader(bytes).readU64(),
+    });
+    expect(stateCustom.decoded).toBe(42n);
+  });
+
+  it("derives { prefix, key } storage slots and supports custom or ContractLogKind decoders", async () => {
+    const client = new KovanicaClient("http://localhost:8545");
+    const getStorageSpy = vi.spyOn(client, "getStorageAt");
+
+    // Custom u128 LP balance under prefix "kvnc/v1/lp/" + account pubkey
+    const lpBalanceBytes = u128le(999_888_777n);
+    getStorageSpy.mockResolvedValueOnce(`0x${bytesToHex(lpBalanceBytes)}`);
+
+    const lpRes = await client.readContractStorage(contractHex, {
+      prefix: STORAGE_KEY_PREFIXES.LP,
+      key: owner,
+      decoder: (bytes) => {
+        const r = new BincodeReader(bytes);
+        const v = r.readU128();
+        r.assertEof();
+        return v;
+      },
+    });
+
+    const expectedLpSlot = `0x${bytesToHex(
+      derivePrefixedStorageSlot(STORAGE_KEY_PREFIXES.LP, owner),
+    )}`;
+    expect(lpRes.slotHex).toBe(expectedLpSlot);
+    expect(lpRes.isEmpty).toBe(false);
+    expect(lpRes.decoded).toBe(999_888_777n);
+  });
+
+  it("detects empty and zero storage slots (null, '0x', '0x0', 32 zero bytes) and skips decoding", async () => {
+    const client = new KovanicaClient("http://localhost:8545");
+    const getStorageSpy = vi.spyOn(client, "getStorageAt");
+    const decoderSpy = vi.fn(() => "should-not-run");
+
+    const emptyInputs: Array<string | null> = [
+      null,
+      "",
+      "0x",
+      "0X",
+      "0x0",
+      "0X0",
+      `0x${"00".repeat(32)}`,
+      "00".repeat(32),
+    ];
+
+    for (const rawVal of emptyInputs) {
+      getStorageSpy.mockResolvedValueOnce(rawVal as unknown as string);
+      const res = await client.readContractStorage(contractHex, {
+        kind: "name",
+        key: "unregistered",
+        decoder: decoderSpy,
+      });
+      expect(res.isEmpty).toBe(true);
+      expect(res.rawHex).toBe("0x");
+      expect(res.rawBytes).toEqual(new Uint8Array(0));
+      expect(res.decoded).toBeUndefined();
+    }
+
+    expect(decoderSpy).not.toHaveBeenCalled();
+
+    // Non-32-byte zero slice (e.g. 8 zero bytes for a stored u64 = 0) is NOT treated as an empty 32-byte slot
+    getStorageSpy.mockResolvedValueOnce(`0x${"00".repeat(8)}`);
+    const zeroU64Res = await readContractStorage(client, contractHex, {
+      prefix: "kvnc/v1/counter",
+      decoder: (bytes) => new BincodeReader(bytes).readU64(),
+    });
+    expect(zeroU64Res.isEmpty).toBe(false);
+    expect(zeroU64Res.rawBytes.length).toBe(8);
+    expect(zeroU64Res.decoded).toBe(0n);
+  });
+
+  it("rejects invalid contract addresses, invalid slot targets, and malformed storage responses fail-closed", async () => {
+    const client = new KovanicaClient("http://localhost:8545");
+    const getStorageSpy = vi.spyOn(client, "getStorageAt");
+
+    // Invalid contract address
+    await expect(
+      readContractStorage(client, "0x1234", { slotHex: "aa".repeat(32) }),
+    ).rejects.toThrow(/Expected 32-byte contract address/);
+
+    // Invalid explicit slotHex
+    await expect(
+      readContractStorage(client, contractHex, { slotHex: "0x1234" }),
+    ).rejects.toThrow(KovanicaDecodeError);
+    await expect(
+      readContractStorage(client, contractHex, { slotHex: "zz".repeat(32) }),
+    ).rejects.toThrow(KovanicaDecodeError);
+
+    // Invalid canonical kind or missing key
+    await expect(
+      readContractStorage(client, contractHex, { kind: "htlc" }),
+    ).rejects.toThrow(KovanicaDecodeError);
+    await expect(
+      readContractStorage(client, contractHex, { kind: "name", key: "   " }),
+    ).rejects.toThrow(KovanicaDecodeError);
+
+    // Missing target properties or invalid decoder kind
+    await expect(
+      readContractStorage(client, contractHex, {} as never),
+    ).rejects.toThrow(KovanicaDecodeError);
+    await expect(
+      readContractStorage(client, contractHex, {
+        slotHex: "aa".repeat(32),
+        decoder: "invalid_kind" as never,
+      }),
+    ).rejects.toThrow(KovanicaDecodeError);
+
+    expect(getStorageSpy).not.toHaveBeenCalled();
+
+    // Malformed hex returned by RPC
+    getStorageSpy.mockResolvedValueOnce("0xzz11");
+    await expect(
+      readContractStorage(client, contractHex, { slotHex: "aa".repeat(32) }),
+    ).rejects.toThrow(KovanicaDecodeError);
   });
 });

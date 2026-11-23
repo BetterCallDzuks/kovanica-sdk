@@ -1307,6 +1307,257 @@ export async function dryRunCall<TDecoded = undefined>(
   };
 }
 
+// --- Batch Read-Only Contract Simulation (`dryRunBatchCalls`) ---
+
+/**
+ * Input item for {@link dryRunBatchCalls}: either a direct {@link CallTxKind} / {@link CallTxKindInput}
+ * or a wrapper `{ call: CallTxKind | CallTxKindInput; options?: DryRunCallOptions<TDecoded> }` with per-call
+ * `from`, `value`, `gasLimit`, `decoder`, or `requestOptions` overrides.
+ */
+export type DryRunBatchCallItem<TDecoded = unknown> =
+  | CallTxKind
+  | CallTxKindInput
+  | {
+      call: CallTxKind | CallTxKindInput;
+      options?: DryRunCallOptions<TDecoded>;
+    };
+
+export interface DryRunBatchCallsOptions {
+  /**
+   * When `true`, executes all dry-run calls concurrently via `Promise.all`.
+   * When `false` (default), executes calls sequentially in input order.
+   */
+  parallel?: boolean;
+  /**
+   * When `true` (default), captures individual call failures as `{ ok: false, error: Error }`
+   * instead of aborting the batch.
+   * When `false`, re-throws the first encountered error.
+   */
+  continueOnError?: boolean;
+  /**
+   * Optional default simulated caller address applied to calls that do not specify their own `options.from`.
+   */
+  from?: Uint8Array | string;
+  /**
+   * Optional default gas limit override applied to calls that do not specify their own `options.gasLimit`
+   * or explicit `call.gas_limit` / `call.gasLimit`.
+   */
+  gasLimit?: bigint | number;
+  /**
+   * Optional default RPC request options (`timeoutMs`, `signal`) forwarded to calls that do not specify
+   * their own `options.requestOptions`.
+   */
+  requestOptions?: RequestOptions;
+}
+
+export type BatchDryRunItemResult<TDecoded = unknown> =
+  | {
+      ok: true;
+      result: DryRunCallResult<TDecoded>;
+    }
+  | {
+      ok: false;
+      error: Error;
+    };
+
+export interface BatchDryRunResult<TDecoded = unknown> {
+  /** Per-call dry-run outcomes in input order. */
+  results: Array<BatchDryRunItemResult<TDecoded>>;
+  /** Total number of calls in the batch (`results.length`). */
+  totalCalls: number;
+  /** Count of calls that succeeded (`ok: true`). */
+  passedCount: number;
+  /** Count of calls that failed (`ok: false`). */
+  failedCount: number;
+}
+
+function isWrappedBatchItem<TDecoded>(
+  item: DryRunBatchCallItem<TDecoded>,
+): item is { call: CallTxKind | CallTxKindInput; options?: DryRunCallOptions<TDecoded> } {
+  return (
+    typeof item === "object" &&
+    item !== null &&
+    "call" in item &&
+    typeof (item as { call?: unknown }).call === "object" &&
+    (item as { call?: unknown }).call !== null &&
+    !("contract" in item && "method" in item && "args" in item)
+  );
+}
+
+function validateDryRunInputsFailClosed<TDecoded>(
+  call: CallTxKind | CallTxKindInput,
+  callOptions: DryRunCallOptions<TDecoded>,
+  index: number,
+): void {
+  if (!call || typeof call !== "object") {
+    throw new TypeError(`dryRunBatchCalls: call at index ${index} must be a valid call object`);
+  }
+  if (typeof call.method !== "string" || call.method.trim().length === 0) {
+    throw new Error(`dryRunBatchCalls: call at index ${index} method must be a non-empty string`);
+  }
+  if (!(call.args instanceof Uint8Array)) {
+    throw new TypeError(`dryRunBatchCalls: call at index ${index} args must be a Uint8Array`);
+  }
+
+  const resolvedInput: CallTxKindInput = {
+    contract: call.contract,
+    method: call.method.trim(),
+    args: call.args,
+    call_value:
+      callOptions.value !== undefined ? callOptions.value : (call.call_value ?? call.value),
+    gas_limit:
+      callOptions.gasLimit !== undefined
+        ? callOptions.gasLimit
+        : (call.gas_limit ?? call.gasLimit),
+  };
+
+  const builtCall = buildCallTxKind(resolvedInput);
+  if (builtCall.call_value > 0xffffffffffffffffn) {
+    throw new RangeError(
+      `dryRunBatchCalls: call at index ${index} call_value out of range for u64: ${builtCall.call_value}`,
+    );
+  }
+
+  if (callOptions.from !== undefined) {
+    const fromBytes = parseContractAddress(callOptions.from);
+    encodeAddress(fromBytes);
+  }
+  if (callOptions.decoder !== undefined && typeof callOptions.decoder !== "function") {
+    throw new TypeError(
+      `dryRunBatchCalls: call at index ${index} decoder must be a function when provided`,
+    );
+  }
+}
+
+/**
+ * Simulates a non-empty batch of read-only contract calls via {@link dryRunCall}.
+ *
+ * - Validates all calls and options fail-closed before any RPC I/O.
+ * - Executes {@link dryRunCall} for each item sequentially by default, or in parallel when `options.parallel === true`.
+ * - When `options.continueOnError !== false` (the default), captures individual results as
+ *   `{ ok: true, result }` or `{ ok: false, error }`.
+ * - When `options.continueOnError === false`, throws on the first encountered error.
+ * - Returns {@link BatchDryRunResult}: `{ results, totalCalls, passedCount, failedCount }`.
+ */
+export async function dryRunBatchCalls<TDecoded = unknown>(
+  client: DryRunCallClient,
+  calls: ReadonlyArray<DryRunBatchCallItem<TDecoded>>,
+  options: DryRunBatchCallsOptions = {},
+): Promise<BatchDryRunResult<TDecoded>> {
+  if (!Array.isArray(calls) || calls.length === 0) {
+    throw new RangeError("dryRunBatchCalls requires a non-empty array of calls");
+  }
+  if (!options || typeof options !== "object") {
+    throw new TypeError("dryRunBatchCalls: options must be an object when provided");
+  }
+
+  // Validate batch-level default `from` and `gasLimit` up front
+  if (options.from !== undefined) {
+    encodeAddress(parseContractAddress(options.from));
+  }
+  if (options.gasLimit !== undefined) {
+    const g = BigInt(options.gasLimit);
+    if (g < 0n) {
+      throw new Error(`gas_limit must be non-negative, got ${g}`);
+    }
+    if (g > MAX_TX_GAS_LIMIT) {
+      throw new Error(`gas_limit ${g} exceeds maximum allowed ${MAX_TX_GAS_LIMIT}`);
+    }
+  }
+
+  const normalizedItems: Array<{
+    call: CallTxKind | CallTxKindInput;
+    callOptions: DryRunCallOptions<TDecoded>;
+  }> = [];
+
+  for (let i = 0; i < calls.length; i++) {
+    const rawItem = calls[i]!;
+    if (!rawItem || typeof rawItem !== "object") {
+      throw new TypeError(`dryRunBatchCalls: item at index ${i} must be a valid call object`);
+    }
+
+    let call: CallTxKind | CallTxKindInput;
+    let itemOptions: DryRunCallOptions<TDecoded> | undefined;
+    if (isWrappedBatchItem<TDecoded>(rawItem)) {
+      call = rawItem.call;
+      itemOptions = rawItem.options;
+    } else {
+      call = rawItem;
+      itemOptions = undefined;
+    }
+
+    const hasExplicitCallGas =
+      call &&
+      typeof call === "object" &&
+      (call.gas_limit !== undefined || call.gasLimit !== undefined);
+
+    const mergedOptions: DryRunCallOptions<TDecoded> = {
+      from: itemOptions?.from !== undefined ? itemOptions.from : options.from,
+      value: itemOptions?.value,
+      gasLimit:
+        itemOptions?.gasLimit !== undefined
+          ? itemOptions.gasLimit
+          : !hasExplicitCallGas && options.gasLimit !== undefined
+            ? options.gasLimit
+            : undefined,
+      decoder: itemOptions?.decoder,
+      requestOptions:
+        itemOptions?.requestOptions !== undefined
+          ? itemOptions.requestOptions
+          : options.requestOptions,
+    };
+
+    validateDryRunInputsFailClosed(call, mergedOptions, i);
+    normalizedItems.push({ call, callOptions: mergedOptions });
+  }
+
+  const continueOnError = options.continueOnError !== false;
+  const parallel = options.parallel === true;
+
+  const executeOne = async (item: {
+    call: CallTxKind | CallTxKindInput;
+    callOptions: DryRunCallOptions<TDecoded>;
+  }): Promise<BatchDryRunItemResult<TDecoded>> => {
+    try {
+      const result = await dryRunCall<TDecoded>(client, item.call, item.callOptions);
+      return { ok: true, result };
+    } catch (err) {
+      if (!continueOnError) {
+        throw err;
+      }
+      const error = err instanceof Error ? err : new Error(String(err));
+      return { ok: false, error };
+    }
+  };
+
+  let results: Array<BatchDryRunItemResult<TDecoded>>;
+  if (parallel) {
+    results = await Promise.all(normalizedItems.map((item) => executeOne(item)));
+  } else {
+    results = [];
+    for (const item of normalizedItems) {
+      results.push(await executeOne(item));
+    }
+  }
+
+  let passedCount = 0;
+  let failedCount = 0;
+  for (const res of results) {
+    if (res.ok) {
+      passedCount += 1;
+    } else {
+      failedCount += 1;
+    }
+  }
+
+  return {
+    results,
+    totalCalls: results.length,
+    passedCount,
+    failedCount,
+  };
+}
+
 // --- Transaction Receipt Poller (`waitForTransactionReceipt`) ---
 
 /** Default polling interval in milliseconds for {@link waitForTransactionReceipt} (`1_000` ms). */
