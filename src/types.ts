@@ -3,6 +3,8 @@
  * Verified against crates/kovanica-rpc in kovanica git SHA: d2239fd8314a0c6edb08d54724738d662d406a32
  */
 
+import type { KovanicaRpcError } from "./errors";
+
 /** Canonical 64-character PRO-21 Kovanica address (`kvnc...dag` / `tknc...dag`). */
 export type KovanicaAddress = string;
 
@@ -70,6 +72,15 @@ export interface JsonRpcResponse<TResult = unknown> {
   error?: JsonRpcErrorObject;
   id: string | number | null;
 }
+
+export interface JsonRpcBatchRequestItem<TParams = unknown> {
+  method: string;
+  params?: TParams;
+}
+
+export type JsonRpcBatchItemResult<TResult = unknown> =
+  | { ok: true; result: TResult }
+  | { ok: false; error: KovanicaRpcError };
 
 export type TransactionKind =
   | { type: "transfer"; to: string; amount: bigint }

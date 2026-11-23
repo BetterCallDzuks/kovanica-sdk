@@ -153,6 +153,33 @@ const resilientClient = new KovanicaClient({
 - **Failover rotation:** When multiple `rpcUrls` are configured (primary `url`/`rpcUrl` first, deduplicated), transient errors rotate to the next endpoint. If `retry` is omitted on a single-endpoint client, `maxRetries` defaults to `0`.
 - **No retry on JSON-RPC errors or abort:** Application-level `KovanicaRpcError` responses (e.g., `-32000` revert, `-32602` invalid params) and `AbortSignal` cancellations fail immediately without retrying.
 
+#### Bounded JSON-RPC 2.0 Batch Requests (`callBatch`)
+
+Execute up to `MAX_JSONRPC_BATCH_SIZE` (`32`) JSON-RPC 2.0 calls in a single HTTP round-trip with out-of-order response ID correlation and per-item error isolation:
+
+```typescript
+import { KovanicaClient, MAX_JSONRPC_BATCH_SIZE } from "kovanica-sdk";
+
+const client = new KovanicaClient("http://127.0.0.1:8545/rpc");
+
+const results = await client.callBatch([
+  { method: "kovanica_blockNumber", params: [] },
+  { method: "kovanica_getBalance", params: ["kvnc123...dag"] },
+  { method: "kovanica_estimateFee", params: [] },
+]);
+
+for (const item of results) {
+  if (item.ok) {
+    console.log("Result:", item.result);
+  } else {
+    console.warn(`RPC error (${item.error.code}): ${item.error.message}`);
+  }
+}
+```
+
+- Batches must contain `1..=32` (`MAX_JSONRPC_BATCH_SIZE`) requests; empty or oversized batches fail closed before any network I/O.
+- Automatic retry/failover is only enabled when **every** method in the batch is allowlisted in `retryableMethods` (batches containing `kovanica_sendRawTransaction` are never auto-retried).
+
 ### 5. HD Wallet Key Derivation (BIP-39 / SLIP-0010)
 
 ```typescript

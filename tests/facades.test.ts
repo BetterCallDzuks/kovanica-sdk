@@ -7,12 +7,15 @@ import {
   buildEscrowCreateCall,
   buildHtlcCreateCall,
   buildNameRegisterCall,
+  buildNftMintCall,
   buildTokenTransferCall,
+  buildVaultCreateCall,
   bytesToHex,
   concatBytes,
   encodeBincodeBytes32Vec,
   encodeBincodeString,
   encodeBincodeStringVec,
+  u32le,
   u64le,
   u128le,
 } from "../src/contracts";
@@ -21,8 +24,11 @@ import {
   type ContractFacadeClient,
   EscrowClient,
   HtlcClient,
+  MultisigClient,
   NameRegistryClient,
+  NftClient,
   TokenClient,
+  VaultClient,
 } from "../src/facades";
 
 function makeBytes32(fill: number): Uint8Array {
@@ -118,6 +124,101 @@ function encodeHtlcBytes(opts: {
   ]);
 }
 
+function encodeNftMetadataBytes(opts: {
+  name: string;
+  symbol: string;
+  baseUri: string;
+  owner: Uint8Array;
+  minter: Uint8Array;
+  tokens?: Array<{
+    tokenId: bigint;
+    owner: Uint8Array;
+    approved: Uint8Array | null;
+    tokenUri: string;
+  }>;
+}): Uint8Array {
+  const tokens = opts.tokens ?? [];
+  const parts: Uint8Array[] = [
+    encodeBincodeString(opts.name),
+    encodeBincodeString(opts.symbol),
+    encodeBincodeString(opts.baseUri),
+    opts.owner,
+    opts.minter,
+    u64le(BigInt(tokens.length)),
+  ];
+  for (const t of tokens) {
+    parts.push(
+      u128le(t.tokenId),
+      t.owner,
+      t.approved ? concatBytes([Uint8Array.of(1), t.approved]) : Uint8Array.of(0),
+      encodeBincodeString(t.tokenUri),
+    );
+  }
+  return concatBytes(parts);
+}
+
+function encodeVaultBytes(opts: {
+  creator: Uint8Array;
+  beneficiary: Uint8Array;
+  totalAmount: bigint;
+  claimedAmount: bigint;
+  schedule:
+    | { kind: "absolute"; unlockAt: bigint }
+    | { kind: "linear"; start: bigint; end: bigint; cliff: bigint | null };
+  cancelled: boolean;
+}): Uint8Array {
+  const scheduleBytes =
+    opts.schedule.kind === "absolute"
+      ? concatBytes([u32le(0), u64le(opts.schedule.unlockAt)])
+      : concatBytes([
+          u32le(1),
+          u64le(opts.schedule.start),
+          u64le(opts.schedule.end),
+          opts.schedule.cliff !== null
+            ? concatBytes([Uint8Array.of(1), u64le(opts.schedule.cliff)])
+            : Uint8Array.of(0),
+        ]);
+  return concatBytes([
+    opts.creator,
+    opts.beneficiary,
+    u128le(opts.totalAmount),
+    u128le(opts.claimedAmount),
+    scheduleBytes,
+    Uint8Array.of(opts.cancelled ? 1 : 0),
+  ]);
+}
+
+function encodeMultisigStateBytes(opts: {
+  owners: Uint8Array[];
+  threshold: number;
+  nextTxId: bigint;
+}): Uint8Array {
+  return concatBytes([
+    encodeBincodeBytes32Vec(opts.owners),
+    u32le(opts.threshold),
+    u64le(opts.nextTxId),
+  ]);
+}
+
+function encodeMultisigPendingTxBytes(opts: {
+  id: bigint;
+  to: Uint8Array;
+  amount: bigint;
+  data: Uint8Array;
+  confirmations: Uint8Array[];
+  executed: boolean;
+}): Uint8Array {
+  return concatBytes([
+    u64le(opts.id),
+    opts.to,
+    u128le(opts.amount),
+    u64le(BigInt(opts.data.length)),
+    opts.data,
+    encodeBincodeBytes32Vec(opts.confirmations),
+    Uint8Array.of(opts.executed ? 1 : 0),
+  ]);
+}
+
 function createMockFacadeClient(overrides: Partial<ContractFacadeClient> = {}) {
   const call = vi.fn().mockResolvedValue("0x");
   const estimateFee = vi.fn().mockResolvedValue(10n);
@@ -147,11 +248,17 @@ describe("Typed Contract Client Facades", () => {
       const tokenClient = new TokenClient(rpcClient, `0x${CONTRACT_HEX}`);
       const escrowClient = new EscrowClient(rpcClient, CONTRACT_BYTES);
       const htlcClient = new HtlcClient(rpcClient, CONTRACT_HEX);
+      const nftClient = new NftClient(rpcClient, CONTRACT_ADDR);
+      const vaultClient = new VaultClient(rpcClient, CONTRACT_BYTES);
+      const multisigClient = new MultisigClient(rpcClient, `0x${CONTRACT_HEX}`);
 
       expect(nameClient.contractAddress).toBe(CONTRACT_ADDR);
       expect(tokenClient.contractAddress).toBe(CONTRACT_ADDR);
       expect(escrowClient.contractHex).toBe(CONTRACT_HEX);
       expect(htlcClient.contractBytes).toEqual(CONTRACT_BYTES);
+      expect(nftClient.contractAddress).toBe(CONTRACT_ADDR);
+      expect(vaultClient.contractBytes).toEqual(CONTRACT_BYTES);
+      expect(multisigClient.contractHex).toBe(CONTRACT_HEX);
     });
 
     it("defensively copies Uint8Array contract bytes on construction", () => {
@@ -176,6 +283,9 @@ describe("Typed Contract Client Facades", () => {
       expect(() => new HtlcClient(client, "kvncinvalidchecksumdag")).toThrow(
         /HtlcClient contract/,
       );
+      expect(() => new NftClient(client, "bad-nft-address")).toThrow(/NftClient contract/);
+      expect(() => new VaultClient(client, new Uint8Array(4))).toThrow(/VaultClient contract/);
+      expect(() => new MultisigClient(client, "0x1234")).toThrow(/MultisigClient contract/);
     });
 
     it("rejects invalid client instances fail-closed", () => {
@@ -601,6 +711,470 @@ describe("Typed Contract Client Facades", () => {
       await expect(
         htlc.prepareCreate({ hashlock, timelock: -5n, recipient: claimer }),
       ).rejects.toThrow(/Timelock must be non-negative/);
+
+      expect(estimateFee).not.toHaveBeenCalled();
+      expect(getNonce).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("NftClient", () => {
+    const owner = makeBytes32(0x21);
+    const minter = makeBytes32(0x22);
+    const holder = makeBytes32(0x23);
+    const approved = makeBytes32(0x24);
+    const collection = makeBytes32(0x25);
+
+    it("getMetadata() reads canonical nft_metadata storage and decodes NftMetadata", async () => {
+      const { client, getStorageAt } = createMockFacadeClient();
+      const payload = encodeNftMetadataBytes({
+        name: "Kovanica Genesis",
+        symbol: "KGEN",
+        baseUri: "ipfs://QmGenesis/",
+        owner,
+        minter,
+        tokens: [
+          {
+            tokenId: 1n,
+            owner: holder,
+            approved,
+            tokenUri: "1.json",
+          },
+          {
+            tokenId: 2n,
+            owner: holder,
+            approved: null,
+            tokenUri: "2.json",
+          },
+        ],
+      });
+      getStorageAt.mockResolvedValueOnce(`0x${bytesToHex(payload)}`);
+
+      const nft = new NftClient(client, CONTRACT_ADDR);
+      const metadata = await nft.getMetadata();
+
+      expect(metadata).not.toBeNull();
+      expect(metadata!.name).toBe("Kovanica Genesis");
+      expect(metadata!.symbol).toBe("KGEN");
+      expect(metadata!.baseUri).toBe("ipfs://QmGenesis/");
+      expect(metadata!.ownerHex).toBe(bytesToHex(owner));
+      expect(metadata!.minterHex).toBe(bytesToHex(minter));
+      expect(metadata!.tokens).toHaveLength(2);
+      expect(metadata!.tokens[0]!.tokenId).toBe(1n);
+      expect(metadata!.tokens[0]!.approvedHex).toBe(bytesToHex(approved));
+      expect(metadata!.tokens[1]!.approved).toBeNull();
+      expect(metadata!.tokens[1]!.tokenUri).toBe("2.json");
+
+      const expectedSlot = `0x${deriveStorageSlotHex("nft")}`;
+      expect(getStorageAt).toHaveBeenCalledWith(CONTRACT_ADDR, expectedSlot, undefined);
+    });
+
+    it("getMetadata() returns null when storage slot is empty", async () => {
+      const { client, getStorageAt } = createMockFacadeClient();
+      getStorageAt.mockResolvedValueOnce("0x");
+
+      const nft = new NftClient(client, CONTRACT_ADDR);
+      expect(await nft.getMetadata()).toBeNull();
+    });
+
+    it("prepareMint() builds canonical nft_mint call (default and explicit collection) and estimates fee/nonce", async () => {
+      const { client, estimateFee, getNonce } = createMockFacadeClient();
+      estimateFee.mockResolvedValueOnce(18n);
+      getNonce.mockResolvedValueOnce(5n);
+
+      const nft = new NftClient(client, CONTRACT_ADDR);
+      const preparedDefault = await nft.prepareMint(
+        {
+          to: encodeAddress(holder),
+          tokenId: 42n,
+          tokenUri: "ipfs://QmGenesis/42.json",
+        },
+        { sender: SENDER_ADDR, chainId: CHAIN_IDS.TESTNET },
+      );
+
+      expect(preparedDefault.call.method).toBe("nft_mint");
+      expect(preparedDefault.call.args).toEqual(
+        buildNftMintCall(CONTRACT_BYTES, holder, 42n, "ipfs://QmGenesis/42.json"),
+      );
+      expect(preparedDefault.nonce).toBe(5n);
+      expect(preparedDefault.feeRatePerByte).toBe(18n);
+      expect(preparedDefault.fee).toBeGreaterThan(0n);
+      expect(preparedDefault.chainId).toBe(CHAIN_IDS.TESTNET);
+
+      estimateFee.mockResolvedValueOnce(20n);
+      const preparedExplicit = await nft.prepareMint(
+        {
+          collection: `0x${bytesToHex(collection)}`,
+          to: holder,
+          tokenId: 7n,
+          tokenUri: "https://example.com/7.json",
+          gasLimit: 90_000n,
+        },
+        { nonce: 99n },
+      );
+
+      expect(preparedExplicit.call.args).toEqual(
+        buildNftMintCall(collection, holder, 7n, "https://example.com/7.json"),
+      );
+      expect(preparedExplicit.gasLimit).toBe(90_000n);
+      expect(preparedExplicit.nonce).toBe(99n);
+    });
+
+    it("prepareMint() rejects invalid inputs fail-closed before RPC", async () => {
+      const { client, estimateFee, getNonce } = createMockFacadeClient();
+      const nft = new NftClient(client, CONTRACT_ADDR);
+
+      await expect(
+        nft.prepareMint({ to: "invalid-to", tokenId: 1n, tokenUri: "ipfs://x" }),
+      ).rejects.toThrow(/NftClient\.prepareMint to/);
+      await expect(
+        nft.prepareMint({
+          collection: "0x1234",
+          to: holder,
+          tokenId: 1n,
+          tokenUri: "ipfs://x",
+        }),
+      ).rejects.toThrow(/NftClient\.prepareMint collection/);
+      await expect(
+        nft.prepareMint({ to: holder, tokenId: -1n, tokenUri: "ipfs://x" }),
+      ).rejects.toThrow(/Token ID must be non-negative/);
+      await expect(
+        nft.prepareMint({
+          to: holder,
+          tokenId: 1n,
+          tokenUri: 123 as unknown as string,
+        }),
+      ).rejects.toThrow(TypeError);
+
+      expect(estimateFee).not.toHaveBeenCalled();
+      expect(getNonce).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("VaultClient", () => {
+    const vaultId = makeBytes32(0x61);
+    const creator = makeBytes32(0x62);
+    const beneficiary = makeBytes32(0x63);
+
+    it("getVault() reads canonical vault storage slot and decodes VaultRecord (absolute & linear)", async () => {
+      const { client, getStorageAt } = createMockFacadeClient();
+      const absPayload = encodeVaultBytes({
+        creator,
+        beneficiary,
+        totalAmount: 100_000_000n,
+        claimedAmount: 25_000_000n,
+        schedule: { kind: "absolute", unlockAt: 1_900_000_000n },
+        cancelled: false,
+      });
+      getStorageAt.mockResolvedValueOnce(`0x${bytesToHex(absPayload)}`);
+
+      const vault = new VaultClient(client, CONTRACT_ADDR);
+      const absRecord = await vault.getVault(`0x${bytesToHex(vaultId)}`);
+
+      expect(absRecord).not.toBeNull();
+      expect(absRecord!.creatorHex).toBe(bytesToHex(creator));
+      expect(absRecord!.beneficiaryHex).toBe(bytesToHex(beneficiary));
+      expect(absRecord!.totalAmount).toBe(100_000_000n);
+      expect(absRecord!.claimedAmount).toBe(25_000_000n);
+      expect(absRecord!.schedule).toEqual({ kind: "absolute", unlockAt: 1_900_000_000n });
+      expect(absRecord!.cancelled).toBe(false);
+
+      const expectedSlot = `0x${deriveStorageSlotHex("vault", vaultId)}`;
+      expect(getStorageAt).toHaveBeenCalledWith(CONTRACT_ADDR, expectedSlot, undefined);
+
+      const linearPayload = encodeVaultBytes({
+        creator,
+        beneficiary,
+        totalAmount: 500_000_000n,
+        claimedAmount: 0n,
+        schedule: { kind: "linear", start: 1000n, end: 5000n, cliff: 2000n },
+        cancelled: true,
+      });
+      getStorageAt.mockResolvedValueOnce(`0x${bytesToHex(linearPayload)}`);
+
+      const linearRecord = await vault.getVault(vaultId);
+      expect(linearRecord).not.toBeNull();
+      expect(linearRecord!.schedule).toEqual({
+        kind: "linear",
+        start: 1000n,
+        end: 5000n,
+        cliff: 2000n,
+      });
+      expect(linearRecord!.cancelled).toBe(true);
+    });
+
+    it("getVault() returns null on empty storage and rejects invalid id", async () => {
+      const { client, getStorageAt } = createMockFacadeClient();
+      getStorageAt.mockResolvedValueOnce("0x0");
+
+      const vault = new VaultClient(client, CONTRACT_ADDR);
+      expect(await vault.getVault(vaultId)).toBeNull();
+
+      await expect(vault.getVault("0xdeadbeef")).rejects.toThrow(/VaultClient\.getVault id/);
+      expect(getStorageAt).toHaveBeenCalledTimes(1);
+    });
+
+    it("prepareCreate() builds canonical vault_create call and estimates fee/nonce", async () => {
+      const { client, estimateFee, getNonce } = createMockFacadeClient();
+      estimateFee.mockResolvedValueOnce(22n);
+      getNonce.mockResolvedValueOnce(11n);
+
+      const vault = new VaultClient(client, CONTRACT_ADDR);
+      const prepared = await vault.prepareCreate(
+        {
+          beneficiary: encodeAddress(beneficiary),
+          amount: 100_000_000n,
+          lockUntil: 1_950_000_000n,
+          value: 100_000_000n,
+        },
+        { sender: SENDER_ADDR },
+      );
+
+      const expectedBuilt = buildVaultCreateCall(
+        CONTRACT_BYTES,
+        beneficiary,
+        100_000_000n,
+        1_950_000_000n,
+      );
+      expect(prepared.call.method).toBe("vault_create");
+      expect(prepared.call.call_value).toBe(100_000_000n);
+      expect(prepared.call.args).toEqual(expectedBuilt.args);
+      expect(prepared.nonce).toBe(11n);
+      expect(prepared.feeRatePerByte).toBe(22n);
+      expect(prepared.fee).toBeGreaterThan(0n);
+    });
+
+    it("prepareCreate() rejects invalid beneficiary, negative amount, and negative lockUntil fail-closed", async () => {
+      const { client, estimateFee, getNonce } = createMockFacadeClient();
+      const vault = new VaultClient(client, CONTRACT_ADDR);
+
+      await expect(
+        vault.prepareCreate({ beneficiary: "bad-beneficiary", amount: 10n, lockUntil: 100n }),
+      ).rejects.toThrow(/VaultClient\.prepareCreate beneficiary/);
+      await expect(
+        vault.prepareCreate({ beneficiary, amount: -1n, lockUntil: 100n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        vault.prepareCreate({ beneficiary, amount: 10n, lockUntil: -5n }),
+      ).rejects.toThrow(RangeError);
+
+      expect(estimateFee).not.toHaveBeenCalled();
+      expect(getNonce).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("MultisigClient", () => {
+    const ownerA = makeBytes32(0xa1);
+    const ownerB = makeBytes32(0xa2);
+    const ownerC = makeBytes32(0xa3);
+    const recipient = makeBytes32(0xa4);
+    const multisigId = makeBytes32(0xa5);
+
+    it("getState() reads canonical multisig_state storage and returns null when empty", async () => {
+      const { client, getStorageAt } = createMockFacadeClient();
+      const payload = encodeMultisigStateBytes({
+        owners: [ownerA, ownerB, ownerC],
+        threshold: 2,
+        nextTxId: 4n,
+      });
+      getStorageAt.mockResolvedValueOnce(`0x${bytesToHex(payload)}`);
+
+      const multisig = new MultisigClient(client, CONTRACT_ADDR);
+      const state = await multisig.getState();
+
+      expect(state).not.toBeNull();
+      expect(state!.ownersHex).toEqual([
+        bytesToHex(ownerA),
+        bytesToHex(ownerB),
+        bytesToHex(ownerC),
+      ]);
+      expect(state!.threshold).toBe(2);
+      expect(state!.nextTxId).toBe(4n);
+
+      const expectedSlot = `0x${deriveStorageSlotHex("multisig")}`;
+      expect(getStorageAt).toHaveBeenCalledWith(CONTRACT_ADDR, expectedSlot, undefined);
+
+      getStorageAt.mockResolvedValueOnce(`0x${"00".repeat(32)}`);
+      expect(await multisig.getState()).toBeNull();
+    });
+
+    it("getPendingTx() reads canonical multisig_tx storage, returns null when empty, and rejects invalid txId", async () => {
+      const { client, getStorageAt } = createMockFacadeClient();
+      const callData = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+      const payload = encodeMultisigPendingTxBytes({
+        id: 3n,
+        to: recipient,
+        amount: 7_500_000n,
+        data: callData,
+        confirmations: [ownerA, ownerB],
+        executed: false,
+      });
+      getStorageAt.mockResolvedValueOnce(`0x${bytesToHex(payload)}`);
+
+      const multisig = new MultisigClient(client, CONTRACT_ADDR);
+      const tx = await multisig.getPendingTx(3n);
+
+      expect(tx).not.toBeNull();
+      expect(tx!.id).toBe(3n);
+      expect(tx!.toHex).toBe(bytesToHex(recipient));
+      expect(tx!.amount).toBe(7_500_000n);
+      expect(tx!.data).toEqual(callData);
+      expect(tx!.confirmationsHex).toEqual([bytesToHex(ownerA), bytesToHex(ownerB)]);
+      expect(tx!.executed).toBe(false);
+
+      const expectedSlot = `0x${deriveStorageSlotHex("multisig_tx", 3n)}`;
+      expect(getStorageAt).toHaveBeenCalledWith(CONTRACT_ADDR, expectedSlot, undefined);
+
+      getStorageAt.mockResolvedValueOnce("0x");
+      expect(await multisig.getPendingTx(99n)).toBeNull();
+
+      await expect(multisig.getPendingTx(-1n)).rejects.toThrow(RangeError);
+      await expect(
+        multisig.getPendingTx("1" as unknown as bigint),
+      ).rejects.toThrow(TypeError);
+      expect(getStorageAt).toHaveBeenCalledTimes(2);
+    });
+
+    it("prepareCreate() builds canonical multisig_create call and validates inputs fail-closed", async () => {
+      const { client, estimateFee, getNonce } = createMockFacadeClient();
+      estimateFee.mockResolvedValueOnce(14n);
+      getNonce.mockResolvedValueOnce(1n);
+
+      const multisig = new MultisigClient(client, CONTRACT_ADDR);
+      const prepared = await multisig.prepareCreate(
+        {
+          owners: [encodeAddress(ownerA), `0x${bytesToHex(ownerB)}`, ownerC],
+          threshold: 2,
+        },
+        { sender: SENDER_ADDR },
+      );
+
+      expect(prepared.call.method).toBe("multisig_create");
+      expect(prepared.call.args).toEqual(
+        concatBytes([encodeBincodeBytes32Vec([ownerA, ownerB, ownerC]), u32le(2)]),
+      );
+      expect(prepared.nonce).toBe(1n);
+      expect(prepared.feeRatePerByte).toBe(14n);
+
+      await expect(
+        multisig.prepareCreate({ owners: [], threshold: 1 }),
+      ).rejects.toThrow(/non-empty array/);
+      await expect(
+        multisig.prepareCreate({ owners: [ownerA], threshold: 2 }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        multisig.prepareCreate({ owners: ["bad-owner"], threshold: 1 }),
+      ).rejects.toThrow(/owners\[0\]/);
+      expect(estimateFee).toHaveBeenCalledTimes(1);
+    });
+
+    it("preparePropose() builds canonical multisig_propose call and estimates fee/nonce", async () => {
+      const { client, estimateFee, getNonce } = createMockFacadeClient();
+      estimateFee.mockResolvedValueOnce(16n);
+      getNonce.mockResolvedValueOnce(8n);
+
+      const multisig = new MultisigClient(client, CONTRACT_ADDR);
+      const prepared = await multisig.preparePropose(
+        {
+          multisigId: `0x${bytesToHex(multisigId)}`,
+          to: encodeAddress(recipient),
+          amount: 1_234_567n,
+          data: "0xdeadbeef",
+        },
+        { sender: SENDER_ADDR, chainId: CHAIN_IDS.TESTNET },
+      );
+
+      const expectedData = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+      expect(prepared.call.method).toBe("multisig_propose");
+      expect(prepared.call.args).toEqual(
+        concatBytes([
+          multisigId,
+          recipient,
+          u128le(1_234_567n),
+          u64le(4n),
+          expectedData,
+        ]),
+      );
+      expect(prepared.nonce).toBe(8n);
+      expect(prepared.feeRatePerByte).toBe(16n);
+      expect(prepared.chainId).toBe(CHAIN_IDS.TESTNET);
+
+      // Default empty data
+      estimateFee.mockResolvedValueOnce(16n);
+      const preparedEmpty = await multisig.preparePropose(
+        {
+          multisigId,
+          to: recipient,
+          amount: 0n,
+        },
+        { nonce: 9n },
+      );
+      expect(preparedEmpty.call.args).toEqual(
+        concatBytes([multisigId, recipient, u128le(0n), u64le(0n)]),
+      );
+    });
+
+    it("prepareApprove(), prepareConfirm(), and prepareExecute() build canonical multisig calls", async () => {
+      const { client, estimateFee, getNonce } = createMockFacadeClient();
+      estimateFee.mockResolvedValue(12n);
+      getNonce.mockResolvedValue(15n);
+
+      const multisig = new MultisigClient(client, CONTRACT_ADDR);
+      const expectedArgs = concatBytes([multisigId, u64le(7n)]);
+
+      const approved = await multisig.prepareApprove(
+        { multisigId: `0x${bytesToHex(multisigId)}`, txId: 7n },
+        { sender: SENDER_ADDR },
+      );
+      expect(approved.call.method).toBe("multisig_confirm");
+      expect(approved.call.args).toEqual(expectedArgs);
+      expect(approved.call.args.length).toBe(40);
+      expect(approved.nonce).toBe(15n);
+      expect(approved.feeRatePerByte).toBe(12n);
+
+      const confirmed = await multisig.prepareConfirm(
+        { multisigId, txId: 7 },
+        { nonce: 16n },
+      );
+      expect(confirmed.call.method).toBe("multisig_confirm");
+      expect(confirmed.call.args).toEqual(expectedArgs);
+      expect(confirmed.nonce).toBe(16n);
+
+      const executed = await multisig.prepareExecute(
+        { multisigId, txId: 7n, gasLimit: 150_000n },
+        { nonce: 17n },
+      );
+      expect(executed.call.method).toBe("multisig_execute");
+      expect(executed.call.args).toEqual(expectedArgs);
+      expect(executed.gasLimit).toBe(150_000n);
+      expect(executed.nonce).toBe(17n);
+    });
+
+    it("preparePropose/prepareApprove/prepareExecute reject invalid inputs fail-closed before RPC", async () => {
+      const { client, estimateFee, getNonce } = createMockFacadeClient();
+      const multisig = new MultisigClient(client, CONTRACT_ADDR);
+
+      await expect(
+        multisig.preparePropose({ multisigId: "0x1234", to: recipient, amount: 10n }),
+      ).rejects.toThrow(/multisigId/);
+      await expect(
+        multisig.preparePropose({ multisigId, to: "bad-to", amount: 10n }),
+      ).rejects.toThrow(/preparePropose to/);
+      await expect(
+        multisig.preparePropose({ multisigId, to: recipient, amount: -10n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        multisig.preparePropose({ multisigId, to: recipient, amount: 10n, data: "0xzz" }),
+      ).rejects.toThrow(/invalid hex string/);
+
+      await expect(
+        multisig.prepareApprove({ multisigId: "0xabcd", txId: 1n }),
+      ).rejects.toThrow(/multisigId/);
+      await expect(
+        multisig.prepareApprove({ multisigId, txId: -1n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        multisig.prepareExecute({ multisigId, txId: 1.5 }),
+      ).rejects.toThrow(RangeError);
 
       expect(estimateFee).not.toHaveBeenCalled();
       expect(getNonce).not.toHaveBeenCalled();
