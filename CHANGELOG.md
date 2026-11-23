@@ -2,19 +2,31 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
-## [0.4.0] - 2026-11-22
+## [0.4.0] - 2026-11-23
 
 ### Added
-- **WebSocket Subscription Client (`KovanicaWsClient`)** (`ws.ts`):
+- **WebSocket Subscription Client & Heartbeat Liveness (`KovanicaWsClient`)** (`ws.ts`):
   - Typed JSON-RPC 2.0 WebSocket client for `/ws` endpoints supporting `subscribeNewHeads` (`newHeads`), `subscribeCommittedLeaders` (`newCommittedLeader`), `subscribeLogs` (`logs` with optional address/topic `WsLogFilter`), and `unsubscribe`.
-  - Lifecycle management (`connect`, `close`, `isConnected`, `activeSubscriptionCount`), automatic exponential-backoff reconnection with transparent subscription re-establishment and server ID remapping, configurable request timeouts, injectable `WebSocketImpl`, and `onError` hook.
-- **Typed Bincode Contract ABI Decoders & Storage Slot Derivation** (`decoders.ts`):
+  - Lifecycle management (`connect`, `close`, `isConnected`, `activeSubscriptionCount`), automatic exponential-backoff reconnection with transparent subscription re-establishment and server ID remapping, configurable request timeouts, injectable `WebSocketImpl`, `onError` hook, and periodic heartbeat liveness detection (`heartbeatIntervalMs`, `heartbeatTimeoutMs`, `heartbeatMethod`).
+- **Typed Bincode Contract ABI Decoders, Storage Slot Derivation & Log Decoders** (`decoders.ts`):
   - Bounds-checked little-endian `BincodeReader` and typed `KovanicaDecodeError` (`TRUNCATED`, `TRAILING_BYTES`, `INVALID_BOOL`, `INVALID_VARIANT`, `INVALID_UTF8`, `LENGTH_OVERFLOW`, `INVALID_INPUT`).
   - Canonical state and record decoders matching `kovanica-l1` Rust layouts: `decodeHtlcRecord`, `decodeVaultRecord`, `decodeMultisigState`, `decodeMultisigPendingTx`, `decodeTokenMetadata` / `decodeTokenState`, `decodeTokenPool`, `decodeNameRecord`, `decodeNftMetadata` / `decodeNftState`, and `decodeEscrowRecord`.
   - BLAKE3 storage slot derivation helpers (`STORAGE_KEY_PREFIXES`, `derivePrefixedStorageSlot`, `deriveStorageSlot`, `deriveStorageSlotHex`) for `kovanica_getStorageAt`.
-- **Fee/Gas Estimation & Call Builder Helper** (`contracts.ts`, `client.ts`):
-  - Added `estimateAndBuildCall` (standalone and `client.estimateAndBuildCall(...)`) and `estimateCallTxSize`.
-  - Computes exact wire Call transaction size, fetches fee rate via `kovanica_estimateFee` (and optional sender nonce via `kovanica_getNonce` in parallel), applies configurable basis-point safety margins (`DEFAULT_FEE_SAFETY_MARGIN_BPS = 12_000`, `DEFAULT_GAS_SAFETY_MARGIN_BPS = 12_000`), enforces optional `minFee` floor / `maxFee` cap, and returns a validated `PreparedCallTransaction` ready for signing.
+  - Typed contract event log decoders: `decodeContractLog` and `decodeTransactionReceiptLogs` (with `ContractLogKindResolver` support for multi-contract receipts).
+- **Typed Contract Storage Reader (`readContractStorage`)** (`decoders.ts`, `client.ts`):
+  - Added `readContractStorage` (standalone and `client.readContractStorage(...)`) combining BLAKE3 storage slot derivation, `kovanica_getStorageAt`, and canonical Bincode state decoding into a single typed call.
+- **Fee/Gas Estimation, Batch Estimation & Dry-Run Simulation** (`contracts.ts`, `client.ts`):
+  - Added `estimateAndBuildCall` and `estimateBatchCalls` (standalone and on `KovanicaClient`) plus `estimateCallTxSize`, computing exact wire Call transaction sizes, fetching fee rates and sequential nonces, applying configurable basis-point safety margins (`DEFAULT_FEE_SAFETY_MARGIN_BPS = 12_000`, `DEFAULT_GAS_SAFETY_MARGIN_BPS = 12_000`), and enforcing optional `minFee` / `maxFee` bounds.
+  - Added `dryRunCall` and `dryRunBatchCalls` (standalone and on `KovanicaClient`) for pre-submission `kovanica_call` simulation with typed return data, gas usage, and revert/error reporting.
+- **Transaction Receipt Poller (`waitForTransactionReceipt`)** (`contracts.ts`, `client.ts`):
+  - Added `waitForTransactionReceipt` (standalone and `client.waitForTransactionReceipt(...)`) with configurable polling intervals (`DEFAULT_RECEIPT_POLL_INTERVAL_MS`, `MIN_RECEIPT_POLL_INTERVAL_MS`), timeout (`DEFAULT_RECEIPT_TIMEOUT_MS`), and `AbortSignal` cancellation.
+- **Typed Contract Client Facades** (`facades.ts`):
+  - Added high-level typed facades for all 7 Kovanica system/playground contracts built on `ContractFacade`: `NameRegistryClient`, `TokenClient`, `EscrowClient`, `HtlcClient`, `NftClient`, `VaultClient`, and `MultisigClient`.
+- **Resilient Retry/Failover RPC Transport & JSON-RPC 2.0 Batching** (`client.ts`, `transport.ts`):
+  - Added automatic exponential-backoff retry (`computeRetryDelayMs`, `RpcRetryConfig`) and multi-endpoint failover for read-only idempotent methods (`DEFAULT_IDEMPOTENT_RPC_METHODS`) on transient transport, timeout, or HTTP 5xx errors while keeping state-mutating RPCs non-retried.
+  - Added JSON-RPC 2.0 `callBatch` support on `HttpTransport` and `KovanicaClient` with `MAX_JSONRPC_BATCH_SIZE` validation and typed `JsonRpcBatchRequestItem` / `JsonRpcBatchItemResult` handling.
+- **Release Readiness & Export Surface Verification** (`tests/exports.test.ts`):
+  - Added ESM (`dist/index.js`), CJS (`dist/index.cjs`), and TypeScript declaration (`dist/index.d.ts`) export surface smoke tests plus browser-bundle cleanliness assertions ensuring zero accidental Node-only (`node:fs`, `node:child_process`, `node:net`) static imports.
 
 ## [0.3.0] - 2026-11-17
 
