@@ -41,6 +41,7 @@ import {
   concatBytes,
   decodeHtlcRecord,
   decodeNameRecord,
+  dryRunBatchCalls,
   dryRunCall,
   encodeAddress,
   encodeBincodeBytes32Vec,
@@ -1079,6 +1080,252 @@ describe("Canonical Smart Contract Argument Builders & Bincode Encoders", () => 
           { gasLimit: MAX_TX_GAS_LIMIT + 1n },
         ),
       ).rejects.toThrow(/exceeds maximum allowed/);
+
+      expect(callSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("dryRunBatchCalls & client.dryRunBatchCalls", () => {
+    const contractBytes = hexToBytes("11".repeat(32));
+    const contractHex = "0x" + "11".repeat(32);
+    const contractPro21 = encodeAddress(contractBytes);
+
+    it("executes a batch of dry-run calls sequentially by default and aggregates results", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const order: string[] = [];
+
+      const owner = acc0.publicKey;
+      const targetPubkey = acc1.publicKey;
+      const encodedNameRecord = concatBytes([
+        owner,
+        targetPubkey,
+        encodeBincodeStringVec(["https://relay1.kovanica.org"]),
+      ]);
+
+      const callSpy = vi
+        .spyOn(client, "call")
+        .mockImplementation(async (_method, params) => {
+          const [callObj] = params as Array<{ method: string }>;
+          order.push(callObj!.method);
+          if (callObj!.method === "name_lookup") {
+            return `0x${bytesToHex(encodedNameRecord)}`;
+          }
+          return "0xdeadbeef";
+        });
+
+      const batch = await client.dryRunBatchCalls([
+        {
+          call: {
+            contract: contractHex,
+            method: "name_lookup",
+            args: encodeBincodeString("alice"),
+          },
+          options: {
+            decoder: decodeNameRecord,
+          },
+        },
+        {
+          contract: contractBytes,
+          method: "raw_ping",
+          args: new Uint8Array([1, 2]),
+        },
+      ]);
+
+      expect(callSpy).toHaveBeenCalledTimes(2);
+      expect(order).toEqual(["name_lookup", "raw_ping"]);
+      expect(batch.totalCalls).toBe(2);
+      expect(batch.passedCount).toBe(2);
+      expect(batch.failedCount).toBe(0);
+      expect(batch.results).toHaveLength(2);
+
+      const res0 = batch.results[0]!;
+      expect(res0.ok).toBe(true);
+      if (res0.ok) {
+        expect(res0.result.decoded).toEqual(decodeNameRecord(encodedNameRecord));
+      }
+
+      const res1 = batch.results[1]!;
+      expect(res1.ok).toBe(true);
+      if (res1.ok) {
+        expect(res1.result.rawHex).toBe("0xdeadbeef");
+        expect(res1.result.rawBytes).toEqual(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+      }
+    });
+
+    it("executes calls in parallel when options.parallel is true and forwards batch default options", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      let inFlight = 0;
+      let maxConcurrent = 0;
+
+      const callSpy = vi.spyOn(client, "call").mockImplementation(async () => {
+        inFlight += 1;
+        maxConcurrent = Math.max(maxConcurrent, inFlight);
+        await new Promise((r) => setTimeout(r, 15));
+        inFlight -= 1;
+        return "0x01";
+      });
+
+      const controller = new AbortController();
+      const requestOptions = { timeoutMs: 3_000, signal: controller.signal };
+
+      const batch = await dryRunBatchCalls(
+        client,
+        [
+          {
+            contract: contractHex,
+            method: "call_a",
+            args: new Uint8Array([1]),
+          },
+          {
+            contract: contractHex,
+            method: "call_b",
+            args: new Uint8Array([2]),
+          },
+          {
+            call: {
+              contract: contractHex,
+              method: "call_c",
+              args: new Uint8Array([3]),
+            },
+            options: {
+              gasLimit: 300_000n,
+            },
+          },
+        ],
+        {
+          parallel: true,
+          from: acc0.publicKey,
+          gasLimit: 200_000n,
+          requestOptions,
+        },
+      );
+
+      expect(callSpy).toHaveBeenCalledTimes(3);
+      expect(maxConcurrent).toBe(3);
+      expect(batch.totalCalls).toBe(3);
+      expect(batch.passedCount).toBe(3);
+      expect(batch.failedCount).toBe(0);
+
+      // Verify batch default `from` and `gasLimit` were applied, and call_c overrode `gasLimit`
+      expect(callSpy).toHaveBeenNthCalledWith(
+        1,
+        "kovanica_call",
+        [
+          expect.objectContaining({
+            to: contractPro21,
+            from: encodeAddress(acc0.publicKey),
+            method: "call_a",
+            gas: "0x30d40", // 200_000n
+          }),
+        ],
+        requestOptions,
+      );
+      expect(callSpy).toHaveBeenNthCalledWith(
+        3,
+        "kovanica_call",
+        [
+          expect.objectContaining({
+            to: contractPro21,
+            from: encodeAddress(acc0.publicKey),
+            method: "call_c",
+            gas: "0x493e0", // 300_000n override
+          }),
+        ],
+        requestOptions,
+      );
+    });
+
+    it("captures per-call errors when continueOnError !== false and throws on first error when continueOnError === false", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const callSpy = vi
+        .spyOn(client, "call")
+        .mockResolvedValueOnce("0x0102")
+        .mockRejectedValueOnce(new KovanicaRpcError(-32000, "Execution reverted: Trap"))
+        .mockResolvedValueOnce("0x0304");
+
+      const calls = [
+        { contract: contractHex, method: "ok_1", args: new Uint8Array(0) },
+        { contract: contractHex, method: "revert_2", args: new Uint8Array(0) },
+        { contract: contractHex, method: "ok_3", args: new Uint8Array(0) },
+      ];
+
+      // 1. Default continueOnError (true) captures individual error and continues
+      const batch = await client.dryRunBatchCalls(calls);
+      expect(callSpy).toHaveBeenCalledTimes(3);
+      expect(batch.totalCalls).toBe(3);
+      expect(batch.passedCount).toBe(2);
+      expect(batch.failedCount).toBe(1);
+      expect(batch.results[0]?.ok).toBe(true);
+      expect(batch.results[1]?.ok).toBe(false);
+      if (batch.results[1] && !batch.results[1].ok) {
+        expect(batch.results[1].error).toBeInstanceOf(KovanicaRpcError);
+        expect(batch.results[1].error.message).toMatch(/Execution reverted/);
+      }
+      expect(batch.results[2]?.ok).toBe(true);
+
+      // 2. continueOnError: false throws on first error and stops sequential execution
+      callSpy.mockClear();
+      callSpy
+        .mockResolvedValueOnce("0x0102")
+        .mockRejectedValueOnce(new KovanicaRpcError(-32000, "Execution reverted: Trap"))
+        .mockResolvedValueOnce("0x0304");
+
+      await expect(
+        dryRunBatchCalls(client, calls, { continueOnError: false }),
+      ).rejects.toThrow(/Execution reverted/);
+      expect(callSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("validates all calls fail-closed before performing any RPC I/O", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const callSpy = vi.spyOn(client, "call").mockResolvedValue("0x01");
+
+      const validCall = {
+        contract: contractHex,
+        method: "valid_method",
+        args: new Uint8Array([1]),
+      };
+
+      // Empty array
+      await expect(dryRunBatchCalls(client, [])).rejects.toThrow(
+        /non-empty array of calls/,
+      );
+
+      // Invalid second call contract address fails before calling RPC for first call
+      await expect(
+        dryRunBatchCalls(client, [
+          validCall,
+          {
+            contract: "0x1234",
+            method: "bad_contract",
+            args: new Uint8Array(0),
+          },
+        ]),
+      ).rejects.toThrow(/Expected 32-byte contract address/);
+
+      // Invalid method on wrapped call
+      await expect(
+        dryRunBatchCalls(client, [
+          validCall,
+          {
+            call: {
+              contract: contractHex,
+              method: "   ",
+              args: new Uint8Array(0),
+            },
+          },
+        ]),
+      ).rejects.toThrow(/method must be a non-empty string/);
+
+      // Invalid gasLimit on batch options
+      await expect(
+        dryRunBatchCalls(client, [validCall], { gasLimit: MAX_TX_GAS_LIMIT + 1n }),
+      ).rejects.toThrow(/exceeds maximum allowed/);
+
+      // Invalid from on batch options
+      await expect(
+        dryRunBatchCalls(client, [validCall], { from: "0x1234" }),
+      ).rejects.toThrow(/Expected 32-byte contract address/);
 
       expect(callSpy).not.toHaveBeenCalled();
     });

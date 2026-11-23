@@ -3,6 +3,12 @@
  * Verified against crates/kovanica-rpc in kovanica git SHA: d2239fd8314a0c6edb08d54724738d662d406a32
  */
 
+/** Canonical 64-character PRO-21 Kovanica address (`kvnc...dag` / `tknc...dag`). */
+export type KovanicaAddress = string;
+
+/** Hexadecimal string (e.g. `"0x..."`). */
+export type HexString = string;
+
 export interface RequestOptions {
   /** Optional cancellation signal. */
   signal?: AbortSignal;

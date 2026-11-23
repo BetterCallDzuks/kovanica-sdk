@@ -12,8 +12,10 @@
  */
 
 import { blake3 } from "@noble/hashes/blake3.js";
-import { bytesToHex, concatBytes, hexToBytes, u64le } from "./contracts";
+import { encodeAddress } from "./address";
+import { bytesToHex, concatBytes, hexToBytes, parseContractAddress, u64le } from "./contracts";
 import { KovanicaError } from "./errors";
+import type { HexString, KovanicaAddress, RequestOptions } from "./types";
 
 // --- Constants ---
 
@@ -1041,6 +1043,9 @@ export type StorageSlotContract =
   | "name"
   | "escrow";
 
+/** Alias for {@link StorageSlotContract}. */
+export type StorageSlotKind = StorageSlotContract;
+
 export type StorageSlotKey = Uint8Array | string | bigint | number;
 
 function parseFixed32Key(key: StorageSlotKey | undefined, label: string): Uint8Array {
@@ -1188,4 +1193,373 @@ export function deriveStorageSlotHex(
   key?: StorageSlotKey,
 ): string {
   return bytesToHex(deriveStorageSlot(contract, key));
+}
+
+// --- Typed Contract Storage Reader (`readContractStorage`) ---
+
+/**
+ * Minimal client interface required by {@link readContractStorage}.
+ * Satisfied by {@link KovanicaClient}.
+ */
+export interface ReadContractStorageClient {
+  getStorageAt(
+    address: string,
+    slot: string | number | bigint,
+    options?: RequestOptions,
+  ): Promise<string>;
+}
+
+/**
+ * Maps a canonical {@link StorageSlotKind} to its default decoded record type
+ * when no explicit `decoder` is supplied to {@link readContractStorage}.
+ */
+export type DefaultDecodedStorageByKind<K extends StorageSlotKind> = K extends "htlc"
+  ? HtlcRecord
+  : K extends "vault"
+    ? VaultRecord
+    : K extends "multisig"
+      ? MultisigState
+      : K extends "multisig_tx"
+        ? MultisigPendingTx
+        : K extends "token"
+          ? TokenMetadata
+          : K extends "token_pool"
+            ? TokenPoolState
+            : K extends "name"
+              ? NameRecord
+              : K extends "nft"
+                ? NftMetadata
+                : K extends "escrow"
+                  ? EscrowRecord
+                  : undefined;
+
+const DEFAULT_DECODER_KIND_BY_SLOT_KIND: Partial<Record<StorageSlotKind, ContractLogKind>> = {
+  htlc: "htlc",
+  vault: "vault",
+  multisig: "multisig_state",
+  multisig_tx: "multisig_tx",
+  token: "token_metadata",
+  token_pool: "token_pool",
+  name: "name",
+  nft: "nft_metadata",
+  escrow: "escrow",
+};
+
+/**
+ * Target storage slot selector for {@link readContractStorage}:
+ * - `{ slotHex: string; decoder?: ... }`: explicit 32-byte hex slot
+ * - `{ kind: StorageSlotKind; key?: StorageSlotKey; decoder?: ... }`: canonical BLAKE3 slot via {@link deriveStorageSlotHex}
+ * - `{ prefix: string | Uint8Array; key?: string | Uint8Array; decoder?: ... }`: prefixed BLAKE3 slot via {@link derivePrefixedStorageSlot}
+ */
+export type ContractStorageTarget<TDecoded = unknown> =
+  | {
+      slotHex: string;
+      decoder?: ContractLogKind | ((bytes: Uint8Array) => TDecoded);
+    }
+  | {
+      kind: StorageSlotKind;
+      key?: StorageSlotKey;
+      decoder?: ContractLogKind | ((bytes: Uint8Array) => TDecoded);
+    }
+  | {
+      prefix: string | Uint8Array;
+      key?: string | Uint8Array;
+      decoder?: ContractLogKind | ((bytes: Uint8Array) => TDecoded);
+    };
+
+export interface ReadContractStorageOptions {
+  /**
+   * Optional block number or tag (reserved for forward compatibility; `kovanica_getStorageAt` queries latest committed state).
+   */
+  blockNumberOrTag?: bigint | number | string;
+  /**
+   * Optional RPC request options (`timeoutMs`, `signal`) forwarded to `client.getStorageAt`.
+   */
+  requestOptions?: RequestOptions;
+}
+
+export interface ContractStorageReadResult<TDecoded = undefined> {
+  /** Validated canonical 64-character PRO-21 contract address (`kvnc...dag`). */
+  contract: KovanicaAddress;
+  /** Normalized `0x`-prefixed 64-character lowercase hex storage slot key. */
+  slotHex: HexString;
+  /** Normalized `0x`-prefixed lowercase hex value (`"0x"` when `isEmpty` is `true`). */
+  rawHex: HexString;
+  /** Raw storage value bytes (`new Uint8Array(0)` when `isEmpty` is `true`). */
+  rawBytes: Uint8Array;
+  /** True when the storage slot is empty (`null`, `"0x"`, `"0x0"`, or 32 zero bytes). */
+  isEmpty: boolean;
+  /** Decoded Bincode record when `isEmpty` is `false` and a decoder (or default `kind` decoder) is applicable. */
+  decoded?: TDecoded;
+}
+
+function normalizeAndValidateSlotHex(slotHex: string): string {
+  if (typeof slotHex !== "string") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "readContractStorage: slotHex must be a 32-byte hex string",
+      { field: "slotHex" },
+    );
+  }
+  const trimmed = slotHex.trim();
+  const clean =
+    trimmed.startsWith("0x") || trimmed.startsWith("0X") ? trimmed.slice(2) : trimmed;
+  if (clean.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(clean)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      `readContractStorage: expected 32-byte (64-character) slotHex, got "${slotHex}"`,
+      { field: "slotHex" },
+    );
+  }
+  return `0x${clean.toLowerCase()}`;
+}
+
+function isEmptyStorageValue(
+  rawResponse: unknown,
+): { isEmpty: true } | { isEmpty: false; cleanHex: string; rawBytes: Uint8Array } {
+  if (rawResponse === null || rawResponse === undefined) {
+    return { isEmpty: true };
+  }
+  if (typeof rawResponse !== "string") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "kovanica_getStorageAt: expected hex string or null response",
+    );
+  }
+  const trimmed = rawResponse.trim();
+  if (trimmed.length === 0 || trimmed === "0x" || trimmed === "0X" || trimmed === "0x0" || trimmed === "0X0") {
+    return { isEmpty: true };
+  }
+  const clean =
+    trimmed.startsWith("0x") || trimmed.startsWith("0X") ? trimmed.slice(2) : trimmed;
+  if (clean.length === 0) {
+    return { isEmpty: true };
+  }
+  if (clean.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(clean)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "kovanica_getStorageAt: invalid hex string in storage response",
+    );
+  }
+  const rawBytes = hexToBytes(clean);
+  if (rawBytes.length === 32 && rawBytes.every((b) => b === 0)) {
+    return { isEmpty: true };
+  }
+  return {
+    isEmpty: false,
+    cleanHex: clean.toLowerCase(),
+    rawBytes,
+  };
+}
+
+/**
+ * Reads a contract storage slot via `client.getStorageAt`, automatically deriving canonical or prefixed
+ * BLAKE3 storage slots, detecting empty/zero storage slots, and optionally decoding Bincode state records.
+ */
+export async function readContractStorage<TDecoded>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    slotHex: string;
+    decoder: (bytes: Uint8Array) => TDecoded;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<TDecoded>>;
+export async function readContractStorage<K extends ContractLogKind>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    slotHex: string;
+    decoder: K;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<DecodedContractLogByKind<K>["record"]>>;
+export async function readContractStorage<TDecoded = undefined>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    slotHex: string;
+    decoder?: undefined;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<TDecoded>>;
+export async function readContractStorage<TDecoded>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    kind: StorageSlotKind;
+    key?: StorageSlotKey;
+    decoder: (bytes: Uint8Array) => TDecoded;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<TDecoded>>;
+export async function readContractStorage<K extends ContractLogKind>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    kind: StorageSlotKind;
+    key?: StorageSlotKey;
+    decoder: K;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<DecodedContractLogByKind<K>["record"]>>;
+export async function readContractStorage<S extends StorageSlotKind>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    kind: S;
+    key?: StorageSlotKey;
+    decoder?: undefined;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<DefaultDecodedStorageByKind<S>>>;
+export async function readContractStorage<TDecoded>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    prefix: string | Uint8Array;
+    key?: string | Uint8Array;
+    decoder: (bytes: Uint8Array) => TDecoded;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<TDecoded>>;
+export async function readContractStorage<K extends ContractLogKind>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    prefix: string | Uint8Array;
+    key?: string | Uint8Array;
+    decoder: K;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<DecodedContractLogByKind<K>["record"]>>;
+export async function readContractStorage<TDecoded = undefined>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: {
+    prefix: string | Uint8Array;
+    key?: string | Uint8Array;
+    decoder?: undefined;
+  },
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<TDecoded>>;
+export async function readContractStorage<TDecoded = unknown>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: ContractStorageTarget<TDecoded>,
+  options?: ReadContractStorageOptions,
+): Promise<ContractStorageReadResult<TDecoded>>;
+export async function readContractStorage<TDecoded = unknown>(
+  client: ReadContractStorageClient,
+  contract: Uint8Array | string,
+  target: ContractStorageTarget<TDecoded>,
+  options: ReadContractStorageOptions = {},
+): Promise<ContractStorageReadResult<TDecoded>> {
+  const contractBytes = parseContractAddress(contract);
+  const canonicalContract = encodeAddress(contractBytes);
+
+  if (!target || typeof target !== "object") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "readContractStorage: target must be an object specifying slotHex, kind, or prefix",
+      { field: "target" },
+    );
+  }
+
+  let normalizedSlotHex: string;
+  let effectiveDecoder: ContractLogKind | ((bytes: Uint8Array) => TDecoded) | undefined =
+    target.decoder;
+
+  if ("slotHex" in target && target.slotHex !== undefined) {
+    normalizedSlotHex = normalizeAndValidateSlotHex(target.slotHex);
+  } else if ("kind" in target && target.kind !== undefined) {
+    const rawSlotHex = deriveStorageSlotHex(target.kind, target.key);
+    normalizedSlotHex = `0x${rawSlotHex.toLowerCase()}`;
+    if (effectiveDecoder === undefined) {
+      effectiveDecoder = DEFAULT_DECODER_KIND_BY_SLOT_KIND[target.kind];
+    }
+  } else if ("prefix" in target && target.prefix !== undefined) {
+    if (typeof target.prefix !== "string" && !(target.prefix instanceof Uint8Array)) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        "readContractStorage: prefix must be a string or Uint8Array",
+        { field: "prefix" },
+      );
+    }
+    if (
+      target.key !== undefined &&
+      typeof target.key !== "string" &&
+      !(target.key instanceof Uint8Array)
+    ) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        "readContractStorage: key for prefixed storage slot must be a string or Uint8Array",
+        { field: "key" },
+      );
+    }
+    const slotBytes = derivePrefixedStorageSlot(target.prefix, target.key);
+    normalizedSlotHex = `0x${bytesToHex(slotBytes)}`;
+  } else {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "readContractStorage: target must specify slotHex, kind, or prefix",
+      { field: "target" },
+    );
+  }
+
+  if (effectiveDecoder !== undefined && typeof effectiveDecoder !== "function") {
+    if (
+      typeof effectiveDecoder !== "string" ||
+      !VALID_CONTRACT_LOG_KINDS.has(effectiveDecoder)
+    ) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `Unknown contract log kind: ${String(effectiveDecoder)}`,
+        { field: "decoder" },
+      );
+    }
+  }
+
+  const rawStorage = await client.getStorageAt(
+    canonicalContract,
+    normalizedSlotHex,
+    options.requestOptions,
+  );
+
+  const inspected = isEmptyStorageValue(rawStorage);
+  if (inspected.isEmpty) {
+    return {
+      contract: canonicalContract,
+      slotHex: normalizedSlotHex,
+      rawHex: "0x",
+      rawBytes: new Uint8Array(0),
+      isEmpty: true,
+    };
+  }
+
+  const rawHex = `0x${inspected.cleanHex}`;
+  const { rawBytes } = inspected;
+
+  if (effectiveDecoder !== undefined) {
+    const decoded: TDecoded =
+      typeof effectiveDecoder === "function"
+        ? effectiveDecoder(rawBytes)
+        : (decodeContractLog(rawBytes, effectiveDecoder).record as unknown as TDecoded);
+    return {
+      contract: canonicalContract,
+      slotHex: normalizedSlotHex,
+      rawHex,
+      rawBytes,
+      isEmpty: false,
+      decoded,
+    };
+  }
+
+  return {
+    contract: canonicalContract,
+    slotHex: normalizedSlotHex,
+    rawHex,
+    rawBytes,
+    isEmpty: false,
+  };
 }
