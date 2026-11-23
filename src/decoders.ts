@@ -807,6 +807,84 @@ export function decodeEscrowRecord(input: Uint8Array | string): EscrowRecord {
   };
 }
 
+// --- Typed Contract Log / Record Dispatcher (`decodeContractLog`) ---
+
+export type ContractLogKind =
+  | "htlc"
+  | "vault"
+  | "multisig_state"
+  | "multisig_tx"
+  | "token_metadata"
+  | "token_pool"
+  | "name"
+  | "nft_metadata"
+  | "escrow";
+
+export type DecodedContractLog =
+  | { kind: "htlc"; record: HtlcRecord }
+  | { kind: "vault"; record: VaultRecord }
+  | { kind: "multisig_state"; record: MultisigState }
+  | { kind: "multisig_tx"; record: MultisigPendingTx }
+  | { kind: "token_metadata"; record: TokenMetadata }
+  | { kind: "token_pool"; record: TokenPoolState }
+  | { kind: "name"; record: NameRecord }
+  | { kind: "nft_metadata"; record: NftMetadata }
+  | { kind: "escrow"; record: EscrowRecord };
+
+export type DecodedContractLogByKind<K extends ContractLogKind> = Extract<
+  DecodedContractLog,
+  { kind: K }
+>;
+
+/**
+ * Decodes a canonical Bincode contract log/event or state payload (`Uint8Array` or `0x`/raw hex string,
+ * such as `WsExecutionEvent.data`) into a typed discriminated union `{ kind, record }`.
+ *
+ * Fails closed with {@link KovanicaDecodeError} on unknown `kind` (`INVALID_INPUT`), invalid hex,
+ * truncated payloads, invalid variants/booleans, or trailing bytes.
+ */
+export function decodeContractLog<K extends ContractLogKind>(
+  logDataHexOrBytes: Uint8Array | string,
+  kind: K,
+): DecodedContractLogByKind<K>;
+export function decodeContractLog(
+  logDataHexOrBytes: Uint8Array | string,
+  kind: ContractLogKind,
+): DecodedContractLog;
+export function decodeContractLog(
+  logDataHexOrBytes: Uint8Array | string,
+  kind: ContractLogKind,
+): DecodedContractLog {
+  switch (kind) {
+    case "htlc":
+      return { kind: "htlc", record: decodeHtlcRecord(logDataHexOrBytes) };
+    case "vault":
+      return { kind: "vault", record: decodeVaultRecord(logDataHexOrBytes) };
+    case "multisig_state":
+      return { kind: "multisig_state", record: decodeMultisigState(logDataHexOrBytes) };
+    case "multisig_tx":
+      return { kind: "multisig_tx", record: decodeMultisigPendingTx(logDataHexOrBytes) };
+    case "token_metadata":
+      return { kind: "token_metadata", record: decodeTokenMetadata(logDataHexOrBytes) };
+    case "token_pool":
+      return { kind: "token_pool", record: decodeTokenPool(logDataHexOrBytes) };
+    case "name":
+      return { kind: "name", record: decodeNameRecord(logDataHexOrBytes) };
+    case "nft_metadata":
+      return { kind: "nft_metadata", record: decodeNftMetadata(logDataHexOrBytes) };
+    case "escrow":
+      return { kind: "escrow", record: decodeEscrowRecord(logDataHexOrBytes) };
+    default: {
+      const exhaustive: never = kind;
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `Unknown contract log kind: ${String(exhaustive)}`,
+        { field: "kind" },
+      );
+    }
+  }
+}
+
 // --- Storage Slot Key Derivation Helpers ---
 
 export type StorageSlotContract =

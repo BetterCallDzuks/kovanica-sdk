@@ -24,11 +24,14 @@ import {
   type DryRunCallOptions,
   type DryRunCallResult,
   type EstimateAndBuildCallOptions,
+  type EstimateBatchCallsOptions,
+  type PreparedBatchCallTransactions,
   type PreparedCallTransaction,
   type SignedTxResult,
   buildCallTxKind,
   dryRunCall,
   estimateAndBuildCall,
+  estimateBatchCalls,
   signCallContractTransaction,
 } from "./contracts";
 import { getPublicKey } from "./wallet";
@@ -303,6 +306,17 @@ export class KovanicaClient {
     options?: EstimateAndBuildCallOptions,
   ): Promise<PreparedCallTransaction> {
     return estimateAndBuildCall(this, call, options);
+  }
+
+  /**
+   * Estimates fee/gas parameters for a non-empty batch of contract calls in a single
+   * parallel RPC round-trip and builds sequential-nonce ready-to-sign call payloads.
+   */
+  async estimateBatchCalls(
+    calls: ReadonlyArray<CallTxKind | CallTxKindInput>,
+    options?: EstimateBatchCallsOptions,
+  ): Promise<PreparedBatchCallTransactions> {
+    return estimateBatchCalls(this, calls, options);
   }
 
   /**

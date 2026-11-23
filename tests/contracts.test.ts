@@ -47,6 +47,7 @@ import {
   encodeNameRegisterArgs,
   encodeNftMintArgs,
   estimateAndBuildCall,
+  estimateBatchCalls,
   estimateCallTxSize,
   hexToBytes,
   signCallContractTransaction,
@@ -1075,6 +1076,251 @@ describe("Canonical Smart Contract Argument Builders & Bincode Encoders", () => 
       ).rejects.toThrow(/exceeds maximum allowed/);
 
       expect(callSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("estimateBatchCalls & client.estimateBatchCalls", () => {
+    const contractHex = "0x" + "11".repeat(32);
+
+    it("estimates a multi-call batch with sequential nonces and a single parallel RPC round-trip", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const estimateFeeSpy = vi.spyOn(client, "estimateFee").mockResolvedValue(50n);
+      const getNonceSpy = vi.spyOn(client, "getNonce").mockResolvedValue(10n);
+      const controller = new AbortController();
+      const requestOptions = { timeoutMs: 3_000, signal: controller.signal };
+
+      const call0 = {
+        contract: contractHex,
+        method: "name_register",
+        args: buildNameRegisterCall("alice", acc1.publicKey, ["127.0.0.1:8000"]),
+      };
+      const call1 = buildHtlcCreateCallTx(
+        contractHex,
+        hexToBytes("22".repeat(32)),
+        1_750_000_000n,
+        acc1.publicKey,
+        200_000n,
+      );
+      const call2 = {
+        contract: contractHex,
+        method: "token_transfer",
+        args: concatBytes([acc1.publicKey, u128le(1_000n)]),
+      };
+
+      const batch = await client.estimateBatchCalls([call0, call1, call2], {
+        sender: acc0.address,
+        chainId: CHAIN_IDS.TESTNET,
+        requestOptions,
+      });
+
+      // Exactly 1 estimateFee + 1 getNonce call
+      expect(estimateFeeSpy).toHaveBeenCalledTimes(1);
+      expect(estimateFeeSpy).toHaveBeenCalledWith(requestOptions);
+      expect(getNonceSpy).toHaveBeenCalledTimes(1);
+      expect(getNonceSpy).toHaveBeenCalledWith(acc0.address, requestOptions);
+
+      expect(batch.calls).toHaveLength(3);
+      expect(batch.feeRatePerByte).toBe(50n);
+      expect(batch.startNonce).toBe(10n);
+      expect(batch.chainId).toBe(CHAIN_IDS.TESTNET);
+
+      // Sequential nonces: 10n, 11n, 12n
+      expect(batch.calls[0]!.nonce).toBe(10n);
+      expect(batch.calls[1]!.nonce).toBe(11n);
+      expect(batch.calls[2]!.nonce).toBe(12n);
+
+      // Call 0 & 2 used default gas (100_000n * 1.2 = 120_000n); Call 1 had explicit 200_000n
+      expect(batch.calls[0]!.gasLimit).toBe(120_000n);
+      expect(batch.calls[1]!.gasLimit).toBe(200_000n);
+      expect(batch.calls[2]!.gasLimit).toBe(120_000n);
+      expect(batch.totalGasLimit).toBe(440_000n);
+
+      const expectedTotalSize =
+        batch.calls[0]!.estimatedTxSize +
+        batch.calls[1]!.estimatedTxSize +
+        batch.calls[2]!.estimatedTxSize;
+      expect(batch.totalEstimatedTxSize).toBe(expectedTotalSize);
+
+      const expectedTotalFee =
+        batch.calls[0]!.fee + batch.calls[1]!.fee + batch.calls[2]!.fee;
+      expect(batch.totalFee).toBe(expectedTotalFee);
+
+      // Signing each prepared call in the batch matches its estimatedTxSize
+      const wallet = new KovanicaWallet(acc0.secretKey, { chainId: batch.chainId });
+      for (const item of batch.calls) {
+        const signed = wallet.signCallTransaction(item.call, {
+          nonce: item.nonce!,
+          fee: item.fee,
+          chainId: item.chainId,
+        });
+        expect(signed.txSize).toBe(item.estimatedTxSize);
+      }
+    });
+
+    it("supports startNonce, feeRatePerByte, minFeePerCall, margins, and omitted sender/nonce", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const estimateFeeSpy = vi.spyOn(client, "estimateFee").mockResolvedValue(20n);
+      const getNonceSpy = vi.spyOn(client, "getNonce").mockResolvedValue(99n);
+
+      const calls = [
+        {
+          contract: contractHex,
+          method: "token_transfer",
+          args: concatBytes([acc1.publicKey, u128le(100n)]),
+          gasLimit: 9_500_000n,
+        },
+        {
+          contract: contractHex,
+          method: "token_transfer",
+          args: concatBytes([acc1.publicKey, u128le(200n)]),
+        },
+      ];
+
+      // Explicit startNonce and feeRatePerByte skip both RPC calls
+      const overridden = await estimateBatchCalls(client, calls, {
+        sender: acc0.address,
+        startNonce: 50n,
+        feeRatePerByte: 10n,
+        feeMarginBps: 15_000,
+        gasMarginBps: 15_000,
+        minFeePerCall: 100_000n,
+        maxTotalFee: 250_000n,
+        chainId: CHAIN_IDS.DEVNET,
+      });
+
+      expect(estimateFeeSpy).not.toHaveBeenCalled();
+      expect(getNonceSpy).not.toHaveBeenCalled();
+      expect(overridden.startNonce).toBe(50n);
+      expect(overridden.calls[0]!.nonce).toBe(50n);
+      expect(overridden.calls[1]!.nonce).toBe(51n);
+      // Call 0 gas 9_500_000 * 1.5 clamped to MAX_TX_GAS_LIMIT (10_000_000n); Call 1 gas 100_000 * 1.5 = 150_000n
+      expect(overridden.calls[0]!.gasLimit).toBe(MAX_TX_GAS_LIMIT);
+      expect(overridden.calls[1]!.gasLimit).toBe(150_000n);
+      expect(overridden.totalGasLimit).toBe(MAX_TX_GAS_LIMIT + 150_000n);
+      // minFeePerCall floor (100_000n) applied to each call
+      expect(overridden.calls[0]!.fee).toBe(100_000n);
+      expect(overridden.calls[1]!.fee).toBe(100_000n);
+      expect(overridden.totalFee).toBe(200_000n);
+      expect(overridden.chainId).toBe(CHAIN_IDS.DEVNET);
+
+      // Omitting both sender and startNonce leaves nonces undefined and only calls estimateFee once
+      const noSender = await estimateBatchCalls(client, calls);
+      expect(estimateFeeSpy).toHaveBeenCalledTimes(1);
+      expect(getNonceSpy).not.toHaveBeenCalled();
+      expect(noSender.startNonce).toBeUndefined();
+      expect(noSender.calls[0]!.nonce).toBeUndefined();
+      expect(noSender.calls[1]!.nonce).toBeUndefined();
+      expect(noSender.chainId).toBe(CHAIN_IDS.MAINNET);
+    });
+
+    it("enforces maxTotalFee cap across the batch", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      vi.spyOn(client, "estimateFee").mockResolvedValue(100n);
+
+      const calls = [
+        {
+          contract: contractHex,
+          method: "token_transfer",
+          args: concatBytes([acc1.publicKey, u128le(1n)]),
+        },
+        {
+          contract: contractHex,
+          method: "token_transfer",
+          args: concatBytes([acc1.publicKey, u128le(2n)]),
+        },
+      ];
+
+      const baseline = await estimateBatchCalls(client, calls);
+      // Cap equal to totalFee succeeds
+      const exactCap = await estimateBatchCalls(client, calls, {
+        maxTotalFee: baseline.totalFee,
+      });
+      expect(exactCap.totalFee).toBe(baseline.totalFee);
+
+      // Cap 1 atom below totalFee throws RangeError
+      await expect(
+        estimateBatchCalls(client, calls, {
+          maxTotalFee: baseline.totalFee - 1n,
+        }),
+      ).rejects.toThrow(/exceeds maxTotalFee/);
+    });
+
+    it("rejects empty batches, invalid options, and invalid individual calls fail-closed before any RPC I/O", async () => {
+      const client = new KovanicaClient("http://localhost:8545");
+      const estimateFeeSpy = vi.spyOn(client, "estimateFee").mockResolvedValue(100n);
+      const getNonceSpy = vi.spyOn(client, "getNonce").mockResolvedValue(1n);
+
+      const validCall = {
+        contract: contractHex,
+        method: "test",
+        args: new Uint8Array([1, 2, 3]),
+      };
+
+      // Empty batch rejected
+      await expect(estimateBatchCalls(client, [])).rejects.toThrow(
+        /non-empty array of calls/,
+      );
+
+      // Invalid options rejected before RPC
+      await expect(
+        estimateBatchCalls(client, [validCall], { feeMarginBps: 9_999 }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateBatchCalls(client, [validCall], { gasMarginBps: 9_000 }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateBatchCalls(client, [validCall], { minFeePerCall: -1n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateBatchCalls(client, [validCall], { maxTotalFee: -1n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateBatchCalls(client, [validCall, validCall], {
+          minFeePerCall: 60n,
+          maxTotalFee: 100n,
+        }),
+      ).rejects.toThrow(/cannot exceed maxTotalFee/);
+      await expect(
+        estimateBatchCalls(client, [validCall], { startNonce: -1n }),
+      ).rejects.toThrow(RangeError);
+      await expect(
+        estimateBatchCalls(client, [validCall], { feeRatePerByte: -1n }),
+      ).rejects.toThrow(RangeError);
+
+      // Invalid second call in batch fails before any RPC call
+      await expect(
+        estimateBatchCalls(
+          client,
+          [
+            validCall,
+            {
+              contract: "0x1234", // invalid 2-byte address
+              method: "test",
+              args: new Uint8Array(),
+            },
+          ],
+          { sender: acc0.address },
+        ),
+      ).rejects.toThrow(/Expected 32-byte contract address/);
+
+      await expect(
+        estimateBatchCalls(
+          client,
+          [
+            validCall,
+            {
+              contract: contractHex,
+              method: "test",
+              args: new Uint8Array(),
+              gas_limit: MAX_TX_GAS_LIMIT + 1n,
+            },
+          ],
+          { sender: acc0.address },
+        ),
+      ).rejects.toThrow(/exceeds maximum allowed/);
+
+      expect(estimateFeeSpy).not.toHaveBeenCalled();
+      expect(getNonceSpy).not.toHaveBeenCalled();
     });
   });
 });

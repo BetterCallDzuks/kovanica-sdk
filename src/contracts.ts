@@ -901,6 +901,248 @@ export async function estimateAndBuildCall(
   };
 }
 
+// --- Multi-Call Batch Estimator (`estimateBatchCalls`) ---
+
+export interface EstimateBatchCallsOptions {
+  /**
+   * Optional sender address (PRO-21 `kvnc...dag` / `tknc...dag` or 32-byte hex).
+   * When provided and `startNonce` is omitted, fetches the sender's current nonce once via `client.getNonce(sender)`.
+   */
+  sender?: string;
+  /**
+   * Explicit starting nonce override for the first call in the batch (`calls[0]`).
+   * Subsequent calls receive sequential nonces `startNonce + BigInt(i)`.
+   * Skips the `client.getNonce` RPC call when provided.
+   */
+  startNonce?: bigint | number;
+  /**
+   * Explicit fee rate override in atoms per byte. Skips the `client.estimateFee` RPC call when provided.
+   */
+  feeRatePerByte?: bigint | number;
+  /**
+   * Fee safety margin in basis points (`10_000` = 1.0x, `12_000` = +20%).
+   * Applied to `feeRatePerByte * estimatedTxSize` for each call in the batch.
+   * Default: {@link DEFAULT_FEE_SAFETY_MARGIN_BPS} (`12_000`).
+   */
+  feeMarginBps?: number;
+  /**
+   * Gas limit safety margin in basis points (`10_000` = 1.0x, `12_000` = +20%).
+   * Applied to each call's gas limit (clamped to {@link MAX_TX_GAS_LIMIT}) when `gasLimit` / `gas_limit`
+   * is not explicitly supplied on that call, or whenever `gasMarginBps` is explicitly specified.
+   * Default: {@link DEFAULT_GAS_SAFETY_MARGIN_BPS} (`12_000`) for defaulted gas, or `10_000` (1.0x) when explicit gas was provided.
+   */
+  gasMarginBps?: number;
+  /**
+   * Minimum fee floor per individual call in atoms. Default: `0n`.
+   */
+  minFeePerCall?: bigint | number;
+  /**
+   * Optional maximum aggregate fee cap across the entire batch in atoms.
+   * Throws a `RangeError` if the sum of all calls' fees exceeds this cap.
+   */
+  maxTotalFee?: bigint | number;
+  /**
+   * Chain ID to attach to each prepared call transaction and the batch result. Default: `CHAIN_IDS.MAINNET`.
+   */
+  chainId?: number;
+  /**
+   * Optional RPC request options (`timeoutMs`, `signal`) forwarded to `estimateFee` and `getNonce`.
+   */
+  requestOptions?: RequestOptions;
+}
+
+export interface PreparedBatchCallTransactions {
+  /** Prepared call transactions in input order, with sequential nonces when `sender` or `startNonce` is provided. */
+  calls: PreparedCallTransaction[];
+  /** Sum of `fee` across all calls in the batch (in atoms). */
+  totalFee: bigint;
+  /** Sum of `gasLimit` across all calls in the batch. */
+  totalGasLimit: bigint;
+  /** Sum of `estimatedTxSize` across all calls in the batch (in bytes). */
+  totalEstimatedTxSize: number;
+  /** Fee rate in atoms per byte used to estimate the batch. */
+  feeRatePerByte: bigint;
+  /** Resolved starting nonce assigned to `calls[0]` (`undefined` when neither `sender` nor `startNonce` was provided). */
+  startNonce?: bigint;
+  /** Chain ID attached to each call in the batch. */
+  chainId: number;
+}
+
+/**
+ * Estimates fee/gas parameters for a non-empty batch of contract calls in a single parallel RPC round-trip
+ * (`kovanica_estimateFee` + `kovanica_getNonce`) and returns sequential-nonce {@link PreparedCallTransaction} items
+ * along with batch totals ({@link PreparedBatchCallTransactions}).
+ *
+ * - Validates options and every call in `calls` fail-closed before any RPC I/O.
+ * - Fetches `kovanica_estimateFee` once (unless `options.feeRatePerByte` is provided) and `kovanica_getNonce(sender)`
+ *   once (when `options.sender` is provided and `options.startNonce` is omitted) in parallel.
+ * - Assigns sequential nonces `startNonce + BigInt(i)` when `startNonce` or `sender` is provided.
+ * - Enforces `minFeePerCall` on each call and optional `maxTotalFee` across the entire batch.
+ */
+export async function estimateBatchCalls(
+  client: EstimateAndBuildCallClient,
+  calls: ReadonlyArray<CallTxKind | CallTxKindInput>,
+  options: EstimateBatchCallsOptions = {},
+): Promise<PreparedBatchCallTransactions> {
+  if (!Array.isArray(calls) || calls.length === 0) {
+    throw new RangeError("estimateBatchCalls requires a non-empty array of calls");
+  }
+
+  const feeMarginBps = validateMarginBps(
+    options.feeMarginBps ?? DEFAULT_FEE_SAFETY_MARGIN_BPS,
+    "feeMarginBps",
+  );
+
+  const explicitGasMarginBps =
+    options.gasMarginBps !== undefined
+      ? validateMarginBps(options.gasMarginBps, "gasMarginBps")
+      : undefined;
+
+  const minFeePerCall =
+    options.minFeePerCall !== undefined ? BigInt(options.minFeePerCall) : 0n;
+  if (minFeePerCall < 0n) {
+    throw new RangeError(`minFeePerCall must be non-negative, got ${minFeePerCall}`);
+  }
+
+  const maxTotalFee =
+    options.maxTotalFee !== undefined ? BigInt(options.maxTotalFee) : undefined;
+  if (maxTotalFee !== undefined && maxTotalFee < 0n) {
+    throw new RangeError(`maxTotalFee must be non-negative, got ${maxTotalFee}`);
+  }
+
+  const minPossibleTotalFee = minFeePerCall * BigInt(calls.length);
+  if (maxTotalFee !== undefined && minPossibleTotalFee > maxTotalFee) {
+    throw new RangeError(
+      `minFeePerCall * calls.length (${minPossibleTotalFee}) cannot exceed maxTotalFee (${maxTotalFee})`,
+    );
+  }
+
+  let explicitStartNonce: bigint | undefined;
+  if (options.startNonce !== undefined) {
+    explicitStartNonce = BigInt(options.startNonce);
+    if (explicitStartNonce < 0n) {
+      throw new RangeError(`startNonce must be non-negative, got ${explicitStartNonce}`);
+    }
+  }
+
+  let explicitFeeRate: bigint | undefined;
+  if (options.feeRatePerByte !== undefined) {
+    explicitFeeRate = BigInt(options.feeRatePerByte);
+    if (explicitFeeRate < 0n) {
+      throw new RangeError(
+        `feeRatePerByte must be non-negative, got ${explicitFeeRate}`,
+      );
+    }
+  }
+
+  // Validate and normalize all calls fail-closed before performing any RPC I/O.
+  const prebuiltCalls: Array<{
+    preparedCall: CallTxKind;
+    resolvedGasLimit: bigint;
+    estimatedTxSize: number;
+  }> = [];
+
+  for (let i = 0; i < calls.length; i++) {
+    const inputCall = calls[i]!;
+    if (!inputCall || typeof inputCall !== "object") {
+      throw new TypeError(`Call at index ${i} must be a valid call object`);
+    }
+    const hasExplicitGas =
+      inputCall.gas_limit !== undefined || inputCall.gasLimit !== undefined;
+    const gasMarginBps =
+      explicitGasMarginBps ??
+      (hasExplicitGas ? BPS_DENOMINATOR : BigInt(DEFAULT_GAS_SAFETY_MARGIN_BPS));
+
+    const baseCall = buildCallTxKind(inputCall);
+    const marginedGas = applyBpsCeil(baseCall.gas_limit, gasMarginBps);
+    const resolvedGasLimit =
+      marginedGas > MAX_TX_GAS_LIMIT ? MAX_TX_GAS_LIMIT : marginedGas;
+
+    const preparedCall: CallTxKind =
+      resolvedGasLimit === baseCall.gas_limit
+        ? baseCall
+        : {
+            ...baseCall,
+            gas_limit: resolvedGasLimit,
+            gasLimit: resolvedGasLimit,
+          };
+
+    const estimatedTxSize = estimateCallTxSize(preparedCall);
+    prebuiltCalls.push({
+      preparedCall,
+      resolvedGasLimit,
+      estimatedTxSize,
+    });
+  }
+
+  const needsFeeEstimate = explicitFeeRate === undefined;
+  const needsNonce =
+    explicitStartNonce === undefined && options.sender !== undefined;
+
+  const [fetchedFeeRate, fetchedNonce] = await Promise.all([
+    needsFeeEstimate
+      ? client.estimateFee(options.requestOptions)
+      : Promise.resolve(undefined),
+    needsNonce
+      ? client.getNonce(options.sender!, options.requestOptions)
+      : Promise.resolve(undefined),
+  ]);
+
+  const feeRatePerByte = explicitFeeRate ?? fetchedFeeRate!;
+  if (feeRatePerByte < 0n) {
+    throw new RangeError(
+      `Estimated fee rate must be non-negative, got ${feeRatePerByte}`,
+    );
+  }
+
+  const startNonce = explicitStartNonce ?? fetchedNonce;
+  if (startNonce !== undefined && startNonce < 0n) {
+    throw new RangeError(`Fetched startNonce must be non-negative, got ${startNonce}`);
+  }
+
+  const chainId = options.chainId ?? CHAIN_IDS.MAINNET;
+  const preparedBatch: PreparedCallTransaction[] = [];
+  let totalFee = 0n;
+  let totalGasLimit = 0n;
+  let totalEstimatedTxSize = 0;
+
+  for (let i = 0; i < prebuiltCalls.length; i++) {
+    const { preparedCall, resolvedGasLimit, estimatedTxSize } = prebuiltCalls[i]!;
+    const baseFee = feeRatePerByte * BigInt(estimatedTxSize);
+    const marginedFee = applyBpsCeil(baseFee, feeMarginBps);
+    const fee = marginedFee < minFeePerCall ? minFeePerCall : marginedFee;
+    const nonce = startNonce !== undefined ? startNonce + BigInt(i) : undefined;
+
+    totalFee += fee;
+    totalGasLimit += resolvedGasLimit;
+    totalEstimatedTxSize += estimatedTxSize;
+
+    preparedBatch.push({
+      call: preparedCall,
+      fee,
+      feeRatePerByte,
+      estimatedTxSize,
+      gasLimit: resolvedGasLimit,
+      nonce,
+      chainId,
+    });
+  }
+
+  if (maxTotalFee !== undefined && totalFee > maxTotalFee) {
+    throw new RangeError(`Computed batch totalFee ${totalFee} exceeds maxTotalFee ${maxTotalFee}`);
+  }
+
+  return {
+    calls: preparedBatch,
+    totalFee,
+    totalGasLimit,
+    totalEstimatedTxSize,
+    feeRatePerByte,
+    startNonce,
+    chainId,
+  };
+}
+
 // --- Read-Only Contract Simulation (`kovanica_call` Dry-Run Helper) ---
 
 /**

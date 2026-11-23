@@ -7,6 +7,7 @@ import {
   STORAGE_KEY_PREFIXES,
   bytesToHex,
   concatBytes,
+  decodeContractLog,
   decodeEscrowRecord,
   decodeHtlcRecord,
   decodeMultisigPendingTx,
@@ -667,5 +668,145 @@ describe("Storage Slot Key Derivation Helpers", () => {
     expectDecodeError(() => deriveStorageSlot("multisig_tx", new Uint8Array(4)), "INVALID_INPUT");
     expectDecodeError(() => deriveStorageSlot("name", ""), "INVALID_INPUT");
     expectDecodeError(() => deriveStorageSlot("name", "   "), "INVALID_INPUT");
+  });
+});
+
+describe("decodeContractLog Dispatcher", () => {
+  it("dispatches across all canonical contract record/log kinds and returns a typed discriminated union", () => {
+    const sender = addr(0x01);
+    const claimer = addr(0x02);
+    const hashLock = blake3(new TextEncoder().encode("log-preimage"));
+
+    // 1. htlc
+    const htlcBytes = concatBytes([
+      sender,
+      claimer,
+      u128le(500_000n),
+      hashLock,
+      u64le(1_234_567n),
+      Uint8Array.of(1),
+      Uint8Array.of(0),
+    ]);
+    const htlcLog = decodeContractLog(`0x${bytesToHex(htlcBytes)}`, "htlc");
+    expect(htlcLog.kind).toBe("htlc");
+    expect(htlcLog.record.status).toBe("claimed");
+    expect(htlcLog.record.amount).toBe(500_000n);
+
+    // 2. vault
+    const vaultBytes = concatBytes([
+      sender,
+      claimer,
+      u128le(1_000_000n),
+      u128le(100_000n),
+      u32le(0),
+      u64le(50_000n),
+      Uint8Array.of(0),
+    ]);
+    const vaultLog = decodeContractLog(vaultBytes, "vault");
+    expect(vaultLog.kind).toBe("vault");
+    expect(vaultLog.record.schedule).toEqual({ kind: "absolute", unlockAt: 50_000n });
+
+    // 3. multisig_state
+    const msStateBytes = concatBytes([
+      encodeBincodeBytes32Vec([sender, claimer]),
+      u32le(2),
+      u64le(9n),
+    ]);
+    const msStateLog = decodeContractLog(msStateBytes, "multisig_state");
+    expect(msStateLog.kind).toBe("multisig_state");
+    expect(msStateLog.record.threshold).toBe(2);
+    expect(msStateLog.record.nextTxId).toBe(9n);
+
+    // 4. multisig_tx
+    const msTxBytes = concatBytes([
+      u64le(3n),
+      claimer,
+      u128le(42_000n),
+      bincodeBytes(new Uint8Array([0xaa, 0xbb])),
+      encodeBincodeBytes32Vec([sender]),
+      Uint8Array.of(0),
+    ]);
+    const msTxLog = decodeContractLog(msTxBytes, "multisig_tx");
+    expect(msTxLog.kind).toBe("multisig_tx");
+    expect(msTxLog.record.id).toBe(3n);
+    expect(msTxLog.record.dataHex).toBe("aabb");
+
+    // 5. token_metadata
+    const tokenBytes = concatBytes([
+      encodeBincodeString("Kovanica Token"),
+      encodeBincodeString("KVT"),
+      Uint8Array.of(9),
+      u128le(10_000_000n),
+      sender,
+      claimer,
+      u64le(0n),
+      u64le(0n),
+      Uint8Array.of(0),
+      encodeBincodeString("https://kovanica.org/kvt.png"),
+    ]);
+    const tokenLog = decodeContractLog(tokenBytes, "token_metadata");
+    expect(tokenLog.kind).toBe("token_metadata");
+    expect(tokenLog.record.symbol).toBe("KVT");
+    expect(tokenLog.record.icon).toBe("https://kovanica.org/kvt.png");
+
+    // 6. token_pool
+    const poolBytes = concatBytes([
+      u128le(1_000n),
+      u128le(2_000n),
+      u16le(25),
+      u128le(1_414n),
+      Uint8Array.of(0),
+    ]);
+    const poolLog = decodeContractLog(poolBytes, "token_pool");
+    expect(poolLog.kind).toBe("token_pool");
+    expect(poolLog.record.feeBps).toBe(25);
+
+    // 7. name
+    const nameBytes = concatBytes([
+      sender,
+      claimer,
+      encodeBincodeStringVec(["https://relay.kovanica.org"]),
+    ]);
+    const nameLog = decodeContractLog(`0x${bytesToHex(nameBytes)}`, "name");
+    expect(nameLog.kind).toBe("name");
+    expect(nameLog.record.relayEndpoints).toEqual(["https://relay.kovanica.org"]);
+
+    // 8. nft_metadata
+    const nftBytes = concatBytes([
+      encodeBincodeString("Kovanica NFT"),
+      encodeBincodeString("KNFT"),
+      encodeBincodeString("ipfs://base/"),
+      sender,
+      claimer,
+      u64le(0n),
+    ]);
+    const nftLog = decodeContractLog(nftBytes, "nft_metadata");
+    expect(nftLog.kind).toBe("nft_metadata");
+    expect(nftLog.record.symbol).toBe("KNFT");
+
+    // 9. escrow
+    const escrowBytes = concatBytes([
+      sender,
+      encodeBincodeBytes32Vec([sender, claimer]),
+      Uint8Array.of(2),
+      encodeBincodeBytes32Vec([sender]),
+      u128le(99_000n),
+      u64le(500_000n),
+      Uint8Array.of(0),
+      Uint8Array.of(0),
+    ]);
+    const escrowLog = decodeContractLog(escrowBytes, "escrow");
+    expect(escrowLog.kind).toBe("escrow");
+    expect(escrowLog.record.status).toBe("open");
+    expect(escrowLog.record.amount).toBe(99_000n);
+  });
+
+  it("fails closed with KovanicaDecodeError on unknown kind or malformed log data", () => {
+    expectDecodeError(
+      () => decodeContractLog("0x00", "unknown_kind" as never),
+      "INVALID_INPUT",
+    );
+    expectDecodeError(() => decodeContractLog("0x1234", "htlc"), "TRUNCATED");
+    expectDecodeError(() => decodeContractLog("0xzz", "name"), "INVALID_INPUT");
   });
 });
