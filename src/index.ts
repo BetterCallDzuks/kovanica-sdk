@@ -273,3 +273,19 @@ export {
   type TokenTransferParams,
   type VaultCreateParams,
 } from "./facades";
+
+// Paginated Contract Log History & Typed Event Streams
+export {
+  DEFAULT_LOG_HISTORY_CHUNK_SIZE,
+  type ContractEventSubscriptionHandle,
+  type ContractLogEntry,
+  type ContractLogHistoryResult,
+  type DecodedContractEvent,
+  type GetContractLogHistoryOptions,
+  type GetLogsClient,
+  type GetLogsFilter,
+  type SubscribeContractEventsOptions,
+  type SubscribeLogsWsClient,
+  getContractLogHistory,
+  subscribeContractEvents,
+} from "./events";
