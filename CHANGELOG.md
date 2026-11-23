@@ -2,6 +2,27 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
+## [0.5.0] - 2026-11-23
+
+### Added
+- **Multi-Endpoint Failover RPC Transport & URL Sanitization** (`transport.ts`, `client.ts`):
+  - Added `FailoverHttpTransport`, `createFailoverHttpTransport`, and `createFailoverClient` for health-tracked multi-endpoint RPC failover with structured failover telemetry.
+  - Added `sanitizeRpcUrl` to strip credentials and sensitive query parameters before logging or emitting endpoint diagnostics.
+- **Fee-Buffer Estimation & Abortable Finality Watching** (`finality.ts`):
+  - Added `applyFeeBuffer` and `estimateTxFeeWithBuffer` for basis-point fee safety buffering with optional floor/ceiling bounds.
+  - Added `waitForTransactionFinality` for abortable receipt and confirmation-depth finality tracking with progress callbacks.
+- **Offline Signed Call Transaction Decoder, Ed25519 Verification & RPC Node Probe** (`tx-decode.ts`, `probe.ts`):
+  - Added `decodeSignedCallTransaction`, `verifyCallTransactionSignature`, and `verifyEd25519` for offline inspection and RFC 8032 Ed25519 signature verification of wire Call transactions.
+  - Added `probeRpcNode` to inspect node RPC capabilities, chain metadata, and network-tag headers.
+- **Offline Transfer Transaction Signer/Verifier & Address Inspector** (`transfer-tx.ts`, `address-inspect.ts`):
+  - Added `signTransferTransaction`, `decodeSignedTransferTransaction`, and `verifyTransferTransactionSignature` for offline wire Transfer transaction creation, decoding, and signature verification.
+  - Added `inspectAddress` and `normalizeAddressList` for address format/checksum diagnostics, chain-policy inspection, and deduplicated list normalization.
+- **Universal Offline Transaction Auto-Decoder & Air-Gapped Envelopes** (`tx-auto-decode.ts`, `airgap.ts`):
+  - Added `peekTransactionVariant`, `decodeSignedTransactionAuto`, and `verifySignedTransactionAuto` to inspect, decode, and verify signed wire transactions without prior variant knowledge.
+  - Added `encodeAirgapTxEnvelope` and `decodeAirgapTxEnvelope` for portable, versioned air-gapped transaction signing/broadcast envelopes.
+- **Mempool Fee Statistics & Fee Recommendations** (`mempool-stats.ts`, `client.ts`):
+  - Added `KovanicaClient.getMempoolStats()`, `parseMempoolFeeStats`, and `computeFeeRecommendations` for typed `kovanica_getMempoolStats` parsing and priority fee tier recommendations.
+
 ## [0.4.0] - 2026-11-23
 
 ### Added

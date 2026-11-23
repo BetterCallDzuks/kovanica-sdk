@@ -379,3 +379,13 @@ export {
   decodeAirgapTxEnvelope,
   encodeAirgapTxEnvelope,
 } from "./airgap";
+
+// Mempool Fee Statistics & Fee-Tier Recommendations
+export {
+  type FeeRecommendationOptions,
+  type FeeRecommendationTier,
+  type FeeRecommendations,
+  type MempoolFeeStats,
+  computeFeeRecommendations,
+  parseMempoolFeeStats,
+} from "./mempool-stats";
