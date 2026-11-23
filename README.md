@@ -102,7 +102,7 @@ console.log(isValidAddress("0x1234...", CHAIN_IDS.TESTNET)); // false (legacy he
 console.log(isValidAddress("0x1234...", CHAIN_IDS.DEVNET)); // true (if valid 32-byte hex)
 ```
 
-### 4. Timeout and Cancellation with `AbortSignal`
+### 4. Timeout, Cancellation (`AbortSignal`), Retry Backoff & Multi-Endpoint Failover
 
 ```typescript
 const controller = new AbortController();
@@ -126,6 +126,32 @@ try {
   clearTimeout(timeout);
 }
 ```
+
+#### Opt-In Retry Backoff & Multi-Endpoint Failover
+
+`KovanicaClient` supports ordered fallback endpoints (`rpcUrls`) and opt-in jittered exponential backoff (`retry`) for transient transport, timeout, and HTTP 5xx errors:
+
+```typescript
+import { KovanicaClient } from "kovanica-sdk";
+
+const resilientClient = new KovanicaClient({
+  rpcUrl: "http://127.0.0.1:8545/rpc",
+  rpcUrls: [
+    "http://127.0.0.1:8546/rpc",
+    "http://127.0.0.1:8547/rpc",
+  ],
+  retry: {
+    maxRetries: 3,
+    initialDelayMs: 100,
+    maxDelayMs: 2_000,
+    jitterRatio: 0.2,
+  },
+});
+```
+
+- **Idempotent-only by default:** Only read-only methods in `DEFAULT_IDEMPOTENT_RPC_METHODS` (such as `kovanica_call`, `kovanica_getStorageAt`, `kovanica_estimateFee`, `kovanica_blockNumber`, `kovanica_getBalance`, `kovanica_getTransactionReceipt`, etc.) are retried. State-mutating `kovanica_sendRawTransaction` is **never** retried unless explicitly added to `retry.retryableMethods`.
+- **Failover rotation:** When multiple `rpcUrls` are configured (primary `url`/`rpcUrl` first, deduplicated), transient errors rotate to the next endpoint. If `retry` is omitted on a single-endpoint client, `maxRetries` defaults to `0`.
+- **No retry on JSON-RPC errors or abort:** Application-level `KovanicaRpcError` responses (e.g., `-32000` revert, `-32602` invalid params) and `AbortSignal` cancellations fail immediately without retrying.
 
 ### 5. HD Wallet Key Derivation (BIP-39 / SLIP-0010)
 

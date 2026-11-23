@@ -16,6 +16,41 @@ export interface RequestOptions {
   timeoutMs?: number;
 }
 
+/**
+ * Optional retry & exponential-backoff configuration for transient RPC transport failures.
+ */
+export interface RpcRetryConfig {
+  /**
+   * Maximum number of retry attempts after the initial call fails.
+   * Defaults to `0` for single-endpoint clients (opt-in) so existing tests remain deterministic.
+   * When multiple `rpcUrls` are configured and `maxRetries` is omitted, defaults to
+   * `rpcUrls.length - 1` to enable automatic failover across fallback endpoints.
+   */
+  maxRetries?: number;
+  /**
+   * Base backoff delay in milliseconds before the first retry (attempt 0).
+   * Defaults to `100` ms when `retry` is configured (or `0` ms for implicit multi-endpoint failover).
+   */
+  initialDelayMs?: number;
+  /**
+   * Upper bound in milliseconds for exponential backoff delay.
+   * Defaults to `5_000` ms.
+   */
+  maxDelayMs?: number;
+  /**
+   * Jitter ratio in `[0, 1]` applied to the exponential backoff delay.
+   * At ratio `r`, delay is scaled by a random factor in `[1 - r, 1 + r]` (clamped to `[0, maxDelayMs]`).
+   * Defaults to `0.2`.
+   */
+  jitterRatio?: number;
+  /**
+   * Explicit allowlist of JSON-RPC method names eligible for automatic retry/failover.
+   * Defaults to `DEFAULT_IDEMPOTENT_RPC_METHODS` (read-only idempotent methods only;
+   * never includes state-mutating `kovanica_sendRawTransaction` unless explicitly listed).
+   */
+  retryableMethods?: ReadonlyArray<string>;
+}
+
 export interface JsonRpcRequest<TParams = unknown> {
   jsonrpc: "2.0";
   method: string;

@@ -3,6 +3,12 @@
  * Provides typed, read-only methods for interacting with a Kovanica JSON-RPC node.
  */
 
+import {
+  KovanicaAbortError,
+  KovanicaRpcError,
+  KovanicaTimeoutError,
+  KovanicaTransportError,
+} from "./errors";
 import { HttpTransport, type HttpTransportOptions, type Transport } from "./transport";
 import type {
   BlockResponse,
@@ -10,6 +16,7 @@ import type {
   LeaderSlot,
   MiningInfo,
   RequestOptions,
+  RpcRetryConfig,
   SyncPeerStatus,
   SyncStatus,
   TransactionKind,
@@ -54,10 +61,183 @@ import {
 } from "./decoders";
 import { getPublicKey } from "./wallet";
 
-export interface KovanicaClientOptions extends HttpTransportOptions {
-  /** Optional custom transport. If provided, `url` and transport options are ignored. */
+export type { RpcRetryConfig } from "./types";
+
+/**
+ * Read-only, idempotent JSON-RPC methods eligible for automatic retry and multi-endpoint failover
+ * on transient transport, timeout, or HTTP 5xx errors.
+ *
+ * State-mutating methods such as `kovanica_sendRawTransaction` are intentionally excluded.
+ */
+export const DEFAULT_IDEMPOTENT_RPC_METHODS: ReadonlyArray<string> = Object.freeze([
+  "kovanica_chainId",
+  "kovanica_blockNumber",
+  "kovanica_getBalance",
+  "kovanica_getNonce",
+  "kovanica_estimateFee",
+  "kovanica_call",
+  "kovanica_getStorageAt",
+  "kovanica_getCode",
+  "kovanica_getTransactionByHash",
+  "kovanica_getTransactionReceipt",
+  "kovanica_getPendingTransactions",
+  "kovanica_getLogs",
+  "kovanica_getBlockByHash",
+  "kovanica_getBlockByNumber",
+  "kovanica_getBlockByHeight",
+  "kovanica_getNodeInfo",
+  "kovanica_syncStatus",
+  "kovanica_getMiningInfo",
+  "kovanica_getDagTips",
+  "kovanica_getValidators",
+  "kovanica_getStake",
+  "kovanica_getRewards",
+  "kovanica_getLeaderSchedule",
+]);
+
+const DEFAULT_RETRY_INITIAL_DELAY_MS = 100;
+const DEFAULT_RETRY_MAX_DELAY_MS = 5_000;
+const DEFAULT_RETRY_JITTER_RATIO = 0.2;
+
+/**
+ * Computes a bounded, jittered exponential backoff delay in milliseconds for a 0-indexed
+ * retry attempt (`attempt = 0` for the first retry).
+ */
+export function computeRetryDelayMs(
+  attempt: number,
+  options?: Pick<RpcRetryConfig, "initialDelayMs" | "maxDelayMs" | "jitterRatio">,
+  randomFn: () => number = Math.random,
+): number {
+  const safeAttempt = Number.isFinite(attempt) && attempt > 0 ? Math.floor(attempt) : 0;
+  const initialDelayMs = Math.max(0, options?.initialDelayMs ?? DEFAULT_RETRY_INITIAL_DELAY_MS);
+  const maxDelayMs = Math.max(initialDelayMs, options?.maxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS);
+  const rawJitter = options?.jitterRatio ?? DEFAULT_RETRY_JITTER_RATIO;
+  const jitterRatio = Number.isFinite(rawJitter) ? Math.min(1, Math.max(0, rawJitter)) : 0;
+
+  if (initialDelayMs === 0 || maxDelayMs === 0) {
+    return 0;
+  }
+
+  const exp = Math.min(safeAttempt, 30);
+  const baseDelay = Math.min(maxDelayMs, initialDelayMs * Math.pow(2, exp));
+
+  if (jitterRatio === 0) {
+    return Math.round(baseDelay);
+  }
+
+  const rand = randomFn();
+  const clampedRand = Number.isFinite(rand) ? Math.min(1, Math.max(0, rand)) : 0.5;
+  const factor = 1 + (clampedRand * 2 - 1) * jitterRatio;
+  const jittered = Math.min(maxDelayMs, Math.max(0, baseDelay * factor));
+  return Math.round(jittered);
+}
+
+function isTransientRpcError(err: unknown): boolean {
+  if (err instanceof KovanicaAbortError) {
+    return false;
+  }
+  if (err instanceof KovanicaRpcError) {
+    return false;
+  }
+  if (err instanceof KovanicaTimeoutError) {
+    return true;
+  }
+  if (err instanceof KovanicaTransportError) {
+    if (err.status !== undefined) {
+      return (
+        (err.status >= 500 && err.status < 600) ||
+        err.status === 429 ||
+        err.status === 408
+      );
+    }
+    return true;
+  }
+  return false;
+}
+
+function sleepWithAbort(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new KovanicaAbortError("Request was aborted during retry backoff"));
+  }
+  if (delayMs <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new KovanicaAbortError("Request was aborted during retry backoff"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function resolveRpcUrls(options: KovanicaClientOptions): string[] {
+  const candidates: string[] = [];
+
+  if (options.url !== undefined) {
+    if (typeof options.url !== "string" || options.url.trim().length === 0) {
+      throw new Error("KovanicaClient url must be a non-empty string");
+    }
+    candidates.push(options.url.trim());
+  }
+
+  if (options.rpcUrl !== undefined) {
+    if (typeof options.rpcUrl !== "string" || options.rpcUrl.trim().length === 0) {
+      throw new Error("KovanicaClient rpcUrl must be a non-empty string");
+    }
+    candidates.push(options.rpcUrl.trim());
+  }
+
+  if (options.rpcUrls !== undefined) {
+    for (const entry of options.rpcUrls) {
+      if (typeof entry !== "string" || entry.trim().length === 0) {
+        throw new Error("KovanicaClient rpcUrls entries must be non-empty strings");
+      }
+      candidates.push(entry.trim());
+    }
+  }
+
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const url of candidates) {
+    if (!seen.has(url)) {
+      seen.add(url);
+      deduped.push(url);
+    }
+  }
+
+  if (deduped.length === 0) {
+    throw new Error("KovanicaClient requires at least one valid RPC URL or a custom transport");
+  }
+
+  return deduped;
+}
+
+export interface KovanicaClientOptions extends Omit<HttpTransportOptions, "url"> {
+  /** Primary JSON-RPC endpoint URL (e.g. "http://127.0.0.1:8545/rpc"). */
+  url?: string;
+  /** Alias for `url` (primary JSON-RPC endpoint URL). */
+  rpcUrl?: string;
+  /**
+   * Ordered list of fallback RPC URLs. Primary `url`/`rpcUrl` is placed first if provided,
+   * and the combined list is deduplicated in order. Fails closed if no valid URL is provided.
+   */
+  rpcUrls?: ReadonlyArray<string>;
+  /**
+   * Optional retry and exponential-backoff configuration for transient transport/timeout/5xx errors.
+   * Defaults to `maxRetries = 0` for single-endpoint clients (opt-in).
+   */
+  retry?: RpcRetryConfig;
+  /** Optional custom transport. If provided, `url`, `rpcUrl`, and `rpcUrls` are ignored. */
   transport?: Transport;
 }
+
+/** Alias for {@link KovanicaClientOptions}. */
+export type KovanicaClientConfig = KovanicaClientOptions;
 
 /**
  * Safely parse an optional quantity into a bigint.
@@ -112,26 +292,134 @@ export function isNodeSynced(status: SyncStatus): boolean | undefined {
 
 export class KovanicaClient {
   readonly transport: Transport;
+  readonly rpcUrls: ReadonlyArray<string>;
+  private readonly transports: ReadonlyArray<Transport>;
+  private activeEndpointIndex = 0;
+  private readonly maxRetries: number;
+  private readonly retryBackoff: Pick<RpcRetryConfig, "initialDelayMs" | "maxDelayMs" | "jitterRatio">;
+  private readonly retryableMethods: ReadonlySet<string>;
 
   constructor(optionsOrUrl: string | KovanicaClientOptions) {
     if (typeof optionsOrUrl === "string") {
-      this.transport = new HttpTransport({ url: optionsOrUrl });
-    } else if (optionsOrUrl.transport) {
-      this.transport = optionsOrUrl.transport;
-    } else {
-      this.transport = new HttpTransport(optionsOrUrl);
+      const httpTransport = new HttpTransport({ url: optionsOrUrl });
+      this.transport = httpTransport;
+      this.transports = [httpTransport];
+      this.rpcUrls = Object.freeze([httpTransport.url]);
+      this.maxRetries = 0;
+      this.retryBackoff = {
+        initialDelayMs: DEFAULT_RETRY_INITIAL_DELAY_MS,
+        maxDelayMs: DEFAULT_RETRY_MAX_DELAY_MS,
+        jitterRatio: DEFAULT_RETRY_JITTER_RATIO,
+      };
+      this.retryableMethods = new Set(DEFAULT_IDEMPOTENT_RPC_METHODS);
+      return;
     }
+
+    if (optionsOrUrl.transport) {
+      this.transport = optionsOrUrl.transport;
+      this.transports = [optionsOrUrl.transport];
+      this.rpcUrls = Object.freeze([]);
+    } else {
+      const urls = resolveRpcUrls(optionsOrUrl);
+      const {
+        url: _url,
+        rpcUrl: _rpcUrl,
+        rpcUrls: _rpcUrls,
+        retry: _retry,
+        transport: _transport,
+        ...httpBaseOptions
+      } = optionsOrUrl;
+      const builtTransports = urls.map(
+        (endpointUrl) => new HttpTransport({ ...httpBaseOptions, url: endpointUrl }),
+      );
+      this.transports = builtTransports;
+      this.transport = builtTransports[0]!;
+      this.rpcUrls = Object.freeze(urls);
+    }
+
+    const retry = optionsOrUrl.retry;
+    if (retry?.maxRetries !== undefined) {
+      if (!Number.isInteger(retry.maxRetries) || retry.maxRetries < 0) {
+        throw new RangeError("retry.maxRetries must be a non-negative integer");
+      }
+      this.maxRetries = retry.maxRetries;
+    } else {
+      this.maxRetries = this.transports.length > 1 ? this.transports.length - 1 : 0;
+    }
+
+    if (retry?.initialDelayMs !== undefined) {
+      if (!Number.isFinite(retry.initialDelayMs) || retry.initialDelayMs < 0) {
+        throw new RangeError("retry.initialDelayMs must be a non-negative finite number");
+      }
+    }
+    if (retry?.maxDelayMs !== undefined) {
+      if (!Number.isFinite(retry.maxDelayMs) || retry.maxDelayMs < 0) {
+        throw new RangeError("retry.maxDelayMs must be a non-negative finite number");
+      }
+    }
+    if (retry?.jitterRatio !== undefined) {
+      if (!Number.isFinite(retry.jitterRatio) || retry.jitterRatio < 0 || retry.jitterRatio > 1) {
+        throw new RangeError("retry.jitterRatio must be a finite number between 0 and 1");
+      }
+    }
+
+    const defaultInitialDelay = retry === undefined && this.transports.length > 1
+      ? 0
+      : DEFAULT_RETRY_INITIAL_DELAY_MS;
+
+    this.retryBackoff = {
+      initialDelayMs: retry?.initialDelayMs ?? defaultInitialDelay,
+      maxDelayMs: retry?.maxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS,
+      jitterRatio: retry?.jitterRatio ?? DEFAULT_RETRY_JITTER_RATIO,
+    };
+
+    this.retryableMethods = new Set(retry?.retryableMethods ?? DEFAULT_IDEMPOTENT_RPC_METHODS);
   }
 
   /**
    * Generic low-level JSON-RPC call.
+   * When retry or multi-endpoint failover is configured, transient transport/timeout/5xx errors
+   * on allowlisted idempotent methods rotate to the next endpoint and retry with bounded jittered
+   * exponential backoff.
    */
   async call<TResult = unknown>(
     method: string,
     params?: unknown,
     options?: RequestOptions,
   ): Promise<TResult> {
-    return this.transport.send<TResult>(method, params, options);
+    const canRetryMethod = this.retryableMethods.has(method);
+    const maxRetries = canRetryMethod ? this.maxRetries : 0;
+
+    let attempt = 0;
+    while (true) {
+      if (options?.signal?.aborted) {
+        throw new KovanicaAbortError("Request was already aborted");
+      }
+
+      const endpointIndex = this.activeEndpointIndex;
+      const activeTransport = this.transports[endpointIndex]!;
+
+      try {
+        return await activeTransport.send<TResult>(method, params, options);
+      } catch (err: unknown) {
+        if (attempt >= maxRetries || !isTransientRpcError(err)) {
+          throw err;
+        }
+
+        if (this.transports.length > 1) {
+          this.activeEndpointIndex = (endpointIndex + 1) % this.transports.length;
+        }
+
+        const delayMs = computeRetryDelayMs(attempt, this.retryBackoff);
+        attempt += 1;
+
+        if (delayMs > 0) {
+          await sleepWithAbort(delayMs, options?.signal);
+        } else if (options?.signal?.aborted) {
+          throw new KovanicaAbortError("Request was aborted during retry backoff");
+        }
+      }
+    }
   }
 
   // ==========================================================================
