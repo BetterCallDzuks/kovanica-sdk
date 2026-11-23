@@ -315,3 +315,19 @@ export {
   estimateTxFeeWithBuffer,
   waitForTransactionFinality,
 } from "./finality";
+
+// Offline Signed Call Tx Decoder & Ed25519 Verifier
+export {
+  type DecodeSignedCallTransactionOptions,
+  type DecodedSignedCallTransaction,
+  decodeSignedCallTransaction,
+  verifyCallTransactionSignature,
+  verifyEd25519,
+} from "./tx-decode";
+
+// RPC Node Capability & Network-Tag Header Probe
+export {
+  type RpcNodeProbeOptions,
+  type RpcNodeProbeResult,
+  probeRpcNode,
+} from "./probe";
