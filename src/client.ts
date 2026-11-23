@@ -10,6 +10,8 @@ import {
   KovanicaTransportError,
 } from "./errors";
 import {
+  FailoverHttpTransport,
+  type FailoverHttpTransportOptions,
   HttpTransport,
   type HttpTransportOptions,
   type Transport,
@@ -1312,4 +1314,16 @@ function mapBlockResponse(raw: RawBlockResponse): BlockResponse {
     statements: raw.statements,
     signature: raw.signature,
   };
+}
+
+/**
+ * Creates a `KovanicaClient` backed by a multi-endpoint `FailoverHttpTransport`.
+ */
+export function createFailoverClient(
+  urls: readonly string[],
+  options?: Omit<FailoverHttpTransportOptions, "urls"> & { retry?: RpcRetryConfig },
+): KovanicaClient {
+  const { retry, ...transportOptions } = options ?? {};
+  const transport = new FailoverHttpTransport({ ...transportOptions, urls });
+  return new KovanicaClient({ transport, retry });
 }
