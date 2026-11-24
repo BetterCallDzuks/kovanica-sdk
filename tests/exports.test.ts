@@ -64,6 +64,9 @@ const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKi
   ["parseBip44Path", "function"],
   ["validateBip44Path", "function"],
   ["createWatchOnlyAccount", "function"],
+  ["getAccountTxHistory", "function"],
+  ["parseAccountTxHistoryEntry", "function"],
+  ["DEFAULT_ACCOUNT_TX_HISTORY_MAX_PAGES", "number"],
 ];
 
 function assertPublicExportSurface(mod: Record<string, unknown>, label: string): void {
