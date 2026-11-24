@@ -25,8 +25,15 @@ import {
   buildHtlcCreateCall,
   buildNameRegisterCall,
   buildNftMintCall,
+  buildRwaBurnCall,
+  buildRwaCreateCall,
+  buildRwaFreezeCall,
+  buildRwaMintCall,
+  buildRwaTransferCall,
+  buildRwaUpdateMetadataCall,
   buildTokenTransferCall,
   buildVaultCreateCall,
+  type RwaAssetClass,
   bytesToHex,
   concatBytes,
   dryRunCall,
@@ -505,6 +512,170 @@ export class NftClient extends ContractFacade {
     const call: CallTxKindInput = {
       contract: this.contractBytes,
       method: "nft_mint",
+      args,
+      ...(params.value !== undefined ? { value: params.value } : {}),
+      ...(params.gasLimit !== undefined ? { gasLimit: params.gasLimit } : {}),
+    };
+    return estimateAndBuildCall(this.client, call, options);
+  }
+}
+
+// --- RWA (KVP-106) Facade ---
+
+export interface RwaCreateParams {
+  name: string;
+  symbol: string;
+  assetClass: RwaAssetClass;
+  uniqueId: string;
+  version: number;
+  jurisdiction?: string;
+  metadataHash: Uint8Array | string;
+  metadataUri?: string;
+  legalUri?: string;
+  custodyUri?: string;
+  decimals: number;
+  maxSupply: bigint | number;
+  initialSupply: bigint | number;
+  value?: bigint | number;
+  gasLimit?: bigint | number;
+}
+
+export interface RwaMintParams {
+  to: Uint8Array | string;
+  amount: bigint | number;
+  value?: bigint | number;
+  gasLimit?: bigint | number;
+}
+
+export interface RwaTransferParams {
+  to: Uint8Array | string;
+  amount: bigint | number;
+  value?: bigint | number;
+  gasLimit?: bigint | number;
+}
+
+export interface RwaFreezeParams {
+  account: Uint8Array | string;
+  frozen: boolean;
+  value?: bigint | number;
+  gasLimit?: bigint | number;
+}
+
+export interface RwaUpdateMetadataParams {
+  metadataHash: Uint8Array | string;
+  metadataUri?: string;
+  legalUri?: string;
+  custodyUri?: string;
+  value?: bigint | number;
+  gasLimit?: bigint | number;
+}
+
+/**
+ * Typed client facade for a deployed KVP-106 `kovanica-rwa` contract.
+ */
+export class RwaClient extends ContractFacade {
+  constructor(client: ContractFacadeClient, contract: Uint8Array | string) {
+    super(client, contract, "RwaClient");
+  }
+
+  async prepareCreate(
+    params: RwaCreateParams,
+    options?: EstimateAndBuildCallOptions,
+  ): Promise<PreparedCallTransaction> {
+    const hashBytes =
+      typeof params.metadataHash === "string"
+        ? hexToBytes(params.metadataHash.replace(/^0x/, ""))
+        : params.metadataHash;
+    const args = buildRwaCreateCall({
+      ...params,
+      metadataHash: hashBytes,
+    });
+    const call: CallTxKindInput = {
+      contract: this.contractBytes,
+      method: "rwa_create",
+      args,
+      ...(params.value !== undefined ? { value: params.value } : {}),
+      ...(params.gasLimit !== undefined ? { gasLimit: params.gasLimit } : {}),
+    };
+    return estimateAndBuildCall(this.client, call, options);
+  }
+
+  async prepareMint(
+    params: RwaMintParams,
+    options?: EstimateAndBuildCallOptions,
+  ): Promise<PreparedCallTransaction> {
+    const toBytes = parseBytes32Address(params.to, "RwaClient.prepareMint to");
+    const args = buildRwaMintCall(toBytes, params.amount);
+    const call: CallTxKindInput = {
+      contract: this.contractBytes,
+      method: "rwa_mint",
+      args,
+      ...(params.value !== undefined ? { value: params.value } : {}),
+      ...(params.gasLimit !== undefined ? { gasLimit: params.gasLimit } : {}),
+    };
+    return estimateAndBuildCall(this.client, call, options);
+  }
+
+  async prepareTransfer(
+    params: RwaTransferParams,
+    options?: EstimateAndBuildCallOptions,
+  ): Promise<PreparedCallTransaction> {
+    const toBytes = parseBytes32Address(params.to, "RwaClient.prepareTransfer to");
+    const args = buildRwaTransferCall(toBytes, params.amount);
+    const call: CallTxKindInput = {
+      contract: this.contractBytes,
+      method: "rwa_transfer",
+      args,
+      ...(params.value !== undefined ? { value: params.value } : {}),
+      ...(params.gasLimit !== undefined ? { gasLimit: params.gasLimit } : {}),
+    };
+    return estimateAndBuildCall(this.client, call, options);
+  }
+
+  async prepareBurn(
+    amount: bigint | number,
+    options?: EstimateAndBuildCallOptions,
+  ): Promise<PreparedCallTransaction> {
+    const args = buildRwaBurnCall(amount);
+    const call: CallTxKindInput = {
+      contract: this.contractBytes,
+      method: "rwa_burn",
+      args,
+    };
+    return estimateAndBuildCall(this.client, call, options);
+  }
+
+  async prepareFreeze(
+    params: RwaFreezeParams,
+    options?: EstimateAndBuildCallOptions,
+  ): Promise<PreparedCallTransaction> {
+    const accountBytes = parseBytes32Address(params.account, "RwaClient.prepareFreeze account");
+    const args = buildRwaFreezeCall(accountBytes, params.frozen);
+    const call: CallTxKindInput = {
+      contract: this.contractBytes,
+      method: "rwa_freeze",
+      args,
+      ...(params.value !== undefined ? { value: params.value } : {}),
+      ...(params.gasLimit !== undefined ? { gasLimit: params.gasLimit } : {}),
+    };
+    return estimateAndBuildCall(this.client, call, options);
+  }
+
+  async prepareUpdateMetadata(
+    params: RwaUpdateMetadataParams,
+    options?: EstimateAndBuildCallOptions,
+  ): Promise<PreparedCallTransaction> {
+    const hashBytes =
+      typeof params.metadataHash === "string"
+        ? hexToBytes(params.metadataHash.replace(/^0x/, ""))
+        : params.metadataHash;
+    const args = buildRwaUpdateMetadataCall({
+      ...params,
+      metadataHash: hashBytes,
+    });
+    const call: CallTxKindInput = {
+      contract: this.contractBytes,
+      method: "rwa_update_metadata",
       args,
       ...(params.value !== undefined ? { value: params.value } : {}),
       ...(params.gasLimit !== undefined ? { gasLimit: params.gasLimit } : {}),
