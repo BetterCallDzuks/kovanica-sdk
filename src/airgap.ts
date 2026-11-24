@@ -7,6 +7,7 @@
  */
 
 import { blake3 } from "@noble/hashes/blake3.js";
+import { inspectAddress } from "./address-inspect";
 import { CHAIN_IDS, NETWORK_TAGS } from "./chains";
 import { bytesToHex, hexToBytes } from "./contracts";
 import { KovanicaDecodeError } from "./decoders";
@@ -553,4 +554,658 @@ export function decodeAirgapTxEnvelope(
         rawTxHex,
         checksumHex: raw.checksumHex,
       };
+}
+
+// --- Air-Gapped Multisig Approval Bundle & Quorum Checker ---
+
+export const MULTISIG_BUNDLE_FORMAT = "kovanica-multisig-bundle-v1" as const;
+export const MULTISIG_BUNDLE_VERSION = 1 as const;
+
+export type MultisigBundleChainId =
+  | typeof CHAIN_IDS.MAINNET
+  | typeof CHAIN_IDS.TESTNET
+  | typeof CHAIN_IDS.DEVNET;
+
+export interface MultisigQuorumInput {
+  signers: readonly string[];
+  approvals: readonly string[];
+  threshold: number;
+}
+
+export interface MultisigQuorumResult {
+  quorumReached: boolean;
+  approvedCount: number;
+  threshold: number;
+  remainingNeeded: number;
+  uniqueSigners: string[];
+  validApprovals: string[];
+  unknownApprovals: string[];
+  duplicateApprovals: string[];
+}
+
+export interface MultisigApprovalEntry {
+  /** Normalized PRO-21 signer address. */
+  signer: string;
+  /** Normalized lowercase `0x`-prefixed 64-byte Ed25519 signature hex. */
+  signatureHex: string;
+  /** Optional Unix timestamp in milliseconds when the approval was signed. */
+  signedAtMs?: number;
+}
+
+export interface MultisigProposalBundle {
+  format: typeof MULTISIG_BUNDLE_FORMAT;
+  version: typeof MULTISIG_BUNDLE_VERSION;
+  chainId: MultisigBundleChainId;
+  multisigAddress: string;
+  proposalId: string;
+  threshold: number;
+  signers: string[];
+  approvals: MultisigApprovalEntry[];
+  payloadHex?: string;
+  description?: string;
+}
+
+export interface EncodeMultisigProposalBundleInput {
+  version?: typeof MULTISIG_BUNDLE_VERSION;
+  chainId: MultisigBundleChainId;
+  multisigAddress: string;
+  proposalId: string;
+  threshold: number;
+  signers: readonly string[];
+  approvals: readonly MultisigApprovalEntry[];
+  payloadHex?: string;
+  description?: string;
+}
+
+export interface DecodedMultisigProposalBundle {
+  bundle: MultisigProposalBundle;
+  quorum: MultisigQuorumResult;
+}
+
+const VALID_MULTISIG_CHAIN_IDS: ReadonlySet<number> = new Set<number>([
+  CHAIN_IDS.MAINNET,
+  CHAIN_IDS.TESTNET,
+  CHAIN_IDS.DEVNET,
+]);
+
+const FORBIDDEN_SECRET_FIELD_PATTERNS: readonly RegExp[] = [
+  /^privatekey$/i,
+  /^privkey$/i,
+  /^rawprivatekey$/i,
+  /^secretkey$/i,
+  /^secret$/i,
+  /^mnemonic$/i,
+  /^seed$/i,
+  /^seedphrase$/i,
+  /^seedhex$/i,
+  /^passphrase$/i,
+  /^password$/i,
+  /^keystore$/i,
+  /^xprv$/i,
+  /^signingkey$/i,
+  /^spendingkey$/i,
+  /^masterkey$/i,
+  /^sk$/i,
+];
+
+function isForbiddenSecretKeyName(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[-_\s]/g, "");
+  return FORBIDDEN_SECRET_FIELD_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function assertNoSecretFields(value: unknown, path = "bundle"): void {
+  if (value === null || typeof value !== "object") {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      assertNoSecretFields(value[i], `${path}[${i}]`);
+    }
+    return;
+  }
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (isForbiddenSecretKeyName(key)) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `Forbidden secret/private key field '${key}' at ${path}.${key} is not permitted in air-gapped multisig bundles`,
+        { field: `${path}.${key}` },
+      );
+    }
+    assertNoSecretFields(nested, `${path}.${key}`);
+  }
+}
+
+interface ValidatedPro21Address {
+  canonical: string;
+  payloadKey: string;
+}
+
+function validatePro21Address(
+  address: unknown,
+  field: string,
+  expectedChainId?: MultisigBundleChainId,
+): ValidatedPro21Address {
+  if (typeof address !== "string") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      `Invalid ${field}: expected a PRO-21 address string`,
+      { field },
+    );
+  }
+  const inspected = inspectAddress(address, expectedChainId);
+  if (
+    !inspected.valid ||
+    (inspected.format !== "pro21-mainnet" && inspected.format !== "pro21-testnet") ||
+    !inspected.canonicalMainnet ||
+    !inspected.canonicalTestnet
+  ) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      `Invalid PRO-21 address in ${field}: ${inspected.error ?? "expected canonical PRO-21 address"}`,
+      { field },
+    );
+  }
+  const canonical =
+    inspected.format === "pro21-testnet"
+      ? inspected.canonicalTestnet
+      : inspected.canonicalMainnet;
+  return {
+    canonical,
+    payloadKey: inspected.canonicalMainnet,
+  };
+}
+
+function validateMultisigChainId(chainId: unknown): MultisigBundleChainId {
+  if (
+    typeof chainId !== "number" ||
+    !Number.isSafeInteger(chainId) ||
+    !VALID_MULTISIG_CHAIN_IDS.has(chainId)
+  ) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      `Invalid multisig bundle chainId: expected 1 (Mainnet), 2 (Testnet), or 3 (Devnet), got ${String(chainId)}`,
+      { field: "chainId" },
+    );
+  }
+  return chainId as MultisigBundleChainId;
+}
+
+function validateThreshold(threshold: unknown, signerCount: number): number {
+  if (
+    typeof threshold !== "number" ||
+    !Number.isSafeInteger(threshold) ||
+    threshold < 1 ||
+    threshold > signerCount
+  ) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      `Invalid multisig threshold: expected integer in range 1..${signerCount}, got ${String(threshold)}`,
+      { field: "threshold" },
+    );
+  }
+  return threshold;
+}
+
+function normalizeSignatureHex(
+  signatureHex: unknown,
+  field: string,
+  strictCanonical: boolean,
+): string {
+  if (typeof signatureHex !== "string") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      `Invalid ${field}: expected a 64-byte hex signature string`,
+      { field },
+    );
+  }
+  if (strictCanonical) {
+    if (!/^0x[0-9a-f]{128}$/.test(signatureHex)) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `Invalid ${field}: expected lowercase 0x-prefixed 64-byte (128 hex chars) signature`,
+        { field },
+      );
+    }
+    return signatureHex;
+  }
+  const trimmed = signatureHex.trim();
+  const clean =
+    trimmed.startsWith("0x") || trimmed.startsWith("0X")
+      ? trimmed.slice(2)
+      : trimmed;
+  if (clean.length !== 128 || !/^[0-9a-fA-F]{128}$/.test(clean)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      `Invalid ${field}: expected 64 bytes (128 hex chars), got ${clean.length} hex char(s)`,
+      { field },
+    );
+  }
+  return `0x${bytesToHex(hexToBytes(clean))}`;
+}
+
+function normalizePayloadHex(
+  payloadHex: unknown,
+  strictCanonical: boolean,
+): string | undefined {
+  if (payloadHex === undefined) {
+    return undefined;
+  }
+  if (typeof payloadHex !== "string") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Invalid payloadHex: expected a hex string",
+      { field: "payloadHex" },
+    );
+  }
+  if (strictCanonical) {
+    if (!/^0x[0-9a-f]+$/.test(payloadHex) || payloadHex.length % 2 !== 0) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        "Invalid payloadHex: expected lowercase 0x-prefixed even-length hex",
+        { field: "payloadHex" },
+      );
+    }
+    return payloadHex;
+  }
+  const trimmed = payloadHex.trim();
+  const clean =
+    trimmed.startsWith("0x") || trimmed.startsWith("0X")
+      ? trimmed.slice(2)
+      : trimmed;
+  if (clean.length === 0 || clean.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(clean)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Invalid payloadHex: expected non-empty even-length hex bytes",
+      { field: "payloadHex" },
+    );
+  }
+  return `0x${bytesToHex(hexToBytes(clean))}`;
+}
+
+function normalizeDescription(description: unknown): string | undefined {
+  if (description === undefined) {
+    return undefined;
+  }
+  if (typeof description !== "string" || description.trim().length === 0) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Invalid description: expected a non-empty string",
+      { field: "description" },
+    );
+  }
+  return description.trim();
+}
+
+function validateSignedAtMs(signedAtMs: unknown, field: string): number | undefined {
+  if (signedAtMs === undefined) {
+    return undefined;
+  }
+  if (
+    typeof signedAtMs !== "number" ||
+    !Number.isSafeInteger(signedAtMs) ||
+    signedAtMs < 0
+  ) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      `Invalid ${field}: expected a non-negative safe integer timestamp in ms`,
+      { field },
+    );
+  }
+  return signedAtMs;
+}
+
+/**
+ * Validates a multisig signer set and threshold, deduplicates normalized signers
+ * and approvals, and computes quorum status along with valid, unknown, and duplicate
+ * approval classifications.
+ */
+export function checkMultisigQuorum(
+  input: MultisigQuorumInput,
+): MultisigQuorumResult {
+  if (!input || typeof input !== "object") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Multisig quorum input must be an object",
+    );
+  }
+  if (!Array.isArray(input.signers)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Invalid signers: expected an array of PRO-21 addresses",
+      { field: "signers" },
+    );
+  }
+  if (!Array.isArray(input.approvals)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Invalid approvals: expected an array of approver addresses",
+      { field: "approvals" },
+    );
+  }
+
+  const signerByPayloadKey = new Map<string, string>();
+  const uniqueSigners: string[] = [];
+
+  for (let i = 0; i < input.signers.length; i++) {
+    const validated = validatePro21Address(input.signers[i], `signers[${i}]`);
+    if (!signerByPayloadKey.has(validated.payloadKey)) {
+      signerByPayloadKey.set(validated.payloadKey, validated.canonical);
+      uniqueSigners.push(validated.canonical);
+    }
+  }
+
+  if (uniqueSigners.length === 0) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Multisig signers list must contain at least one valid PRO-21 address",
+      { field: "signers" },
+    );
+  }
+
+  const threshold = validateThreshold(input.threshold, uniqueSigners.length);
+
+  const validApprovals: string[] = [];
+  const unknownApprovals: string[] = [];
+  const duplicateApprovals: string[] = [];
+
+  const seenValidKeys = new Set<string>();
+  const seenUnknownKeys = new Set<string>();
+  const seenDuplicateKeys = new Set<string>();
+
+  for (let i = 0; i < input.approvals.length; i++) {
+    const rawApproval = input.approvals[i];
+    if (typeof rawApproval !== "string") {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `Invalid approvals[${i}]: expected an address string`,
+        { field: `approvals[${i}]` },
+      );
+    }
+    const inspected = inspectAddress(rawApproval);
+    const isPro21 =
+      inspected.valid &&
+      (inspected.format === "pro21-mainnet" || inspected.format === "pro21-testnet") &&
+      inspected.canonicalMainnet !== undefined &&
+      inspected.canonicalTestnet !== undefined;
+
+    if (isPro21) {
+      const payloadKey = inspected.canonicalMainnet!;
+      const matchedSigner = signerByPayloadKey.get(payloadKey);
+      if (matchedSigner !== undefined) {
+        if (seenValidKeys.has(payloadKey)) {
+          if (!seenDuplicateKeys.has(payloadKey)) {
+            seenDuplicateKeys.add(payloadKey);
+            duplicateApprovals.push(matchedSigner);
+          }
+        } else {
+          seenValidKeys.add(payloadKey);
+          validApprovals.push(matchedSigner);
+        }
+      } else {
+        const normalizedUnknown =
+          inspected.format === "pro21-testnet"
+            ? inspected.canonicalTestnet!
+            : inspected.canonicalMainnet!;
+        if (seenUnknownKeys.has(payloadKey)) {
+          if (!seenDuplicateKeys.has(payloadKey)) {
+            seenDuplicateKeys.add(payloadKey);
+            duplicateApprovals.push(normalizedUnknown);
+          }
+        } else {
+          seenUnknownKeys.add(payloadKey);
+          unknownApprovals.push(normalizedUnknown);
+        }
+      }
+    } else {
+      const trimmedUnknown = rawApproval.trim();
+      const unknownKey = `raw:${trimmedUnknown}`;
+      if (seenUnknownKeys.has(unknownKey)) {
+        if (!seenDuplicateKeys.has(unknownKey)) {
+          seenDuplicateKeys.add(unknownKey);
+          duplicateApprovals.push(trimmedUnknown);
+        }
+      } else {
+        seenUnknownKeys.add(unknownKey);
+        unknownApprovals.push(trimmedUnknown);
+      }
+    }
+  }
+
+  const approvedCount = validApprovals.length;
+  const quorumReached = approvedCount >= threshold;
+  const remainingNeeded = Math.max(0, threshold - approvedCount);
+
+  return {
+    quorumReached,
+    approvedCount,
+    threshold,
+    remainingNeeded,
+    uniqueSigners,
+    validApprovals,
+    unknownApprovals,
+    duplicateApprovals,
+  };
+}
+
+function buildValidatedMultisigBundle(
+  raw: Record<string, unknown>,
+  strictDecode: boolean,
+): MultisigProposalBundle {
+  assertNoSecretFields(raw);
+
+  if (strictDecode) {
+    if (raw.format !== MULTISIG_BUNDLE_FORMAT) {
+      throw new KovanicaDecodeError(
+        "INVALID_VARIANT",
+        `Unsupported multisig bundle format: ${String(raw.format)} (expected '${MULTISIG_BUNDLE_FORMAT}')`,
+        { field: "format" },
+      );
+    }
+    if (raw.version !== MULTISIG_BUNDLE_VERSION) {
+      throw new KovanicaDecodeError(
+        "INVALID_VARIANT",
+        `Unsupported multisig bundle version: ${String(raw.version)} (expected ${MULTISIG_BUNDLE_VERSION})`,
+        { field: "version" },
+      );
+    }
+  } else if (raw.version !== undefined && raw.version !== MULTISIG_BUNDLE_VERSION) {
+    throw new KovanicaDecodeError(
+      "INVALID_VARIANT",
+      `Unsupported multisig bundle version: ${String(raw.version)} (expected ${MULTISIG_BUNDLE_VERSION})`,
+      { field: "version" },
+    );
+  }
+
+  const chainId = validateMultisigChainId(raw.chainId);
+  const multisigAddress = validatePro21Address(
+    raw.multisigAddress,
+    "multisigAddress",
+    chainId,
+  ).canonical;
+
+  if (typeof raw.proposalId !== "string" || raw.proposalId.trim().length === 0) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Invalid proposalId: expected a non-empty string",
+      { field: "proposalId" },
+    );
+  }
+  const proposalId = raw.proposalId.trim();
+
+  if (!Array.isArray(raw.signers)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Invalid signers: expected an array of PRO-21 addresses",
+      { field: "signers" },
+    );
+  }
+
+  const signerByPayloadKey = new Map<string, string>();
+  for (let i = 0; i < raw.signers.length; i++) {
+    const validated = validatePro21Address(raw.signers[i], `signers[${i}]`, chainId);
+    if (!signerByPayloadKey.has(validated.payloadKey)) {
+      signerByPayloadKey.set(validated.payloadKey, validated.canonical);
+    }
+  }
+  const signers = Array.from(signerByPayloadKey.values()).sort();
+  if (signers.length === 0) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Multisig proposal bundle must include at least one valid PRO-21 signer",
+      { field: "signers" },
+    );
+  }
+
+  const threshold = validateThreshold(raw.threshold, signers.length);
+
+  if (!Array.isArray(raw.approvals)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Invalid approvals: expected an array of approval entries",
+      { field: "approvals" },
+    );
+  }
+
+  const approvals: MultisigApprovalEntry[] = [];
+  for (let i = 0; i < raw.approvals.length; i++) {
+    const entry = raw.approvals[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `Invalid approvals[${i}]: expected an object`,
+        { field: `approvals[${i}]` },
+      );
+    }
+    const entryObj = entry as Record<string, unknown>;
+    const signer = validatePro21Address(
+      entryObj.signer,
+      `approvals[${i}].signer`,
+      chainId,
+    ).canonical;
+    const signatureHex = normalizeSignatureHex(
+      entryObj.signatureHex,
+      `approvals[${i}].signatureHex`,
+      strictDecode,
+    );
+    const signedAtMs = validateSignedAtMs(
+      entryObj.signedAtMs,
+      `approvals[${i}].signedAtMs`,
+    );
+    approvals.push(
+      signedAtMs !== undefined
+        ? { signer, signatureHex, signedAtMs }
+        : { signer, signatureHex },
+    );
+  }
+
+  approvals.sort((a, b) => {
+    if (a.signer !== b.signer) return a.signer < b.signer ? -1 : 1;
+    if (a.signatureHex !== b.signatureHex) {
+      return a.signatureHex < b.signatureHex ? -1 : 1;
+    }
+    return (a.signedAtMs ?? -1) - (b.signedAtMs ?? -1);
+  });
+
+  const payloadHex = normalizePayloadHex(raw.payloadHex, strictDecode);
+  const description = normalizeDescription(raw.description);
+  if (payloadHex === undefined && description === undefined) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Multisig proposal bundle must include payloadHex or description",
+      { field: "payloadHex" },
+    );
+  }
+
+  const bundle: MultisigProposalBundle = {
+    format: MULTISIG_BUNDLE_FORMAT,
+    version: MULTISIG_BUNDLE_VERSION,
+    chainId,
+    multisigAddress,
+    proposalId,
+    threshold,
+    signers,
+    approvals,
+  };
+  if (payloadHex !== undefined) {
+    bundle.payloadHex = payloadHex;
+  }
+  if (description !== undefined) {
+    bundle.description = description;
+  }
+
+  return bundle;
+}
+
+/**
+ * Validates an air-gapped multisig proposal bundle (rejecting any private/secret
+ * key fields, invalid PRO-21 addresses, invalid chain IDs, invalid thresholds,
+ * or malformed signature hex) and serializes it into a deterministic versioned
+ * JSON string with `format: "kovanica-multisig-bundle-v1"`.
+ */
+export function encodeMultisigProposalBundle(
+  proposal: EncodeMultisigProposalBundleInput,
+): string {
+  if (!proposal || typeof proposal !== "object" || Array.isArray(proposal)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Multisig proposal bundle input must be an object",
+    );
+  }
+  const bundle = buildValidatedMultisigBundle(
+    proposal as unknown as Record<string, unknown>,
+    false,
+  );
+  return JSON.stringify(bundle);
+}
+
+/**
+ * Parses and strictly validates an encoded air-gapped multisig proposal bundle
+ * JSON string, rejects any embedded secret/private key material, and computes
+ * the quorum summary via `checkMultisigQuorum`.
+ */
+export function decodeMultisigProposalBundle(
+  encoded: string,
+): DecodedMultisigProposalBundle {
+  if (typeof encoded !== "string") {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Encoded multisig proposal bundle must be a string",
+    );
+  }
+  const trimmed = encoded.trim();
+  if (trimmed.length === 0) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Encoded multisig proposal bundle must not be empty",
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Encoded multisig proposal bundle is not valid JSON",
+    );
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new KovanicaDecodeError(
+      "INVALID_INPUT",
+      "Encoded multisig proposal bundle JSON must be an object",
+    );
+  }
+
+  const bundle = buildValidatedMultisigBundle(
+    parsed as Record<string, unknown>,
+    true,
+  );
+  const quorum = checkMultisigQuorum({
+    signers: bundle.signers,
+    approvals: bundle.approvals.map((entry) => entry.signer),
+    threshold: bundle.threshold,
+  });
+
+  return { bundle, quorum };
 }

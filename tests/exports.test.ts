@@ -13,7 +13,7 @@ const distCjsPath = resolve(distDir, "index.cjs");
 const distDtsPath = resolve(distDir, "index.d.ts");
 const distDctsPath = resolve(distDir, "index.d.cts");
 
-type ExpectedRuntimeKind = "function" | "number" | "bigint" | "array";
+type ExpectedRuntimeKind = "function" | "number" | "string" | "bigint" | "array";
 
 const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKind]> = [
   ["KovanicaClient", "function"],
@@ -62,6 +62,11 @@ const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKi
   ["verifySignedTransactionAuto", "function"],
   ["encodeAirgapTxEnvelope", "function"],
   ["decodeAirgapTxEnvelope", "function"],
+  ["MULTISIG_BUNDLE_FORMAT", "string"],
+  ["MULTISIG_BUNDLE_VERSION", "number"],
+  ["checkMultisigQuorum", "function"],
+  ["encodeMultisigProposalBundle", "function"],
+  ["decodeMultisigProposalBundle", "function"],
   ["parseMempoolFeeStats", "function"],
   ["computeFeeRecommendations", "function"],
   ["computeRbfFeeBump", "function"],
@@ -90,6 +95,9 @@ function assertPublicExportSurface(mod: Record<string, unknown>, label: string):
     } else if (expectedKind === "number") {
       expect(typeof value, `${label}.${symbol} should be a number`).toBe("number");
       expect(value as number, `${label}.${symbol} should be positive`).toBeGreaterThan(0);
+    } else if (expectedKind === "string") {
+      expect(typeof value, `${label}.${symbol} should be a string`).toBe("string");
+      expect((value as string).length, `${label}.${symbol} should be non-empty`).toBeGreaterThan(0);
     } else if (expectedKind === "bigint") {
       expect(typeof value, `${label}.${symbol} should be a bigint`).toBe("bigint");
       expect((value as bigint) > 0n, `${label}.${symbol} should be positive`).toBe(true);

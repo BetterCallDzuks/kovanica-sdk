@@ -387,17 +387,29 @@ export {
   verifySignedTransactionAuto,
 } from "./tx-auto-decode";
 
-// Air-Gapped Tx Envelope Encoder/Decoder
+// Air-Gapped Tx Envelope & Multisig Proposal Bundle Encoder/Decoder
 export {
   AIRGAP_ENVELOPE_PREFIX,
   AIRGAP_ENVELOPE_VERSION,
+  MULTISIG_BUNDLE_FORMAT,
+  MULTISIG_BUNDLE_VERSION,
   type AirgapTxEnvelope,
   type AirgapTxKind,
   type DecodeAirgapTxEnvelopeOptions,
+  type DecodedMultisigProposalBundle,
   type EncodeAirgapTxEnvelopeInput,
+  type EncodeMultisigProposalBundleInput,
   type EncodedAirgapTxEnvelope,
+  type MultisigApprovalEntry,
+  type MultisigBundleChainId,
+  type MultisigProposalBundle,
+  type MultisigQuorumInput,
+  type MultisigQuorumResult,
+  checkMultisigQuorum,
   decodeAirgapTxEnvelope,
+  decodeMultisigProposalBundle,
   encodeAirgapTxEnvelope,
+  encodeMultisigProposalBundle,
 } from "./airgap";
 
 // Mempool Fee Statistics, Priority Fee Tier Presets & RBF Fee Bump
