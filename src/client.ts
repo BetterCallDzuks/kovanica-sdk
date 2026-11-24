@@ -35,6 +35,32 @@ import type {
   ValidatorInfo,
 } from "./types";
 import { parseQuantity, toHexQuantity } from "./units";
+
+/** Canonical Balanced-tier fixed minimum fees in KVNC atoms (75% burn / 25% miner). */
+export const FIXED_FEE_SCHEDULE = {
+  deploy: 1_000_000_000n,
+  token_create: 5_000_000_000n,
+  nft_create_collection: 2_000_000_000n,
+  nft_mint: 100_000_000n,
+  rwa_create: 10_000_000_000n,
+  rwa_mint: 500_000_000n,
+} as const;
+
+export interface FeeSchedule {
+  chainId: bigint;
+  activeFromRound: bigint;
+  active: boolean;
+  feeSplitBurnBps: number;
+  feeSplitMinerBps: number;
+  fixedFees: {
+    deploy: bigint;
+    tokenCreate: bigint;
+    nftCreateCollection: bigint;
+    nftMint: bigint;
+    rwaCreate: bigint;
+    rwaMint: bigint;
+  };
+}
 import {
   type BatchDryRunResult,
   type CallTxKind,
@@ -85,6 +111,7 @@ export const DEFAULT_IDEMPOTENT_RPC_METHODS: ReadonlyArray<string> = Object.free
   "kovanica_getBalance",
   "kovanica_getNonce",
   "kovanica_estimateFee",
+  "kovanica_getFeeSchedule",
   "kovanica_call",
   "kovanica_getStorageAt",
   "kovanica_getCode",
@@ -777,6 +804,32 @@ export class KovanicaClient {
   async estimateFee(options?: RequestOptions): Promise<bigint> {
     const raw = await this.call<unknown>("kovanica_estimateFee", [], options);
     return parseQuantity(raw);
+  }
+
+  /**
+   * Returns the canonical fixed operation fee floors, fee split, and activation status.
+   * RPC: `kovanica_getFeeSchedule`
+   */
+  async getFeeSchedule(options?: RequestOptions): Promise<FeeSchedule> {
+    const raw = await this.call<Record<string, unknown>>("kovanica_getFeeSchedule", [], options);
+    const fees = (raw.fixed_fees ?? {}) as Record<string, unknown>;
+    return {
+      chainId: parseQuantity(raw.chain_id),
+      activeFromRound: parseQuantity(raw.active_from_round),
+      active: Boolean(raw.active),
+      feeSplitBurnBps: Number(raw.fee_split_burn_bps ?? 7500),
+      feeSplitMinerBps: Number(raw.fee_split_miner_bps ?? 2500),
+      fixedFees: {
+        deploy: parseQuantity(fees.deploy ?? FIXED_FEE_SCHEDULE.deploy),
+        tokenCreate: parseQuantity(fees.token_create ?? FIXED_FEE_SCHEDULE.token_create),
+        nftCreateCollection: parseQuantity(
+          fees.nft_create_collection ?? FIXED_FEE_SCHEDULE.nft_create_collection,
+        ),
+        nftMint: parseQuantity(fees.nft_mint ?? FIXED_FEE_SCHEDULE.nft_mint),
+        rwaCreate: parseQuantity(fees.rwa_create ?? FIXED_FEE_SCHEDULE.rwa_create),
+        rwaMint: parseQuantity(fees.rwa_mint ?? FIXED_FEE_SCHEDULE.rwa_mint),
+      },
+    };
   }
 
   /**

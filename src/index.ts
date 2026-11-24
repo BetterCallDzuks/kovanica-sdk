@@ -5,7 +5,9 @@
 // Client & Transport
 export {
   DEFAULT_IDEMPOTENT_RPC_METHODS,
+  FIXED_FEE_SCHEDULE,
   KovanicaClient,
+  type FeeSchedule,
   type KovanicaClientConfig,
   type KovanicaClientOptions,
   type RpcRetryConfig,
@@ -193,8 +195,16 @@ export {
   buildNameRegisterCallTx,
   buildNftMintCall,
   buildNftMintCallTx,
+  buildRwaBurnCall,
+  buildRwaCreateCall,
+  buildRwaFreezeCall,
+  buildRwaMintCall,
+  buildRwaTransferCall,
+  buildRwaUpdateMetadataCall,
   buildTokenTransferCall,
   buildVaultCreateCall,
+  RWA_ASSET_CLASSES,
+  type RwaAssetClass,
   bytesToHex,
   computeCallTransactionSigningHash,
   concatBytes,
@@ -286,6 +296,7 @@ export {
   MultisigClient,
   NameRegistryClient,
   NftClient,
+  RwaClient,
   TokenClient,
   VaultClient,
   type ContractFacadeClient,
@@ -297,9 +308,51 @@ export {
   type NameRegisterParams,
   type NameResolveOptions,
   type NftMintParams,
+  type RwaCreateParams,
+  type RwaFreezeParams,
+  type RwaMintParams,
+  type RwaTransferParams,
+  type RwaUpdateMetadataParams,
   type TokenTransferParams,
   type VaultCreateParams,
 } from "./facades";
+
+// Wave A: Atomic Batch & Sponsored (Gasless) Transactions
+export {
+  MAX_BATCH_ACTIONS,
+  PREV_DEPLOYED_CONTRACT,
+  SPONSOR_DOMAIN,
+  type BatchAction,
+  computeBatchSigningHash,
+  computeSponsorSigningHash,
+  signBatchTransaction,
+  signSponsoredTransaction,
+  signingBatchKindBytes,
+  wireBatchKindBytes,
+} from "./wave-a";
+
+// Waves B, C, and D: EIP-1559, Storage Rent, Passkeys, Session Keys, Scheduler, Bridge, PQ
+export {
+  BASE_FEE_MAX_CHANGE_DENOMINATOR,
+  MIN_BASE_FEE_PER_BYTE,
+  ML_DSA_65_PUBKEY_BYTES,
+  ML_DSA_65_SIG_BYTES,
+  STORAGE_DEPOSIT_PER_BYTE,
+  SignatureScheme,
+  TARGET_BLOCK_BYTES,
+  type SessionKeyPolicy,
+  buildBridgeAttestMintCall,
+  buildBridgeInitCall,
+  buildBridgeWithdrawCall,
+  buildSchedulerCreateJobCall,
+  buildSchedulerJobIdCall,
+  checkSessionPolicy,
+  computePqHybridDigest,
+  computeStorageDepositDelta,
+  computeTotalRequiredFee,
+  deriveTypedAddress,
+  nextBaseFeePerByte,
+} from "./waves-bcd";
 
 // Paginated Contract Log History & Typed Event Streams
 export {

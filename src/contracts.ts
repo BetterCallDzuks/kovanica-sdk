@@ -226,6 +226,120 @@ export function buildNftMintCall(
 }
 export const encodeNftMintArgs = buildNftMintCall;
 
+/** Valid KVP-106 RWA asset classes. */
+export const RWA_ASSET_CLASSES = ["RE", "BOND", "INVOICE", "COMMODITY", "FUND", "OTHER"] as const;
+export type RwaAssetClass = (typeof RWA_ASSET_CLASSES)[number];
+
+/**
+ * Encodes arguments for `rwa_create(...)` (KVP-106).
+ * Wire layout: `(String, String, String, String, u32, String, [u8; 32], String, String, String, u8, u128, u128)`.
+ */
+export function buildRwaCreateCall(params: {
+  name: string;
+  symbol: string;
+  assetClass: RwaAssetClass;
+  uniqueId: string;
+  version: number;
+  jurisdiction?: string;
+  metadataHash: Uint8Array;
+  metadataUri?: string;
+  legalUri?: string;
+  custodyUri?: string;
+  decimals: number;
+  maxSupply: bigint | number;
+  initialSupply: bigint | number;
+}): Uint8Array {
+  if (!RWA_ASSET_CLASSES.includes(params.assetClass)) {
+    throw new Error(`Invalid RWA asset class: ${params.assetClass}`);
+  }
+  if (params.metadataHash.length !== 32) {
+    throw new Error(`Expected 32-byte metadataHash, got ${params.metadataHash.length}`);
+  }
+  if (!Number.isInteger(params.version) || params.version < 1) {
+    throw new Error(`Version must be a positive integer, got ${params.version}`);
+  }
+  if (!Number.isInteger(params.decimals) || params.decimals < 0 || params.decimals > 18) {
+    throw new Error(`Decimals must be between 0 and 18, got ${params.decimals}`);
+  }
+  return concatBytes([
+    encodeBincodeString(params.name),
+    encodeBincodeString(params.symbol),
+    encodeBincodeString(params.assetClass),
+    encodeBincodeString(params.uniqueId),
+    u32le(params.version),
+    encodeBincodeString(params.jurisdiction ?? ""),
+    params.metadataHash,
+    encodeBincodeString(params.metadataUri ?? ""),
+    encodeBincodeString(params.legalUri ?? ""),
+    encodeBincodeString(params.custodyUri ?? ""),
+    Uint8Array.of(params.decimals),
+    u128le(params.maxSupply),
+    u128le(params.initialSupply),
+  ]);
+}
+export const encodeRwaCreateArgs = buildRwaCreateCall;
+
+/** Encodes arguments for `rwa_mint(to, amount)`. Wire layout: `([u8; 32], u128)`. */
+export function buildRwaMintCall(to: Uint8Array, amount: bigint | number): Uint8Array {
+  if (to.length !== 32) {
+    throw new Error(`Expected 32-byte to address, got ${to.length}`);
+  }
+  if (BigInt(amount) <= 0n) {
+    throw new Error(`Amount must be positive, got ${amount}`);
+  }
+  return concatBytes([to, u128le(amount)]);
+}
+export const encodeRwaMintArgs = buildRwaMintCall;
+
+/** Encodes arguments for `rwa_transfer(to, amount)`. Wire layout: `([u8; 32], u128)`. */
+export function buildRwaTransferCall(to: Uint8Array, amount: bigint | number): Uint8Array {
+  if (to.length !== 32) {
+    throw new Error(`Expected 32-byte to address, got ${to.length}`);
+  }
+  if (BigInt(amount) <= 0n) {
+    throw new Error(`Amount must be positive, got ${amount}`);
+  }
+  return concatBytes([to, u128le(amount)]);
+}
+export const encodeRwaTransferArgs = buildRwaTransferCall;
+
+/** Encodes arguments for `rwa_burn(amount)`. Wire layout: `u128`. */
+export function buildRwaBurnCall(amount: bigint | number): Uint8Array {
+  if (BigInt(amount) <= 0n) {
+    throw new Error(`Amount must be positive, got ${amount}`);
+  }
+  return u128le(amount);
+}
+export const encodeRwaBurnArgs = buildRwaBurnCall;
+
+/** Encodes arguments for `rwa_freeze(account, frozen)`. Wire layout: `([u8; 32], bool)`. */
+export function buildRwaFreezeCall(account: Uint8Array, frozen: boolean): Uint8Array {
+  if (account.length !== 32) {
+    throw new Error(`Expected 32-byte account address, got ${account.length}`);
+  }
+  return concatBytes([account, Uint8Array.of(frozen ? 1 : 0)]);
+}
+export const encodeRwaFreezeArgs = buildRwaFreezeCall;
+
+/** Encodes arguments for `rwa_update_metadata(metadata_hash, metadata_uri, legal_uri, custody_uri)`. */
+export function buildRwaUpdateMetadataCall(params: {
+  metadataHash: Uint8Array;
+  metadataUri?: string;
+  legalUri?: string;
+  custodyUri?: string;
+}): Uint8Array {
+  if (params.metadataHash.length !== 32) {
+    throw new Error(`Expected 32-byte metadataHash, got ${params.metadataHash.length}`);
+  }
+  return concatBytes([
+    params.metadataHash,
+    encodeBincodeString(params.metadataUri ?? ""),
+    encodeBincodeString(params.legalUri ?? ""),
+    encodeBincodeString(params.custodyUri ?? ""),
+  ]);
+}
+export const encodeRwaUpdateMetadataArgs = buildRwaUpdateMetadataCall;
+
 /**
  * Encodes arguments for `escrow_create(parties, threshold, amount, deadline)`.
  * Wire layout: `(Vec<[u8; 32]>, u8, u64, u64)`.
