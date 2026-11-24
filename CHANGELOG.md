@@ -2,6 +2,22 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
+## [0.6.0] - 2026-11-24
+
+### Added
+- **Paginated Account Transaction History** (`history.ts`, `client.ts`):
+  - Added `getAccountTxHistory` (standalone and via `KovanicaClient`), `parseAccountTxHistoryEntry`, `DEFAULT_ACCOUNT_TX_HISTORY_LIMIT`, `DEFAULT_ACCOUNT_TX_HISTORY_MAX_PAGES`, and `MAX_ACCOUNT_TX_HISTORY_LIMIT`.
+  - Supports cursor-based multi-page traversal with lossless `bigint` amounts/fees/block heights, direction and status normalization, and cyclic cursor protection to prevent infinite pagination loops.
+- **BIP-44 Path Validator & Watch-Only PRO-21 Accounts** (`wallet.ts`):
+  - Added `parseBip44Path` and `validateBip44Path` for browser-safe BIP-44 derivation path parsing and validation pinned to Kovanica coin type `3007` (with hardened SLIP-0010 Ed25519 checks).
+  - Added `createWatchOnlyAccount` for browser-safe PRO-21 read-only account inspection without private key material.
+- **WebSocket Blocks-with-Receipts Subscription & Backpressure Queue Cap** (`ws.ts`, `ws-reconnect.ts`):
+  - Added `subscribeNewBlocksWithReceipts` for real-time committed block + execution receipt streaming over `KovanicaWsClient`.
+  - Added bounded WebSocket backpressure queue cap to prevent unbounded memory growth under bursty event delivery.
+- **Release Readiness, Export Surface Parity & Browser-Bundling Verification** (`package.json`, `tests/release-v060.test.ts`, `tests/exports.test.ts`):
+  - Added `"sideEffects": false` to `package.json` for optimal bundler tree-shaking.
+  - Added `tests/release-v060.test.ts` verifying `v0.6.0` package metadata, `CHANGELOG.md` completeness, `exports`/`main`/`module`/`types`/`sideEffects`/`files` consistency, and built `dist/` artifact presence alongside ESM/CJS export parity and zero-Node-import browser-bundling checks.
+
 ## [0.5.0] - 2026-11-23
 
 ### Added
