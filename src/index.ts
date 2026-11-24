@@ -303,17 +303,32 @@ export {
 
 // Paginated Contract Log History & Typed Event Streams
 export {
+  DEFAULT_CONTRACT_LOGS_MAX_PAGES,
+  DEFAULT_CONTRACT_LOGS_MAX_SPAN,
+  DEFAULT_CONTRACT_LOGS_PAGE_LIMIT,
   DEFAULT_LOG_HISTORY_CHUNK_SIZE,
   type ContractEventSubscriptionHandle,
+  type ContractLogCursor,
   type ContractLogEntry,
   type ContractLogHistoryResult,
+  type ContractLogsQueryFilter,
   type DecodedContractEvent,
+  type DecodedPaginatedContractLog,
   type GetContractLogHistoryOptions,
   type GetLogsClient,
   type GetLogsFilter,
+  type PaginatedContractLogsResult,
+  type PaginatedGetLogsRpcFilter,
+  type PaginatedLogsClient,
+  type QueryContractLogsPaginatedOptions,
+  type RawGetLogsResponse,
+  type RawPaginatedLogsPage,
   type SubscribeContractEventsOptions,
   type SubscribeLogsWsClient,
+  formatContractLogCursor,
   getContractLogHistory,
+  parseContractLogCursor,
+  queryContractLogsPaginated,
   subscribeContractEvents,
 } from "./events";
 

@@ -83,6 +83,12 @@ const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKi
   ["getAccountTxHistory", "function"],
   ["parseAccountTxHistoryEntry", "function"],
   ["DEFAULT_ACCOUNT_TX_HISTORY_MAX_PAGES", "number"],
+  ["DEFAULT_CONTRACT_LOGS_MAX_SPAN", "number"],
+  ["DEFAULT_CONTRACT_LOGS_MAX_PAGES", "number"],
+  ["DEFAULT_CONTRACT_LOGS_PAGE_LIMIT", "number"],
+  ["queryContractLogsPaginated", "function"],
+  ["parseContractLogCursor", "function"],
+  ["formatContractLogCursor", "function"],
 ];
 
 function assertPublicExportSurface(mod: Record<string, unknown>, label: string): void {

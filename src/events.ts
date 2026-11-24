@@ -28,7 +28,7 @@ import {
 } from "./decoders";
 import { KovanicaAbortError } from "./errors";
 import type { HexString, KovanicaAddress, RequestOptions } from "./types";
-import { toHexQuantity } from "./units";
+import { parseQuantity, toHexQuantity } from "./units";
 import type {
   WsExecutionEvent,
   WsLogFilter,
@@ -38,6 +38,20 @@ import type {
 
 /** Default maximum number of blocks queried per `kovanica_getLogs` chunk. */
 export const DEFAULT_LOG_HISTORY_CHUNK_SIZE = 1_000;
+
+/**
+ * Default maximum inclusive block span per `kovanica_getLogs` chunk window
+ * in {@link queryContractLogsPaginated} (matches L1 `MAX_GET_LOGS_BLOCK_RANGE = 500`).
+ */
+export const DEFAULT_CONTRACT_LOGS_MAX_SPAN = 500;
+
+/** Default maximum number of `kovanica_getLogs` page requests per {@link queryContractLogsPaginated} call. */
+export const DEFAULT_CONTRACT_LOGS_MAX_PAGES = 20;
+
+/** Default page size hint (`limit`) per `kovanica_getLogs` request in {@link queryContractLogsPaginated}. */
+export const DEFAULT_CONTRACT_LOGS_PAGE_LIMIT = 200;
+
+const U64_MAX = 18_446_744_073_709_551_615n;
 
 const VALID_CONTRACT_LOG_KINDS: ReadonlySet<ContractLogKind> = new Set<ContractLogKind>([
   "htlc",
@@ -419,6 +433,631 @@ export async function getContractLogHistory(
     chunksQueried,
     fromBlock,
     toBlock,
+  };
+}
+
+// ============================================================================
+// Paginated & Max-Span-Chunked Contract Log Streamer (`queryContractLogsPaginated`)
+// ============================================================================
+
+/** Parsed `kovanica_getLogs` cursor (`"<height>:<logIndex>"`). */
+export interface ContractLogCursor {
+  height: bigint;
+  logIndex: bigint;
+}
+
+/** RPC filter object passed to `kovanica_getLogs` by {@link queryContractLogsPaginated}. */
+export interface PaginatedGetLogsRpcFilter {
+  fromBlock: HexString;
+  toBlock: HexString;
+  address?: KovanicaAddress | ReadonlyArray<KovanicaAddress>;
+  topics?: ReadonlyArray<string | ReadonlyArray<string> | null>;
+  cursor?: string;
+  limit?: number;
+}
+
+/** Structured paginated response envelope optionally returned by cursor-aware RPC proxies/servers. */
+export interface RawPaginatedLogsPage {
+  logs: ReadonlyArray<ContractLogEntry>;
+  nextCursor?: string | null;
+  next_cursor?: string | null;
+  hasMore?: boolean;
+  has_more?: boolean;
+}
+
+/** Supported `kovanica_getLogs` response shapes (standard L1 array or paginated envelope). */
+export type RawGetLogsResponse = ReadonlyArray<ContractLogEntry> | RawPaginatedLogsPage;
+
+/**
+ * Minimal client interface required by {@link queryContractLogsPaginated}.
+ * Satisfied by {@link KovanicaClient} (via `call("kovanica_getLogs", ...)`) or any
+ * client implementing `getLogs(filter, options)`.
+ */
+export type PaginatedLogsClient =
+  | {
+      getLogs(
+        filter: PaginatedGetLogsRpcFilter,
+        options?: RequestOptions,
+      ): Promise<RawGetLogsResponse>;
+    }
+  | {
+      call<TResult = unknown>(
+        method: string,
+        params?: unknown,
+        options?: RequestOptions,
+      ): Promise<TResult>;
+    };
+
+/** Filter parameters for {@link queryContractLogsPaginated}. */
+export interface ContractLogsQueryFilter {
+  /** Inclusive start block height (non-negative `bigint` or safe integer `number`). */
+  fromBlock: bigint | number;
+  /** Inclusive end block height (non-negative `bigint` or safe integer `number`, must be `>= fromBlock`). */
+  toBlock: bigint | number;
+  /** Optional contract address or array of addresses (PRO-21 `kvnc...dag` / `tknc...dag`, 32-byte hex, or 32-byte `Uint8Array`). */
+  address?: Uint8Array | string | ReadonlyArray<Uint8Array | string>;
+  /** Optional positional topic filters forwarded to `kovanica_getLogs`. */
+  topics?: ReadonlyArray<string | ReadonlyArray<string> | null>;
+  /** Optional pagination cursor (`"<height>:<logIndex>"`) from a previous query's `nextCursor`. */
+  cursor?: string;
+}
+
+/** Options for {@link queryContractLogsPaginated}. */
+export interface QueryContractLogsPaginatedOptions<
+  K extends ContractLogKind = ContractLogKind,
+> {
+  /** Optional pagination cursor (`"<height>:<logIndex>"`); overrides `filter.cursor` if both are set. */
+  cursor?: string;
+  /** Maximum inclusive block span per chunk window. Positive safe integer; defaults to `500`. */
+  maxSpan?: number;
+  /** Maximum number of `kovanica_getLogs` page requests per call. Positive safe integer; defaults to `20`. */
+  maxPages?: number;
+  /** Page size hint (`limit`) per `kovanica_getLogs` request. Positive safe integer; defaults to `200`. */
+  pageLimit?: number;
+  /** When `true`, decodes returned logs via {@link decodeContractLog} using `kind`. */
+  decode?: boolean;
+  /** Static {@link ContractLogKind} or resolver callback used when `decode` is enabled. */
+  kind?: K | ContractLogKindResolver<K>;
+  /** Optional cancellation signal checked before and between requests and forwarded to each RPC call. */
+  signal?: AbortSignal;
+  /** Optional per-page RPC request options (`timeoutMs`, `signal`). */
+  requestOptions?: RequestOptions;
+}
+
+/** Decoded log entry produced when `decode` is enabled in {@link queryContractLogsPaginated}. */
+export type DecodedPaginatedContractLog<K extends ContractLogKind = ContractLogKind> = {
+  [P in K]: {
+    /** 0-based index of the log inside `PaginatedContractLogsResult.logs`. */
+    index: number;
+    /** Contract log kind used for decoding. */
+    kind: P;
+    /** Decoded typed Bincode record. */
+    record: DecodedContractLogByKind<P>["record"];
+    /** Original raw log entry. */
+    log: ContractLogEntry;
+  };
+}[K];
+
+/** Result returned by {@link queryContractLogsPaginated}. */
+export interface PaginatedContractLogsResult<
+  K extends ContractLogKind = ContractLogKind,
+> {
+  /** Deduplicated raw logs collected across scanned chunks and pages. */
+  logs: ContractLogEntry[];
+  /** Decoded logs when `decode` is enabled; omitted otherwise. */
+  decodedLogs?: Array<DecodedPaginatedContractLog<K>>;
+  /** Opaque cursor (`"<height>:<logIndex>"`) for resuming pagination, or `null` when complete. */
+  nextCursor: string | null;
+  /** `true` if more pages or block chunks remain beyond `maxPages`; `false` otherwise. */
+  hasMore: boolean;
+  /** Total number of `kovanica_getLogs` page requests executed. */
+  pagesFetched: number;
+  /** Total number of block-range chunk windows scanned. */
+  chunksScanned: number;
+}
+
+function parseCursorComponent(raw: string): bigint | null {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  if (trimmed.startsWith("0x") || trimmed.startsWith("0X")) {
+    const hexPart = trimmed.slice(2);
+    if (hexPart.length === 0 || !/^[0-9a-fA-F]+$/.test(hexPart)) {
+      return null;
+    }
+    return BigInt(`0x${hexPart}`);
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  return BigInt(trimmed);
+}
+
+/**
+ * Parses a `kovanica_getLogs` pagination cursor (`"<height>:<logIndex>"`).
+ * Accepts decimal integers or `0x`-prefixed hex quantities for each component.
+ */
+export function parseContractLogCursor(cursor: string): ContractLogCursor {
+  if (typeof cursor !== "string") {
+    throw new TypeError("queryContractLogsPaginated: cursor must be a '<height>:<logIndex>' string");
+  }
+  const trimmed = cursor.trim();
+  const sep = trimmed.indexOf(":");
+  if (sep === -1 || trimmed.indexOf(":", sep + 1) !== -1) {
+    throw new RangeError(
+      `queryContractLogsPaginated: invalid cursor "${cursor}" (expected '<height>:<logIndex>')`,
+    );
+  }
+  const height = parseCursorComponent(trimmed.slice(0, sep));
+  const logIndex = parseCursorComponent(trimmed.slice(sep + 1));
+  if (height === null || logIndex === null || height < 0n || logIndex < 0n) {
+    throw new RangeError(
+      `queryContractLogsPaginated: invalid cursor "${cursor}" (expected non-negative '<height>:<logIndex>')`,
+    );
+  }
+  return { height, logIndex };
+}
+
+/** Formats a canonical `kovanica_getLogs` pagination cursor (`"<height>:<logIndex>"`). */
+export function formatContractLogCursor(height: bigint, logIndex: bigint): string {
+  if (height < 0n || logIndex < 0n) {
+    throw new RangeError("formatContractLogCursor: height and logIndex must be non-negative");
+  }
+  return `${height.toString(10)}:${logIndex.toString(10)}`;
+}
+
+function parseOptionalLogQuantity(value: unknown): bigint | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value === "boolean" || typeof value === "object" || typeof value === "symbol") {
+    return null;
+  }
+  try {
+    const parsed = parseQuantity(value);
+    return parsed >= 0n ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractLogCursor(log: ContractLogEntry): string | null {
+  const height = parseOptionalLogQuantity(log.blockNumber ?? log.blockHeight);
+  const logIndex = parseOptionalLogQuantity(log.logIndex);
+  if (height === null || logIndex === null) {
+    return null;
+  }
+  return formatContractLogCursor(height, logIndex);
+}
+
+function getLogDedupeKey(log: ContractLogEntry): string | null {
+  const height = parseOptionalLogQuantity(log.blockNumber ?? log.blockHeight);
+  const logIndex = parseOptionalLogQuantity(log.logIndex);
+  if (height !== null && logIndex !== null) {
+    return `bh:${height.toString(10)}:${logIndex.toString(10)}`;
+  }
+  if (typeof log.transactionHash === "string" && log.transactionHash.trim().length > 0 && logIndex !== null) {
+    return `tx:${log.transactionHash.trim().toLowerCase()}:${logIndex.toString(10)}`;
+  }
+  return null;
+}
+
+function normalizeServerCursor(rawCursor: string): string {
+  const trimmed = rawCursor.trim();
+  try {
+    const parsed = parseContractLogCursor(trimmed);
+    return formatContractLogCursor(parsed.height, parsed.logIndex);
+  } catch {
+    return trimmed;
+  }
+}
+
+function normalizeAddressFilter(
+  address: Uint8Array | string | ReadonlyArray<Uint8Array | string> | undefined,
+): KovanicaAddress | ReadonlyArray<KovanicaAddress> | undefined {
+  if (address === undefined) {
+    return undefined;
+  }
+  if (Array.isArray(address)) {
+    return address.map((entry, idx) => {
+      if (typeof entry !== "string" && !(entry instanceof Uint8Array)) {
+        throw new TypeError(
+          `queryContractLogsPaginated: address[${idx}] must be a PRO-21 address, 32-byte hex string, or 32-byte Uint8Array`,
+        );
+      }
+      return normalizeOptionalContractAddress(entry)!;
+    });
+  }
+  if (typeof address !== "string" && !(address instanceof Uint8Array)) {
+    throw new TypeError(
+      "queryContractLogsPaginated: address must be a PRO-21 address, 32-byte hex string, 32-byte Uint8Array, or array of addresses",
+    );
+  }
+  return normalizeOptionalContractAddress(address);
+}
+
+async function fetchPaginatedLogsPage(
+  client: PaginatedLogsClient,
+  filter: PaginatedGetLogsRpcFilter,
+  requestOptions: RequestOptions | undefined,
+): Promise<RawGetLogsResponse> {
+  const candidate = client as {
+    getLogs?: (
+      filter: PaginatedGetLogsRpcFilter,
+      options?: RequestOptions,
+    ) => Promise<RawGetLogsResponse>;
+    call?: <TResult = unknown>(
+      method: string,
+      params?: unknown,
+      options?: RequestOptions,
+    ) => Promise<TResult>;
+  };
+
+  if (typeof candidate.getLogs === "function") {
+    return candidate.getLogs(filter, requestOptions);
+  }
+  if (typeof candidate.call === "function") {
+    return candidate.call<RawGetLogsResponse>("kovanica_getLogs", [filter], requestOptions);
+  }
+  throw new TypeError("queryContractLogsPaginated: client must implement getLogs() or call()");
+}
+
+function parseRawGetLogsResponse(
+  raw: RawGetLogsResponse,
+  pageNumber: number,
+): {
+  pageLogs: ReadonlyArray<ContractLogEntry>;
+  explicitNextCursor: string | null;
+  isStructuredEnvelope: boolean;
+} {
+  if (Array.isArray(raw)) {
+    return {
+      pageLogs: raw,
+      explicitNextCursor: null,
+      isStructuredEnvelope: false,
+    };
+  }
+  if (raw && typeof raw === "object") {
+    const page = raw as RawPaginatedLogsPage;
+    if (!Array.isArray(page.logs)) {
+      throw new KovanicaDecodeError(
+        "INVALID_INPUT",
+        `kovanica_getLogs: expected page ${pageNumber} logs to be an array`,
+        { field: "logs" },
+      );
+    }
+    const rawNext = page.nextCursor !== undefined ? page.nextCursor : page.next_cursor;
+    if (rawNext !== undefined && rawNext !== null && typeof rawNext !== "string") {
+      throw new TypeError(
+        `queryContractLogsPaginated: expected page ${pageNumber} nextCursor to be a string or null`,
+      );
+    }
+    const explicitNextCursor =
+      typeof rawNext === "string" && rawNext.trim().length > 0 ? rawNext.trim() : null;
+    return {
+      pageLogs: page.logs,
+      explicitNextCursor,
+      isStructuredEnvelope: true,
+    };
+  }
+  throw new KovanicaDecodeError(
+    "INVALID_INPUT",
+    `kovanica_getLogs: expected page ${pageNumber} response to be an array or paginated object`,
+    { field: "logs" },
+  );
+}
+
+/**
+ * Queries contract logs across an arbitrary `[fromBlock, toBlock]` range by automatically
+ * chunking wide ranges into `<= maxSpan` windows and walking cursor-paginated pages within
+ * each chunk up to `maxPages`.
+ *
+ * - Validates all inputs fail-closed before any RPC I/O.
+ * - Deduplicates logs across chunk and cursor boundaries by `(blockHeight, logIndex)` (or `(txHash, logIndex)`).
+ * - Guards against infinite loops from cyclic or repeated cursors.
+ * - Honors `AbortSignal` before and between page requests and forwards it to the RPC client.
+ * - Optionally decodes collected logs via {@link decodeContractLog} when `options.decode` is enabled.
+ */
+export async function queryContractLogsPaginated<K extends ContractLogKind>(
+  client: PaginatedLogsClient,
+  filter: ContractLogsQueryFilter,
+  options: QueryContractLogsPaginatedOptions<K> & {
+    decode: true;
+    kind: K | ContractLogKindResolver<K>;
+  },
+): Promise<
+  PaginatedContractLogsResult<K> & {
+    decodedLogs: Array<DecodedPaginatedContractLog<K>>;
+  }
+>;
+export async function queryContractLogsPaginated<K extends ContractLogKind = ContractLogKind>(
+  client: PaginatedLogsClient,
+  filter: ContractLogsQueryFilter,
+  options?: QueryContractLogsPaginatedOptions<K>,
+): Promise<PaginatedContractLogsResult<K>>;
+export async function queryContractLogsPaginated<K extends ContractLogKind = ContractLogKind>(
+  client: PaginatedLogsClient,
+  filter: ContractLogsQueryFilter,
+  options?: QueryContractLogsPaginatedOptions<K>,
+): Promise<PaginatedContractLogsResult<K>> {
+  if (
+    !client ||
+    typeof client !== "object" ||
+    (typeof (client as { getLogs?: unknown }).getLogs !== "function" &&
+      typeof (client as { call?: unknown }).call !== "function")
+  ) {
+    throw new TypeError("queryContractLogsPaginated: client must implement getLogs() or call()");
+  }
+
+  if (!filter || typeof filter !== "object") {
+    throw new TypeError("queryContractLogsPaginated: filter must be an object");
+  }
+
+  if (options !== undefined && (!options || typeof options !== "object")) {
+    throw new TypeError("queryContractLogsPaginated: options must be an object when provided");
+  }
+
+  const fromBlock = parseNonNegativeBlockNumber(filter.fromBlock, "fromBlock");
+  const toBlock = parseNonNegativeBlockNumber(filter.toBlock, "toBlock");
+  if (fromBlock > toBlock) {
+    throw new RangeError(
+      `queryContractLogsPaginated: fromBlock (${fromBlock}) must be <= toBlock (${toBlock})`,
+    );
+  }
+
+  const maxSpan = options?.maxSpan ?? DEFAULT_CONTRACT_LOGS_MAX_SPAN;
+  if (typeof maxSpan !== "number" || !Number.isSafeInteger(maxSpan) || maxSpan < 1) {
+    throw new RangeError(
+      `queryContractLogsPaginated: maxSpan must be a positive safe integer (>= 1), got ${String(maxSpan)}`,
+    );
+  }
+
+  const maxPages = options?.maxPages ?? DEFAULT_CONTRACT_LOGS_MAX_PAGES;
+  if (typeof maxPages !== "number" || !Number.isSafeInteger(maxPages) || maxPages < 1) {
+    throw new RangeError(
+      `queryContractLogsPaginated: maxPages must be a positive safe integer (>= 1), got ${String(maxPages)}`,
+    );
+  }
+
+  const pageLimit = options?.pageLimit ?? DEFAULT_CONTRACT_LOGS_PAGE_LIMIT;
+  if (typeof pageLimit !== "number" || !Number.isSafeInteger(pageLimit) || pageLimit < 1) {
+    throw new RangeError(
+      `queryContractLogsPaginated: pageLimit must be a positive safe integer (>= 1), got ${String(pageLimit)}`,
+    );
+  }
+
+  const normalizedAddress = normalizeAddressFilter(filter.address);
+
+  if (filter.topics !== undefined && !Array.isArray(filter.topics)) {
+    throw new TypeError("queryContractLogsPaginated: topics must be an array when provided");
+  }
+
+  if (options?.decode !== undefined && typeof options.decode !== "boolean") {
+    throw new TypeError("queryContractLogsPaginated: decode must be a boolean when provided");
+  }
+
+  const shouldDecode = options?.decode ?? options?.kind !== undefined;
+  if (shouldDecode && options?.kind === undefined) {
+    throw new TypeError(
+      "queryContractLogsPaginated: options.kind is required when decode is enabled",
+    );
+  }
+  if (options?.kind !== undefined && typeof options.kind !== "function") {
+    validateContractLogKind(options.kind, "kind");
+  }
+
+  const rawInitialCursor = options?.cursor ?? filter.cursor;
+  const parsedInitialCursor =
+    rawInitialCursor !== undefined ? parseContractLogCursor(rawInitialCursor) : null;
+
+  const isAborted = (): boolean =>
+    Boolean(options?.signal?.aborted || options?.requestOptions?.signal?.aborted);
+
+  if (isAborted()) {
+    throw new KovanicaAbortError("Paginated contract log query was aborted");
+  }
+
+  let chunkStart = fromBlock;
+  let currentCursor: string | undefined;
+  if (parsedInitialCursor !== null) {
+    if (parsedInitialCursor.logIndex === U64_MAX) {
+      const resumeHeight = parsedInitialCursor.height + 1n;
+      if (resumeHeight > chunkStart) {
+        chunkStart = resumeHeight;
+      }
+      currentCursor = undefined;
+    } else {
+      if (parsedInitialCursor.height > chunkStart) {
+        chunkStart = parsedInitialCursor.height;
+      }
+      currentCursor = formatContractLogCursor(
+        parsedInitialCursor.height,
+        parsedInitialCursor.logIndex,
+      );
+    }
+  }
+
+  if (chunkStart > toBlock) {
+    return {
+      logs: [],
+      ...(shouldDecode ? { decodedLogs: [] } : {}),
+      nextCursor: null,
+      hasMore: false,
+      pagesFetched: 0,
+      chunksScanned: 0,
+    };
+  }
+
+  const { options: pageRequestOptions, cleanup } = createCombinedRequestOptions(
+    options?.signal,
+    options?.requestOptions,
+  );
+
+  const logs: ContractLogEntry[] = [];
+  const seenLogKeys = new Set<string>();
+  const seenCursors = new Set<string>();
+  if (currentCursor !== undefined) {
+    seenCursors.add(currentCursor);
+  }
+
+  const spanStep = BigInt(maxSpan);
+  let pagesFetched = 0;
+  let chunksScanned = 0;
+  let nextCursor: string | null = null;
+  let hasMore = false;
+  let stopPagination = false;
+
+  try {
+    while (chunkStart <= toBlock && pagesFetched < maxPages && !stopPagination) {
+      const candidateEnd = chunkStart + spanStep - 1n;
+      const chunkEnd = candidateEnd < toBlock ? candidateEnd : toBlock;
+      let chunkEntered = false;
+      let chunkCompleted = false;
+      let lastChunkLogCursor: string | null = null;
+
+      while (pagesFetched < maxPages) {
+        if (isAborted()) {
+          throw new KovanicaAbortError("Paginated contract log query was aborted");
+        }
+
+        const rpcFilter: PaginatedGetLogsRpcFilter = {
+          fromBlock: toHexQuantity(chunkStart),
+          toBlock: toHexQuantity(chunkEnd),
+          ...(normalizedAddress !== undefined ? { address: normalizedAddress } : {}),
+          ...(filter.topics !== undefined ? { topics: filter.topics } : {}),
+          ...(currentCursor !== undefined ? { cursor: currentCursor } : {}),
+          limit: pageLimit,
+        };
+
+        const rawPage = await fetchPaginatedLogsPage(client, rpcFilter, pageRequestOptions);
+        pagesFetched += 1;
+        if (!chunkEntered) {
+          chunkEntered = true;
+          chunksScanned += 1;
+        }
+
+        const { pageLogs, explicitNextCursor, isStructuredEnvelope } = parseRawGetLogsResponse(
+          rawPage,
+          pagesFetched,
+        );
+
+        for (let i = 0; i < pageLogs.length; i += 1) {
+          const entry = pageLogs[i]!;
+          if (!entry || typeof entry !== "object") {
+            throw new KovanicaDecodeError(
+              "INVALID_INPUT",
+              `queryContractLogsPaginated: invalid log entry at page ${pagesFetched}[${i}]`,
+              { field: `logs[${i}]` },
+            );
+          }
+          const dedupeKey = getLogDedupeKey(entry);
+          if (dedupeKey === null || !seenLogKeys.has(dedupeKey)) {
+            if (dedupeKey !== null) {
+              seenLogKeys.add(dedupeKey);
+            }
+            logs.push(entry);
+          }
+          const entryCursor = extractLogCursor(entry);
+          if (entryCursor !== null) {
+            lastChunkLogCursor = entryCursor;
+          }
+        }
+
+        let candidateNextCursor: string | null = null;
+        if (explicitNextCursor !== null) {
+          candidateNextCursor = normalizeServerCursor(explicitNextCursor);
+        } else if (
+          !isStructuredEnvelope &&
+          pageLogs.length === pageLimit &&
+          lastChunkLogCursor !== null
+        ) {
+          candidateNextCursor = lastChunkLogCursor;
+        }
+
+        if (candidateNextCursor !== null) {
+          // Guard against infinite loops caused by repeated or cyclic cursors.
+          if (seenCursors.has(candidateNextCursor)) {
+            nextCursor = null;
+            hasMore = false;
+            stopPagination = true;
+            break;
+          }
+
+          if (pagesFetched >= maxPages) {
+            nextCursor = candidateNextCursor;
+            hasMore = true;
+            stopPagination = true;
+            break;
+          }
+
+          seenCursors.add(candidateNextCursor);
+          currentCursor = candidateNextCursor;
+          continue;
+        }
+
+        chunkCompleted = true;
+        currentCursor = undefined;
+        break;
+      }
+
+      if (stopPagination) {
+        break;
+      }
+
+      if (chunkCompleted) {
+        if (chunkEnd < toBlock) {
+          if (pagesFetched >= maxPages) {
+            nextCursor = formatContractLogCursor(chunkEnd, U64_MAX);
+            hasMore = true;
+            break;
+          }
+          chunkStart = chunkEnd + 1n;
+        } else {
+          nextCursor = null;
+          hasMore = false;
+          break;
+        }
+      }
+    }
+  } finally {
+    cleanup();
+  }
+
+  if (isAborted()) {
+    throw new KovanicaAbortError("Paginated contract log query was aborted");
+  }
+
+  let decodedLogs: Array<DecodedPaginatedContractLog<K>> | undefined;
+  if (shouldDecode && options?.kind !== undefined) {
+    decodedLogs = [];
+    const kindOrResolver = options.kind;
+    for (let i = 0; i < logs.length; i += 1) {
+      const log = logs[i]!;
+      const normalizedLog = normalizeLogForDecoding(log, i);
+      const resolvedKind =
+        typeof kindOrResolver === "function" ? kindOrResolver(normalizedLog, i) : kindOrResolver;
+      if (resolvedKind === null || resolvedKind === undefined) {
+        continue;
+      }
+      validateContractLogKind(resolvedKind, `logs[${i}].kind`);
+      const decoded = decodeContractLog(normalizedLog.data, resolvedKind);
+      decodedLogs.push({
+        index: i,
+        kind: decoded.kind,
+        record: decoded.record,
+        log,
+      } as DecodedPaginatedContractLog<K>);
+    }
+  }
+
+  return {
+    logs,
+    ...(decodedLogs !== undefined ? { decodedLogs } : {}),
+    nextCursor,
+    hasMore,
+    pagesFetched,
+    chunksScanned,
   };
 }
 

@@ -6,12 +6,20 @@ import { KovanicaDecodeError } from "../src/decoders";
 import { KovanicaAbortError } from "../src/errors";
 import {
   type ContractLogEntry,
+  DEFAULT_CONTRACT_LOGS_MAX_PAGES,
+  DEFAULT_CONTRACT_LOGS_MAX_SPAN,
+  DEFAULT_CONTRACT_LOGS_PAGE_LIMIT,
   DEFAULT_LOG_HISTORY_CHUNK_SIZE,
   type DecodedContractEvent,
   type GetLogsClient,
   type GetLogsFilter,
+  type PaginatedGetLogsRpcFilter,
+  type PaginatedLogsClient,
   type SubscribeLogsWsClient,
+  formatContractLogCursor,
   getContractLogHistory,
+  parseContractLogCursor,
+  queryContractLogsPaginated,
   subscribeContractEvents,
 } from "../src/events";
 import type { Transport } from "../src/transport";
@@ -602,5 +610,456 @@ describe("subscribeContractEvents", () => {
     ).rejects.toBeInstanceOf(TypeError);
 
     expect(subscribeLogs).not.toHaveBeenCalled();
+  });
+});
+
+describe("queryContractLogsPaginated", () => {
+  const sampleContractBytes = new Uint8Array(32).fill(0x55);
+  const sampleContractAddress = encodeAddress(sampleContractBytes);
+  const sampleTestnetAddress = encodeAddress(sampleContractBytes, TESTNET_ADDRESS_PREFIX);
+
+  it("exports expected pagination defaults and parses/formats cursors", () => {
+    expect(DEFAULT_CONTRACT_LOGS_MAX_SPAN).toBe(500);
+    expect(DEFAULT_CONTRACT_LOGS_MAX_PAGES).toBe(20);
+    expect(DEFAULT_CONTRACT_LOGS_PAGE_LIMIT).toBe(200);
+
+    expect(parseContractLogCursor("120:4")).toEqual({ height: 120n, logIndex: 4n });
+    expect(parseContractLogCursor("0x78:0x04")).toEqual({ height: 120n, logIndex: 4n });
+    expect(formatContractLogCursor(120n, 4n)).toBe("120:4");
+
+    expect(() => parseContractLogCursor("bad")).toThrow(RangeError);
+    expect(() => parseContractLogCursor("10:20:30")).toThrow(RangeError);
+    expect(() => parseContractLogCursor("0x:1")).toThrow(RangeError);
+    expect(() => parseContractLogCursor("-1:0")).toThrow(RangeError);
+    expect(() => parseContractLogCursor(123 as never)).toThrow(TypeError);
+  });
+
+  it("chunks wide [fromBlock, toBlock] ranges into <= maxSpan windows via KovanicaClient", async () => {
+    const seenFilters: PaginatedGetLogsRpcFilter[] = [];
+    const send = vi.fn(async (method: string, params?: unknown) => {
+      expect(method).toBe("kovanica_getLogs");
+      const filter = (params as [PaginatedGetLogsRpcFilter])[0];
+      seenFilters.push(filter);
+      return [
+        {
+          address: sampleContractAddress,
+          topics: ["0xaa"],
+          data: "0x01",
+          blockNumber: filter.fromBlock,
+          logIndex: "0x0",
+          transactionHash: `0xtx${seenFilters.length}`,
+        },
+      ];
+    });
+    const client = new KovanicaClient({ transport: { send } });
+
+    const res = await queryContractLogsPaginated(
+      client,
+      {
+        fromBlock: 100n,
+        toBlock: 1_250n,
+        address: [sampleContractBytes, sampleTestnetAddress],
+        topics: ["0xaa", null],
+      },
+      { maxSpan: 500, pageLimit: 50 },
+    );
+
+    expect(res.chunksScanned).toBe(3);
+    expect(res.pagesFetched).toBe(3);
+    expect(res.hasMore).toBe(false);
+    expect(res.nextCursor).toBeNull();
+    expect(res.decodedLogs).toBeUndefined();
+    expect(res.logs).toHaveLength(3);
+    expect(seenFilters).toEqual([
+      {
+        fromBlock: "0x64",
+        toBlock: "0x257",
+        address: [sampleContractAddress, sampleTestnetAddress],
+        topics: ["0xaa", null],
+        limit: 50,
+      },
+      {
+        fromBlock: "0x258",
+        toBlock: "0x44b",
+        address: [sampleContractAddress, sampleTestnetAddress],
+        topics: ["0xaa", null],
+        limit: 50,
+      },
+      {
+        fromBlock: "0x44c",
+        toBlock: "0x4e2",
+        address: [sampleContractAddress, sampleTestnetAddress],
+        topics: ["0xaa", null],
+        limit: 50,
+      },
+    ]);
+  });
+
+  it("paginates via derived cursor within a chunk and deduplicates boundary overlap", async () => {
+    const requests: PaginatedGetLogsRpcFilter[] = [];
+    const client: PaginatedLogsClient = {
+      getLogs: vi.fn(async (filter: PaginatedGetLogsRpcFilter) => {
+        requests.push(filter);
+        if (!filter.cursor) {
+          return [
+            {
+              address: sampleContractAddress,
+              data: "0x01",
+              blockNumber: "0xa",
+              logIndex: "0x0",
+              transactionHash: "0xtx1",
+            },
+            {
+              address: sampleContractAddress,
+              data: "0x02",
+              blockNumber: "0xa",
+              logIndex: "0x1",
+              transactionHash: "0xtx1",
+            },
+          ];
+        }
+        if (filter.cursor === "10:1") {
+          return [
+            // Overlapping duplicate from boundary — must be deduplicated
+            {
+              address: sampleContractAddress,
+              data: "0x02",
+              blockNumber: "0xa",
+              logIndex: "0x1",
+              transactionHash: "0xtx1",
+            },
+            {
+              address: sampleContractAddress,
+              data: "0x03",
+              blockNumber: "0x14",
+              logIndex: "0x0",
+              transactionHash: "0xtx2",
+            },
+          ];
+        }
+        if (filter.cursor === "20:0") {
+          return [
+            {
+              address: sampleContractAddress,
+              data: "0x04",
+              blockNumber: "0x1e",
+              logIndex: "0x2",
+              transactionHash: "0xtx3",
+            },
+          ];
+        }
+        return [];
+      }),
+    };
+
+    const res = await queryContractLogsPaginated(
+      client,
+      { fromBlock: 0, toBlock: 50 },
+      { maxSpan: 100, pageLimit: 2, maxPages: 10 },
+    );
+
+    expect(res.chunksScanned).toBe(1);
+    expect(res.pagesFetched).toBe(3);
+    expect(res.hasMore).toBe(false);
+    expect(res.nextCursor).toBeNull();
+    expect(res.logs.map((l) => l.data)).toEqual(["0x01", "0x02", "0x03", "0x04"]);
+    expect(requests.map((r) => r.cursor)).toEqual([undefined, "10:1", "20:0"]);
+  });
+
+  it("deduplicates by (transactionHash, logIndex) when blockNumber is absent", async () => {
+    let call = 0;
+    const client: PaginatedLogsClient = {
+      getLogs: vi.fn(async () => {
+        call += 1;
+        if (call === 1) {
+          return {
+            logs: [
+              { data: "0x01", transactionHash: "0xAAA", logIndex: "0x0" },
+              { data: "0x02", transactionHash: "0xAAA", logIndex: "0x1" },
+            ],
+            nextCursor: "10:1",
+          };
+        }
+        return {
+          logs: [
+            { data: "0x02", transactionHash: "0xaaa", logIndex: 1 },
+            { data: "0x03", transactionHash: "0xbbb", logIndex: 0 },
+          ],
+          nextCursor: null,
+        };
+      }),
+    };
+
+    const res = await queryContractLogsPaginated(client, { fromBlock: 0, toBlock: 20 });
+    expect(res.logs.map((l) => l.data)).toEqual(["0x01", "0x02", "0x03"]);
+    expect(res.pagesFetched).toBe(2);
+    expect(res.hasMore).toBe(false);
+    expect(res.nextCursor).toBeNull();
+  });
+
+  it("enforces maxPages cap and supports seamless cursor resumption mid-chunk and across chunks", async () => {
+    const allLogs: ContractLogEntry[] = [
+      { data: "0x01", blockNumber: "0xa", logIndex: "0x0" },
+      { data: "0x02", blockNumber: "0xa", logIndex: "0x1" },
+      { data: "0x03", blockNumber: "0x14", logIndex: "0x0" },
+      { data: "0x04", blockNumber: "0x6e", logIndex: "0x0" }, // block 110 (chunk 2)
+      { data: "0x05", blockNumber: "0xdc", logIndex: "0x0" }, // block 220 (chunk 3)
+    ];
+
+    const client: PaginatedLogsClient = {
+      getLogs: vi.fn(async (filter: PaginatedGetLogsRpcFilter) => {
+        const from = BigInt(filter.fromBlock);
+        const to = BigInt(filter.toBlock);
+        const cursor = filter.cursor ? parseContractLogCursor(filter.cursor) : null;
+        const limit = filter.limit ?? 200;
+
+        const matching = allLogs.filter((log) => {
+          const h = BigInt(log.blockNumber as string);
+          const idx = BigInt(log.logIndex as string);
+          if (h < from || h > to) return false;
+          if (cursor && (h < cursor.height || (h === cursor.height && idx <= cursor.logIndex))) {
+            return false;
+          }
+          return true;
+        });
+
+        return matching.slice(0, limit);
+      }),
+    };
+
+    // Pass 1: maxPages=1, pageLimit=2 -> stops mid-chunk after 2 logs with cursor "10:1"
+    const p1 = await queryContractLogsPaginated(
+      client,
+      { fromBlock: 0, toBlock: 250 },
+      { maxSpan: 100, maxPages: 1, pageLimit: 2 },
+    );
+    expect(p1.pagesFetched).toBe(1);
+    expect(p1.chunksScanned).toBe(1);
+    expect(p1.hasMore).toBe(true);
+    expect(p1.nextCursor).toBe("10:1");
+    expect(p1.logs.map((l) => l.data)).toEqual(["0x01", "0x02"]);
+
+    // Pass 2: resume from "10:1" with maxPages=1 -> finishes chunk [10, 109] (gets 0x03), hits chunk boundary cap
+    const p2 = await queryContractLogsPaginated(
+      client,
+      { fromBlock: 0, toBlock: 250, cursor: p1.nextCursor! },
+      { maxSpan: 100, maxPages: 1, pageLimit: 2 },
+    );
+    expect(p2.pagesFetched).toBe(1);
+    expect(p2.hasMore).toBe(true);
+    expect(p2.nextCursor).toBe("109:18446744073709551615");
+    expect(p2.logs.map((l) => l.data)).toEqual(["0x03"]);
+
+    // Pass 3: resume from chunk-boundary cursor -> scans [110, 209] and [210, 250]
+    const p3 = await queryContractLogsPaginated(
+      client,
+      { fromBlock: 0, toBlock: 250 },
+      { cursor: p2.nextCursor!, maxSpan: 100, maxPages: 5, pageLimit: 2 },
+    );
+    expect(p3.hasMore).toBe(false);
+    expect(p3.nextCursor).toBeNull();
+    expect(p3.chunksScanned).toBe(2);
+    expect(p3.logs.map((l) => l.data)).toEqual(["0x04", "0x05"]);
+
+    // Cursor beyond toBlock returns empty with zero RPC calls
+    const getLogsUnused = vi.fn(async () => []);
+    const beyond = await queryContractLogsPaginated(
+      { getLogs: getLogsUnused },
+      { fromBlock: 0, toBlock: 50, cursor: "51:0" },
+    );
+    expect(beyond).toEqual({
+      logs: [],
+      nextCursor: null,
+      hasMore: false,
+      pagesFetched: 0,
+      chunksScanned: 0,
+    });
+    expect(getLogsUnused).not.toHaveBeenCalled();
+  });
+
+  it("guards against cyclic or repeated cursors in both structured and raw-array responses", async () => {
+    // Structured response repeating nextCursor "10:0"
+    const cyclicStructured = vi.fn(async () => ({
+      logs: [{ data: "0x01", blockNumber: "0xa", logIndex: "0x0" }],
+      nextCursor: "10:0",
+    }));
+    const res1 = await queryContractLogsPaginated(
+      { getLogs: cyclicStructured },
+      { fromBlock: 0, toBlock: 50 },
+      { maxPages: 10 },
+    );
+    expect(cyclicStructured).toHaveBeenCalledTimes(2);
+    expect(res1.pagesFetched).toBe(2);
+    expect(res1.hasMore).toBe(false);
+    expect(res1.nextCursor).toBeNull();
+    expect(res1.logs).toHaveLength(1);
+
+    // Raw array response ignoring cursor and repeating same pageLimit logs
+    const cyclicRaw = vi.fn(async () => [
+      { data: "0x01", blockNumber: "0xa", logIndex: "0x0" },
+      { data: "0x02", blockNumber: "0xa", logIndex: "0x1" },
+    ]);
+    const res2 = await queryContractLogsPaginated(
+      { getLogs: cyclicRaw },
+      { fromBlock: 0, toBlock: 50 },
+      { maxPages: 10, pageLimit: 2 },
+    );
+    expect(cyclicRaw).toHaveBeenCalledTimes(2);
+    expect(res2.pagesFetched).toBe(2);
+    expect(res2.hasMore).toBe(false);
+    expect(res2.nextCursor).toBeNull();
+    expect(res2.logs).toHaveLength(2);
+  });
+
+  it("decodes collected logs via decodeContractLog when decode is enabled", async () => {
+    const htlcBytes = encodeHtlcFixture({ amount: 4242n, expiry: 900n, claimed: true });
+    const escrowBytes = encodeEscrowFixture({ amount: 9090n, deadline: 1234n, released: true });
+
+    const client: PaginatedLogsClient = {
+      getLogs: vi.fn(async () => [
+        {
+          address: sampleContractAddress,
+          topics: ["htlc"],
+          data: `0x${bytesToHex(htlcBytes)}`,
+          blockNumber: "0x1",
+          logIndex: "0x0",
+        },
+        {
+          address: sampleContractAddress,
+          topics: ["other"],
+          data: "0xdeadbeef",
+          blockNumber: "0x1",
+          logIndex: "0x1",
+        },
+        {
+          address: sampleContractAddress,
+          topics: ["escrow"],
+          data: Array.from(escrowBytes),
+          blockNumber: "0x2",
+          logIndex: "0x0",
+        },
+      ]),
+    };
+
+    const res = await queryContractLogsPaginated(
+      client,
+      { fromBlock: 1, toBlock: 2 },
+      {
+        decode: true,
+        kind: (log) => {
+          if (log.topics?.[0] === "htlc") return "htlc";
+          if (log.topics?.[0] === "escrow") return "escrow";
+          return null;
+        },
+      },
+    );
+
+    expect(res.logs).toHaveLength(3);
+    expect(res.decodedLogs).toHaveLength(2);
+    expect(res.decodedLogs[0]?.index).toBe(0);
+    expect(res.decodedLogs[0]?.kind).toBe("htlc");
+    if (res.decodedLogs[0]?.kind === "htlc") {
+      expect(res.decodedLogs[0].record.amount).toBe(4242n);
+      expect(res.decodedLogs[0].record.status).toBe("claimed");
+    }
+    expect(res.decodedLogs[1]?.index).toBe(2);
+    expect(res.decodedLogs[1]?.kind).toBe("escrow");
+    if (res.decodedLogs[1]?.kind === "escrow") {
+      expect(res.decodedLogs[1].record.amount).toBe(9090n);
+      expect(res.decodedLogs[1].record.status).toBe("released");
+    }
+
+    // Explicitly decode: false omits decodedLogs even if kind is supplied
+    const rawOnly = await queryContractLogsPaginated(
+      client,
+      { fromBlock: 1, toBlock: 2 },
+      { decode: false, kind: "htlc" },
+    );
+    expect(rawOnly.decodedLogs).toBeUndefined();
+  });
+
+  it("honors AbortSignal before start and mid-pagination between chunks", async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+
+    const getLogsPre = vi.fn(async () => []);
+    await expect(
+      queryContractLogsPaginated(
+        { getLogs: getLogsPre },
+        { fromBlock: 0, toBlock: 500 },
+        { signal: preAborted.signal },
+      ),
+    ).rejects.toBeInstanceOf(KovanicaAbortError);
+    expect(getLogsPre).not.toHaveBeenCalled();
+
+    const midController = new AbortController();
+    let calls = 0;
+    const getLogsMid = vi.fn(async () => {
+      calls += 1;
+      if (calls === 2) {
+        midController.abort();
+      }
+      return [];
+    });
+
+    await expect(
+      queryContractLogsPaginated(
+        { getLogs: getLogsMid },
+        { fromBlock: 0, toBlock: 499 },
+        { maxSpan: 100, signal: midController.signal },
+      ),
+    ).rejects.toBeInstanceOf(KovanicaAbortError);
+    expect(calls).toBe(2);
+  });
+
+  it("validates invalid ranges, maxSpan, maxPages, pageLimit, cursor, decode, and client fail-closed before RPC I/O", async () => {
+    const getLogs = vi.fn(async () => []);
+    const client: PaginatedLogsClient = { getLogs };
+
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: 20n, toBlock: 10n }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: -1n, toBlock: 10n }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: 0, toBlock: 10 }, { maxSpan: 0 }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: 0, toBlock: 10 }, { maxSpan: 1.5 }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: 0, toBlock: 10 }, { maxPages: 0 }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: 0, toBlock: 10 }, { maxPages: -3 }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: 0, toBlock: 10 }, { pageLimit: 0 }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: 0, toBlock: 10, cursor: "not-a-cursor" }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      queryContractLogsPaginated(client, { fromBlock: 0, toBlock: 10 }, { decode: true }),
+    ).rejects.toBeInstanceOf(TypeError);
+    await expect(
+      queryContractLogsPaginated(
+        client,
+        { fromBlock: 0, toBlock: 10 },
+        { decode: true, kind: "invalid_kind" as never },
+      ),
+    ).rejects.toBeInstanceOf(KovanicaDecodeError);
+    await expect(
+      queryContractLogsPaginated(
+        client,
+        { fromBlock: 0, toBlock: 10, address: "kvnc_invalid" },
+      ),
+    ).rejects.toThrow();
+    await expect(
+      queryContractLogsPaginated({} as PaginatedLogsClient, { fromBlock: 0, toBlock: 10 }),
+    ).rejects.toBeInstanceOf(TypeError);
+
+    expect(getLogs).not.toHaveBeenCalled();
   });
 });
