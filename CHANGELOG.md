@@ -2,6 +2,18 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
+## [0.7.0] - 2026-11-24
+
+### Added
+- **Priority Fee Tier Presets & RBF Fee Bump Helper** (`mempool-stats.ts`):
+  - Added `estimatePriorityFeeTiers` and `computeRbfFeeBump` for lossless `bigint` priority fee tier presets, congestion level classification (`DEFAULT_MODERATE_CONGESTION_PENDING_COUNT`, `DEFAULT_HIGH_CONGESTION_PENDING_COUNT`), and Replace-By-Fee (RBF) fee bump calculation with configurable basis-point bounds and minimum bump floors (`DEFAULT_RBF_BUMP_BPS`, `DEFAULT_RBF_MIN_BUMP_ATOMS`, `MIN_RBF_BUMP_BPS`, `MAX_RBF_BUMP_BPS`).
+- **Air-Gapped Multisig Proposal Bundle & Quorum Checker** (`airgap.ts`):
+  - Added `checkMultisigQuorum`, `encodeMultisigProposalBundle`, and `decodeMultisigProposalBundle` (alongside `MULTISIG_BUNDLE_FORMAT` and `MULTISIG_BUNDLE_VERSION`) for browser-safe, BLAKE3-checksummed air-gapped multisig proposal bundle encoding/decoding, network-tag pinning, and deduplicated signer quorum verification.
+- **Paginated Contract Log Streamer** (`events.ts`):
+  - Added `queryContractLogsPaginated` for max-span chunked and cursor-paginated contract log streaming with lossless `bigint` block ranges and bounded page traversal.
+- **Release Readiness & Metadata Parity** (`package.json`, `package-lock.json`, `README.md`, `tests/release-v070.test.ts`):
+  - Bumped `kovanica-sdk` to `v0.7.0` and added `tests/release-v070.test.ts` verifying `v0.7.0` package/lockfile metadata, `CHANGELOG.md` completeness, `README.md` version parity, `exports`/`main`/`module`/`types`/`sideEffects`/`files` consistency, and built `dist/` artifact presence.
+
 ## [0.6.0] - 2026-11-24
 
 ### Added
