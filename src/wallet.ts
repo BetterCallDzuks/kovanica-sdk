@@ -13,7 +13,8 @@ import { hmac } from "@noble/hashes/hmac.js";
 import { pbkdf2 } from "@noble/hashes/pbkdf2.js";
 import { sha512 } from "@noble/hashes/sha2.js";
 import { ADDRESS_PREFIX, TESTNET_ADDRESS_PREFIX, encodeAddress } from "./address";
-import { CHAIN_IDS } from "./chains";
+import { inspectAddress } from "./address-inspect";
+import { CHAIN_IDS, getChainConfig } from "./chains";
 import type { KovanicaClient } from "./client";
 import {
   type CallTxKind,
@@ -51,6 +52,323 @@ export interface DerivedAccount {
   publicKey: Uint8Array;
   address: string;
   path: string;
+}
+
+export interface Bip44PathHardening {
+  readonly purpose: boolean;
+  readonly coinType: boolean;
+  readonly account: boolean;
+  readonly change: boolean;
+  readonly addressIndex: boolean;
+}
+
+export interface ParsedBip44Path {
+  readonly purpose: number;
+  readonly coinType: number;
+  readonly account: number;
+  readonly change: number;
+  readonly addressIndex: number;
+  readonly hardened: Bip44PathHardening;
+  readonly allHardened: boolean;
+  readonly normalized: string;
+}
+
+export interface Bip44PathOptions {
+  /**
+   * Allowed SLIP-0044 coin type(s).
+   * Defaults to `KOVANICA_COIN_TYPE` (`3007`).
+   * Pass `null` to allow any valid coin type in `0..2147483647`.
+   */
+  coinType?: number | readonly number[] | null;
+  /**
+   * Require all five segments (including `change` and `addressIndex`) to be hardened,
+   * matching Kovanica SLIP-0010 Ed25519 derivation (`m/44'/3007'/0'/0'/0'`).
+   * Defaults to `false`.
+   */
+  requireAllHardened?: boolean;
+  /**
+   * Restrict `change` index to `0` (external) or `1` (internal/change).
+   * Defaults to `false`.
+   */
+  strictChange?: boolean;
+}
+
+export interface Bip44PathValidationResult {
+  readonly valid: boolean;
+  readonly input: string;
+  readonly parsed?: ParsedBip44Path;
+  readonly error?: string;
+}
+
+export type WatchOnlyNetwork = "mainnet" | "testnet" | "devnet" | "custom";
+
+export interface WatchOnlyAccount {
+  readonly address: string;
+  readonly format: "pro21-mainnet" | "pro21-testnet";
+  readonly payloadHex: string;
+  readonly canonicalMainnet: string;
+  readonly canonicalTestnet: string;
+  readonly chainId: number;
+  readonly network: WatchOnlyNetwork;
+  readonly readOnly: true;
+  readonly isWatchOnly: true;
+  readonly canSign: false;
+}
+
+const STRICT_UINT_REGEX = /^(?:0|[1-9]\d*)$/;
+const MAX_BIP44_INDEX = HARDENED_OFFSET - 1;
+const BIP44_LEVEL_NAMES = ["purpose", "coinType", "account", "change", "addressIndex"] as const;
+
+interface ParsedSegment {
+  value: number;
+  hardened: boolean;
+}
+
+function parseBip44Segment(rawSegment: string, levelName: string): ParsedSegment {
+  if (rawSegment.length === 0) {
+    throw new Error(`Empty BIP-44 ${levelName} segment`);
+  }
+  const lastChar = rawSegment[rawSegment.length - 1];
+  const hardened = lastChar === "'" || lastChar === "h" || lastChar === "H";
+  const numStr = hardened ? rawSegment.slice(0, -1) : rawSegment;
+
+  if (!STRICT_UINT_REGEX.test(numStr)) {
+    throw new Error(`Invalid BIP-44 ${levelName} segment '${rawSegment}'`);
+  }
+
+  const value = Number(numStr);
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_BIP44_INDEX) {
+    throw new Error(
+      `BIP-44 ${levelName} index '${numStr}' is out of range (must be 0..${MAX_BIP44_INDEX})`,
+    );
+  }
+
+  return { value, hardened };
+}
+
+function resolveAllowedCoinTypes(
+  coinTypeOption: Bip44PathOptions["coinType"],
+): readonly number[] | null {
+  if (coinTypeOption === undefined) {
+    return [KOVANICA_COIN_TYPE];
+  }
+  if (coinTypeOption === null) {
+    return null;
+  }
+  const list = typeof coinTypeOption === "number" ? [coinTypeOption] : coinTypeOption;
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new Error("BIP-44 coinType option must be a valid coin type, non-empty array, or null");
+  }
+  for (const ct of list) {
+    if (!Number.isInteger(ct) || ct < 0 || ct > MAX_BIP44_INDEX) {
+      throw new Error(
+        `Invalid BIP-44 coinType option '${String(ct)}' (must be an integer in 0..${MAX_BIP44_INDEX})`,
+      );
+    }
+  }
+  return list;
+}
+
+/**
+ * Parses and validates a BIP-44 derivation path (e.g. `m/44'/3007'/0'/0/0` or
+ * Kovanica's all-hardened SLIP-0010 form `m/44'/3007'/0'/0'/0'`).
+ *
+ * Browser-safe: zero Node.js built-in dependencies.
+ * Throws an `Error` if the path is malformed or violates the configured constraints.
+ */
+export function parseBip44Path(path: string, options: Bip44PathOptions = {}): ParsedBip44Path {
+  if (typeof path !== "string") {
+    throw new Error("Derivation path must be a string");
+  }
+
+  const trimmed = path.trim();
+  if (trimmed.length === 0) {
+    throw new Error("Derivation path must not be empty");
+  }
+
+  const allowedCoinTypes = resolveAllowedCoinTypes(options.coinType);
+  const requireAllHardened = options.requireAllHardened ?? false;
+  const strictChange = options.strictChange ?? false;
+
+  const parts = trimmed.split("/");
+  if (parts[0] !== "m" && parts[0] !== "M") {
+    throw new Error(`BIP-44 path must start with 'm/' (got '${path}')`);
+  }
+
+  const levelParts = parts.slice(1);
+  if (levelParts.length !== 5) {
+    throw new Error(
+      `BIP-44 path must have exactly 5 derivation levels (m/44'/coin_type'/account'/change/address_index), got ${levelParts.length}`,
+    );
+  }
+
+  const parsedLevels = levelParts.map((seg, idx) =>
+    parseBip44Segment(seg, BIP44_LEVEL_NAMES[idx]!),
+  );
+  const [purposeSeg, coinTypeSeg, accountSeg, changeSeg, addressIndexSeg] = parsedLevels as [
+    ParsedSegment,
+    ParsedSegment,
+    ParsedSegment,
+    ParsedSegment,
+    ParsedSegment,
+  ];
+
+  if (!purposeSeg.hardened) {
+    throw new Error(`BIP-44 purpose segment '${levelParts[0]}' must be hardened`);
+  }
+  if (!coinTypeSeg.hardened) {
+    throw new Error(`BIP-44 coinType segment '${levelParts[1]}' must be hardened`);
+  }
+  if (!accountSeg.hardened) {
+    throw new Error(`BIP-44 account segment '${levelParts[2]}' must be hardened`);
+  }
+
+  if (requireAllHardened) {
+    if (!changeSeg.hardened) {
+      throw new Error(
+        `SLIP-0010 Ed25519 requires hardened change segment '${levelParts[3]}'`,
+      );
+    }
+    if (!addressIndexSeg.hardened) {
+      throw new Error(
+        `SLIP-0010 Ed25519 requires hardened addressIndex segment '${levelParts[4]}'`,
+      );
+    }
+  }
+
+  if (purposeSeg.value !== BIP44_PURPOSE) {
+    throw new Error(
+      `Unsupported BIP-44 purpose ${purposeSeg.value}: expected ${BIP44_PURPOSE}`,
+    );
+  }
+
+  if (allowedCoinTypes !== null && !allowedCoinTypes.includes(coinTypeSeg.value)) {
+    throw new Error(
+      `Unsupported BIP-44 coin type ${coinTypeSeg.value}: expected ${allowedCoinTypes.join(" or ")}`,
+    );
+  }
+
+  if (strictChange && changeSeg.value !== 0 && changeSeg.value !== 1) {
+    throw new Error(`Invalid BIP-44 change index ${changeSeg.value}: expected 0 or 1`);
+  }
+
+  const hardened: Bip44PathHardening = Object.freeze({
+    purpose: purposeSeg.hardened,
+    coinType: coinTypeSeg.hardened,
+    account: accountSeg.hardened,
+    change: changeSeg.hardened,
+    addressIndex: addressIndexSeg.hardened,
+  });
+
+  const allHardened =
+    hardened.purpose &&
+    hardened.coinType &&
+    hardened.account &&
+    hardened.change &&
+    hardened.addressIndex;
+
+  const normalized = [
+    "m",
+    `${purposeSeg.value}'`,
+    `${coinTypeSeg.value}'`,
+    `${accountSeg.value}'`,
+    `${changeSeg.value}${changeSeg.hardened ? "'" : ""}`,
+    `${addressIndexSeg.value}${addressIndexSeg.hardened ? "'" : ""}`,
+  ].join("/");
+
+  return Object.freeze({
+    purpose: purposeSeg.value,
+    coinType: coinTypeSeg.value,
+    account: accountSeg.value,
+    change: changeSeg.value,
+    addressIndex: addressIndexSeg.value,
+    hardened,
+    allHardened,
+    normalized,
+  });
+}
+
+/**
+ * Validates a BIP-44 derivation path without throwing.
+ * Returns `{ valid: true, input, parsed }` on success or `{ valid: false, input, error }` on failure.
+ *
+ * Browser-safe: zero Node.js built-in dependencies.
+ */
+export function validateBip44Path(
+  path: string,
+  options: Bip44PathOptions = {},
+): Bip44PathValidationResult {
+  const input = typeof path === "string" ? path : String(path);
+  try {
+    const parsed = parseBip44Path(path, options);
+    return {
+      valid: true,
+      input,
+      parsed,
+    };
+  } catch (err) {
+    return {
+      valid: false,
+      input,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function resolveWatchOnlyNetwork(chainId: number): WatchOnlyNetwork {
+  const config = getChainConfig(chainId);
+  if (!config) {
+    return "custom";
+  }
+  if (chainId === CHAIN_IDS.MAINNET) return "mainnet";
+  if (chainId === CHAIN_IDS.TESTNET) return "testnet";
+  if (chainId === CHAIN_IDS.DEVNET) return "devnet";
+  return "custom";
+}
+
+/**
+ * Creates a frozen, immutable watch-only account for a Kovanica PRO-21 address.
+ * Validates the address and optional chain ID compatibility via `inspectAddress`
+ * and guarantees zero private key material is stored on the returned object.
+ *
+ * Browser-safe: zero Node.js built-in dependencies.
+ */
+export function createWatchOnlyAccount(address: string, chainId?: number): WatchOnlyAccount {
+  const inspection = inspectAddress(address, chainId);
+  if (!inspection.valid) {
+    throw new Error(inspection.error ?? "Invalid Kovanica address");
+  }
+
+  if (inspection.format !== "pro21-mainnet" && inspection.format !== "pro21-testnet") {
+    throw new Error(
+      `Watch-only accounts require a canonical PRO-21 address (${ADDRESS_PREFIX}...dag or ${TESTNET_ADDRESS_PREFIX}...dag), got ${inspection.format}`,
+    );
+  }
+
+  const resolvedChainId =
+    chainId !== undefined
+      ? chainId
+      : inspection.format === "pro21-testnet"
+        ? CHAIN_IDS.TESTNET
+        : CHAIN_IDS.MAINNET;
+
+  const normalizedAddress =
+    inspection.format === "pro21-testnet"
+      ? inspection.canonicalTestnet!
+      : inspection.canonicalMainnet!;
+
+  return Object.freeze({
+    address: normalizedAddress,
+    format: inspection.format,
+    payloadHex: inspection.payloadHex!,
+    canonicalMainnet: inspection.canonicalMainnet!,
+    canonicalTestnet: inspection.canonicalTestnet!,
+    chainId: resolvedChainId,
+    network: resolveWatchOnlyNetwork(resolvedChainId),
+    readOnly: true as const,
+    isWatchOnly: true as const,
+    canSign: false as const,
+  });
 }
 
 /**

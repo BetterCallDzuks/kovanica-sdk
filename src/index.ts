@@ -111,7 +111,7 @@ export {
   parseLegacyAddress,
 } from "./address";
 
-// HD Wallet & Key Derivation (BIP-39 / BIP-44 / SLIP-0010)
+// HD Wallet & Key Derivation (BIP-39 / BIP-44 / SLIP-0010) & Watch-Only Accounts
 export {
   BIP44_PURPOSE,
   DEV_COIN_TYPE,
@@ -119,16 +119,25 @@ export {
   KOVANICA_COIN_TYPE,
   LEGACY_COIN_TYPE,
   KovanicaWallet,
+  type Bip44PathHardening,
+  type Bip44PathOptions,
+  type Bip44PathValidationResult,
   type DerivedAccount,
+  type ParsedBip44Path,
   type Slip10Node,
+  type WatchOnlyAccount,
+  type WatchOnlyNetwork,
   addressFromSeed,
   bip39Seed,
+  createWatchOnlyAccount,
   deriveBip44,
   deriveHardened,
   derivePath,
   formatBip44Path,
   getPublicKey,
   masterFromSeed,
+  parseBip44Path,
+  validateBip44Path,
   wipe,
 } from "./wallet";
 
