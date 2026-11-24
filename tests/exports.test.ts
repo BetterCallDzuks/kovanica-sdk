@@ -18,6 +18,9 @@ type ExpectedRuntimeKind = "function" | "number" | "array";
 const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKind]> = [
   ["KovanicaClient", "function"],
   ["KovanicaWsClient", "function"],
+  ["DEFAULT_WS_MAX_QUEUE_SIZE", "number"],
+  ["DEFAULT_BLOCK_RECEIPT_CONCURRENCY", "number"],
+  ["subscribeNewBlocksWithReceipts", "function"],
   ["KovanicaWallet", "function"],
   ["HttpTransport", "function"],
   ["MAX_JSONRPC_BATCH_SIZE", "number"],

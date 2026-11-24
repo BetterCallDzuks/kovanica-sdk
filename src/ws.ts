@@ -6,12 +6,19 @@
  */
 
 import {
+  KovanicaAbortError,
   KovanicaRpcError,
   KovanicaTimeoutError,
   KovanicaTransportError,
 } from "./errors";
 import { parseLosslessJson, sanitizeDiagnostics } from "./transport";
-import type { JsonRpcRequest, JsonRpcResponse } from "./types";
+import type {
+  BlockResponse,
+  JsonRpcRequest,
+  JsonRpcResponse,
+  RequestOptions,
+  TransactionReceipt,
+} from "./types";
 
 const WS_OPEN = 1;
 const WS_CLOSING = 2;
@@ -22,6 +29,73 @@ const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_METHOD = "kovanica_chainId";
+
+/** Default maximum number of buffered notifications per subscription before backpressure drops occur. */
+export const DEFAULT_WS_MAX_QUEUE_SIZE = 256;
+
+/** Default maximum number of concurrent `getTransactionReceipt` calls per block in {@link subscribeNewBlocksWithReceipts}. */
+export const DEFAULT_BLOCK_RECEIPT_CONCURRENCY = 8;
+
+/** Backpressure policy applied when a subscription's pending queue reaches `maxQueueSize`. */
+export type WsBackpressureOverflowPolicy = "drop-oldest" | "drop-newest" | "error";
+
+const VALID_OVERFLOW_POLICIES: ReadonlySet<WsBackpressureOverflowPolicy> = new Set([
+  "drop-oldest",
+  "drop-newest",
+  "error",
+]);
+
+/** Telemetry payload emitted when an incoming event is dropped due to backpressure. */
+export interface WsBackpressureDropEvent<T = unknown> {
+  /** Overflow policy that caused the drop. */
+  policy: WsBackpressureOverflowPolicy;
+  /** Subscription ID associated with the drop, when applicable. */
+  subscriptionId?: string;
+  /** The dropped event payload. */
+  droppedItem: T;
+  /** Queue occupancy after applying the overflow policy. */
+  queueSize: number;
+  /** Configured maximum queue capacity. */
+  maxQueueSize: number;
+  /** Cumulative number of dropped events. */
+  droppedCount: number;
+}
+
+function resolvePositiveSafeIntegerOption(
+  value: number | undefined,
+  fallback: number,
+  fieldName: string,
+): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${fieldName} must be a positive safe integer (>= 1)`);
+  }
+  return value;
+}
+
+function resolveOverflowPolicy(
+  policy: WsBackpressureOverflowPolicy | undefined,
+): WsBackpressureOverflowPolicy {
+  if (policy === undefined) {
+    return "drop-oldest";
+  }
+  if (!VALID_OVERFLOW_POLICIES.has(policy)) {
+    throw new RangeError(
+      `overflowPolicy must be one of "drop-oldest", "drop-newest", or "error", got ${String(policy)}`,
+    );
+  }
+  return policy;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
 
 export interface KovanicaWsClientOptions {
   /** Full WebSocket URL of the Kovanica RPC endpoint (e.g. "ws://127.0.0.1:8545/ws"). */
@@ -52,6 +126,20 @@ export interface KovanicaWsClientOptions {
    * Default: `"kovanica_chainId"`.
    */
   heartbeatMethod?: string;
+  /**
+   * Maximum number of pending notifications buffered per subscription when an async
+   * subscription callback is still running. Must be a positive safe integer. Default: 256.
+   */
+  maxQueueSize?: number;
+  /** Alias for `maxQueueSize`. */
+  maxPendingQueue?: number;
+  /**
+   * Backpressure policy when a subscription's pending queue reaches `maxQueueSize`.
+   * Default: `"drop-oldest"`.
+   */
+  overflowPolicy?: WsBackpressureOverflowPolicy;
+  /** Optional telemetry callback invoked whenever a notification is dropped due to backpressure. */
+  onBackpressureDrop?: (event: WsBackpressureDropEvent) => void;
   /** Optional error hook for asynchronous transport, protocol, or callback errors. */
   onError?: (error: Error) => void;
 }
@@ -114,7 +202,7 @@ export interface WsSubscriptionNotification<TResult = unknown> {
   };
 }
 
-export type WsSubscriptionCallback<T = unknown> = (event: T) => void;
+export type WsSubscriptionCallback<T = unknown> = (event: T) => void | Promise<void>;
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -126,7 +214,10 @@ interface ActiveSubscription {
   clientId: string;
   serverId: string;
   params: unknown[];
-  callback: (result: unknown) => void;
+  callback: (result: unknown) => void | Promise<void>;
+  active: boolean;
+  draining: boolean;
+  pendingQueue: unknown[];
 }
 
 export class KovanicaWsClient {
@@ -139,6 +230,9 @@ export class KovanicaWsClient {
   private readonly heartbeatIntervalMs: number;
   private readonly heartbeatTimeoutMs: number;
   private readonly heartbeatMethod: string;
+  private readonly _maxQueueSize: number;
+  private readonly overflowPolicy: WsBackpressureOverflowPolicy;
+  private readonly onBackpressureDrop?: (event: WsBackpressureDropEvent) => void;
   private readonly onError?: (error: Error) => void;
 
   private ws: WebSocket | null = null;
@@ -146,6 +240,7 @@ export class KovanicaWsClient {
   private closedByUser = false;
   private idCounter = 1;
   private reconnectAttempt = 0;
+  private _droppedCount = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatIntervalTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
@@ -174,6 +269,26 @@ export class KovanicaWsClient {
     if (options.heartbeatMethod !== undefined && options.heartbeatMethod.trim().length === 0) {
       throw new Error("heartbeatMethod must be a non-empty string");
     }
+    if (options.maxQueueSize !== undefined) {
+      resolvePositiveSafeIntegerOption(
+        options.maxQueueSize,
+        DEFAULT_WS_MAX_QUEUE_SIZE,
+        "maxQueueSize",
+      );
+    }
+    if (options.maxPendingQueue !== undefined) {
+      resolvePositiveSafeIntegerOption(
+        options.maxPendingQueue,
+        DEFAULT_WS_MAX_QUEUE_SIZE,
+        "maxPendingQueue",
+      );
+    }
+    if (
+      options.onBackpressureDrop !== undefined &&
+      typeof options.onBackpressureDrop !== "function"
+    ) {
+      throw new TypeError("onBackpressureDrop must be a function when provided");
+    }
 
     this.url = options.url.trim();
     this.reconnectEnabled = options.reconnect ?? false;
@@ -184,6 +299,10 @@ export class KovanicaWsClient {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 0;
     this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
     this.heartbeatMethod = options.heartbeatMethod?.trim() ?? DEFAULT_HEARTBEAT_METHOD;
+    this._maxQueueSize =
+      options.maxQueueSize ?? options.maxPendingQueue ?? DEFAULT_WS_MAX_QUEUE_SIZE;
+    this.overflowPolicy = resolveOverflowPolicy(options.overflowPolicy);
+    this.onBackpressureDrop = options.onBackpressureDrop;
     this.onError = options.onError;
   }
 
@@ -195,6 +314,25 @@ export class KovanicaWsClient {
   /** Number of currently tracked active subscriptions. */
   get activeSubscriptionCount(): number {
     return this.subscriptionsByClientId.size;
+  }
+
+  /** Configured per-subscription maximum backpressure queue capacity. */
+  get maxQueueSize(): number {
+    return this._maxQueueSize;
+  }
+
+  /** Cumulative number of subscription notifications dropped due to backpressure. */
+  get droppedCount(): number {
+    return this._droppedCount;
+  }
+
+  /** Total number of notifications currently buffered across all active subscriptions. */
+  get pendingQueueSize(): number {
+    let total = 0;
+    for (const sub of this.subscriptionsByClientId.values()) {
+      total += sub.pendingQueue.length;
+    }
+    return total;
   }
 
   /**
@@ -320,6 +458,10 @@ export class KovanicaWsClient {
     this.connectPromise = null;
 
     this.rejectAllPending(new KovanicaTransportError("WebSocket connection closed"));
+    for (const sub of this.subscriptionsByClientId.values()) {
+      sub.active = false;
+      sub.pendingQueue.length = 0;
+    }
     this.subscriptionsByClientId.clear();
     this.subscriptionsByServerId.clear();
 
@@ -369,6 +511,18 @@ export class KovanicaWsClient {
   }
 
   /**
+   * Subscribes to `newHeads` and enriches each incoming block head with its transaction receipts
+   * fetched via `rpcClient` using bounded concurrency and a capped backpressure queue.
+   */
+  async subscribeNewBlocksWithReceipts(
+    rpcClient: BlockReceiptsRpcClient,
+    onBlock: (event: BlockWithReceiptsEvent) => void | Promise<void>,
+    options?: SubscribeNewBlocksWithReceiptsOptions,
+  ): Promise<BlockWithReceiptsSubscriptionHandle> {
+    return subscribeNewBlocksWithReceipts(this, rpcClient, onBlock, options);
+  }
+
+  /**
    * Unsubscribes from an active subscription by ID.
    * Returns `true` if the server confirmed the subscription was removed.
    */
@@ -380,6 +534,8 @@ export class KovanicaWsClient {
     const targetServerId = sub ? sub.serverId : subscriptionId;
 
     if (sub) {
+      sub.active = false;
+      sub.pendingQueue.length = 0;
       this.subscriptionsByClientId.delete(sub.clientId);
       this.subscriptionsByServerId.delete(sub.serverId);
     }
@@ -408,6 +564,9 @@ export class KovanicaWsClient {
       serverId,
       params,
       callback,
+      active: true,
+      draining: false,
+      pendingQueue: [],
     };
     this.subscriptionsByClientId.set(entry.clientId, entry);
     this.subscriptionsByServerId.set(entry.serverId, entry);
@@ -517,12 +676,8 @@ export class KovanicaWsClient {
       const params = record.params as { subscription?: unknown; result?: unknown };
       if (typeof params.subscription === "string") {
         const sub = this.subscriptionsByServerId.get(params.subscription);
-        if (sub) {
-          try {
-            sub.callback(params.result);
-          } catch (err) {
-            this.emitError(err instanceof Error ? err : new Error(String(err)));
-          }
+        if (sub && sub.active) {
+          this.dispatchSubscriptionEvent(sub, params.result);
         }
       }
       return;
@@ -738,9 +893,627 @@ export class KovanicaWsClient {
     }
   }
 
+  private dispatchSubscriptionEvent(sub: ActiveSubscription, payload: unknown): void {
+    if (!sub.active) {
+      return;
+    }
+
+    if (sub.draining) {
+      if (sub.pendingQueue.length < this._maxQueueSize) {
+        sub.pendingQueue.push(payload);
+        return;
+      }
+
+      this._droppedCount += 1;
+      if (this.overflowPolicy === "drop-oldest") {
+        const droppedItem = sub.pendingQueue.shift();
+        sub.pendingQueue.push(payload);
+        this.emitBackpressureDrop({
+          policy: "drop-oldest",
+          subscriptionId: sub.clientId,
+          droppedItem,
+          queueSize: sub.pendingQueue.length,
+          maxQueueSize: this._maxQueueSize,
+          droppedCount: this._droppedCount,
+        });
+        return;
+      }
+
+      const policy = this.overflowPolicy;
+      this.emitBackpressureDrop({
+        policy,
+        subscriptionId: sub.clientId,
+        droppedItem: payload,
+        queueSize: sub.pendingQueue.length,
+        maxQueueSize: this._maxQueueSize,
+        droppedCount: this._droppedCount,
+      });
+
+      if (policy === "error") {
+        this.emitError(
+          new KovanicaTransportError(
+            `WebSocket subscription backpressure queue overflow (maxQueueSize=${this._maxQueueSize})`,
+          ),
+        );
+      }
+      return;
+    }
+
+    let result: void | Promise<void>;
+    try {
+      result = sub.callback(payload);
+    } catch (err) {
+      this.emitError(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+
+    if (isPromiseLike(result)) {
+      sub.draining = true;
+      void Promise.resolve(result)
+        .catch((err) => {
+          this.emitError(err instanceof Error ? err : new Error(String(err)));
+        })
+        .finally(() => {
+          void this.drainSubscriptionQueue(sub);
+        });
+    }
+  }
+
+  private async drainSubscriptionQueue(sub: ActiveSubscription): Promise<void> {
+    try {
+      while (sub.active && sub.pendingQueue.length > 0) {
+        const nextPayload = sub.pendingQueue.shift();
+        try {
+          const res = sub.callback(nextPayload);
+          if (isPromiseLike(res)) {
+            await res;
+          }
+        } catch (err) {
+          this.emitError(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+    } finally {
+      sub.draining = false;
+    }
+  }
+
+  private emitBackpressureDrop(event: WsBackpressureDropEvent): void {
+    if (!this.onBackpressureDrop) {
+      return;
+    }
+    try {
+      this.onBackpressureDrop(event);
+    } catch {
+      // Never allow telemetry hooks to crash WebSocket message dispatch
+    }
+  }
+
   private emitError(error: Error): void {
     if (this.onError) {
       this.onError(error);
     }
   }
+}
+
+// ============================================================================
+// Typed Block + Receipt Stream (`subscribeNewBlocksWithReceipts`)
+// ============================================================================
+
+/** Minimal WebSocket client interface required by {@link subscribeNewBlocksWithReceipts}. */
+export interface SubscribeNewHeadsWsClient {
+  subscribeNewHeads(cb: WsSubscriptionCallback<WsNewHeadEvent>): Promise<string>;
+  unsubscribe(subscriptionId: string): Promise<boolean>;
+}
+
+/** Minimal JSON-RPC client interface required by {@link subscribeNewBlocksWithReceipts}. */
+export interface BlockReceiptsRpcClient {
+  getTransactionReceipt(
+    hash: string,
+    options?: RequestOptions,
+  ): Promise<TransactionReceipt | null>;
+  getBlockByHash?(
+    hash: string,
+    fullTransactions?: boolean,
+    options?: RequestOptions,
+  ): Promise<BlockResponse | null>;
+}
+
+/** Diagnostic context passed alongside errors reported via `options.onError`. */
+export interface BlockReceiptErrorContext {
+  stage: "block" | "receipt" | "callback" | "backpressure" | "unsubscribe";
+  head?: WsNewHeadEvent;
+  txHash?: string;
+}
+
+/** Enriched block event delivered to `onBlock` by {@link subscribeNewBlocksWithReceipts}. */
+export interface BlockWithReceiptsEvent {
+  /** Raw block head received from the `newHeads` WebSocket subscription. */
+  head: WsNewHeadEvent;
+  /** Optional full block fetched via `getBlockByHash` when `head.transactions` was omitted. */
+  block?: BlockResponse | null;
+  /** Transaction receipts fetched for this block, in deterministic transaction order. */
+  receipts: TransactionReceipt[];
+  /** Number of incoming block heads dropped due to backpressure immediately before this block. */
+  droppedBeforeThis: number;
+}
+
+/** Options for {@link subscribeNewBlocksWithReceipts}. */
+export interface SubscribeNewBlocksWithReceiptsOptions {
+  /**
+   * Maximum number of pending block heads buffered while a previous block is being
+   * enriched/processed. Must be a positive safe integer. Default: 256.
+   */
+  maxQueueSize?: number;
+  /** Alias for `maxQueueSize`. */
+  maxPendingQueue?: number;
+  /**
+   * Backpressure policy applied when a new block head arrives while the pending queue is full.
+   * - `"drop-oldest"` (default): evict the oldest buffered head and enqueue the newest.
+   * - `"drop-newest"`: discard the newly arrived head.
+   * - `"error"`: discard the newly arrived head and invoke `onError` with a `KovanicaTransportError`.
+   */
+  overflowPolicy?: WsBackpressureOverflowPolicy;
+  /**
+   * Maximum number of concurrent `getTransactionReceipt` RPC calls per block.
+   * Must be a positive safe integer. Default: 8.
+   */
+  receiptConcurrency?: number;
+  /**
+   * When `true` (default) and an incoming `newHeads` payload omits `transactions`,
+   * attempts to fetch the block transaction list via `rpcClient.getBlockByHash`.
+   */
+  fetchMissingBlock?: boolean;
+  /** Optional per-request options (`timeoutMs`, `signal`) forwarded to RPC calls. */
+  requestOptions?: RequestOptions;
+  /** Optional `AbortSignal` that unsubscribes and cancels in-flight receipt fetches when aborted. */
+  signal?: AbortSignal;
+  /**
+   * Optional error handler invoked for block/receipt fetch errors, backpressure `"error"` policy
+   * overflows, or `onBlock` callback failures. Errors are isolated and never crash the loop.
+   */
+  onError?: (error: Error, context?: BlockReceiptErrorContext) => void;
+  /** Optional telemetry callback invoked whenever a block head is dropped due to backpressure. */
+  onBackpressureDrop?: (event: WsBackpressureDropEvent<WsNewHeadEvent>) => void;
+}
+
+/** Active subscription handle returned by {@link subscribeNewBlocksWithReceipts}. */
+export interface BlockWithReceiptsSubscriptionHandle {
+  /** Subscription ID returned by `wsClient.subscribeNewHeads`. */
+  subscriptionId: string;
+  /** Cumulative number of block heads dropped due to backpressure. */
+  readonly droppedCount: number;
+  /** Current number of block heads waiting in the backpressure queue. */
+  readonly pendingCount: number;
+  /** Unsubscribes from `newHeads`, aborts in-flight receipt fetches, and clears buffered heads. */
+  unsubscribe: () => Promise<boolean>;
+}
+
+interface QueuedBlockHead {
+  head: WsNewHeadEvent;
+  droppedBefore: number;
+}
+
+function extractTransactionHash(entry: unknown): string | null {
+  if (typeof entry === "string") {
+    const trimmed = entry.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+    const record = entry as { hash?: unknown; tx_hash?: unknown };
+    if (typeof record.hash === "string" && record.hash.trim().length > 0) {
+      return record.hash.trim();
+    }
+    if (typeof record.tx_hash === "string" && record.tx_hash.trim().length > 0) {
+      return record.tx_hash.trim();
+    }
+  }
+  return null;
+}
+
+function extractTransactionHashesFromList(transactions: ReadonlyArray<unknown>): string[] {
+  const hashes: string[] = [];
+  for (const tx of transactions) {
+    const hash = extractTransactionHash(tx);
+    if (hash !== null) {
+      hashes.push(hash);
+    }
+  }
+  return hashes;
+}
+
+function createCombinedBlockRequestOptions(
+  stopSignal: AbortSignal,
+  requestOptions: RequestOptions | undefined,
+): { options: RequestOptions; cleanup: () => void } {
+  const reqSignal = requestOptions?.signal;
+  if (!reqSignal || reqSignal === stopSignal) {
+    return {
+      options: { ...requestOptions, signal: stopSignal },
+      cleanup: () => {},
+    };
+  }
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (stopSignal.aborted || reqSignal.aborted) {
+    controller.abort();
+  } else {
+    stopSignal.addEventListener("abort", onAbort, { once: true });
+    reqSignal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  return {
+    options: { ...requestOptions, signal: controller.signal },
+    cleanup: () => {
+      stopSignal.removeEventListener("abort", onAbort);
+      reqSignal.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+/**
+ * Subscribes to live block heads (`newHeads`) via `wsClient`, enriches each block with its
+ * transaction receipts fetched via `rpcClient` using bounded concurrency and a capped
+ * backpressure queue, and delivers `{ head, receipts, droppedBeforeThis }` to `onBlock`
+ * in arrival order.
+ */
+export async function subscribeNewBlocksWithReceipts(
+  wsClient: SubscribeNewHeadsWsClient,
+  rpcClient: BlockReceiptsRpcClient,
+  onBlock: (event: BlockWithReceiptsEvent) => void | Promise<void>,
+  options?: SubscribeNewBlocksWithReceiptsOptions,
+): Promise<BlockWithReceiptsSubscriptionHandle> {
+  if (
+    !wsClient ||
+    typeof wsClient !== "object" ||
+    typeof wsClient.subscribeNewHeads !== "function" ||
+    typeof wsClient.unsubscribe !== "function"
+  ) {
+    throw new TypeError(
+      "subscribeNewBlocksWithReceipts: wsClient must implement subscribeNewHeads() and unsubscribe()",
+    );
+  }
+  if (
+    !rpcClient ||
+    typeof rpcClient !== "object" ||
+    typeof rpcClient.getTransactionReceipt !== "function"
+  ) {
+    throw new TypeError(
+      "subscribeNewBlocksWithReceipts: rpcClient must implement getTransactionReceipt()",
+    );
+  }
+  if (typeof onBlock !== "function") {
+    throw new TypeError("subscribeNewBlocksWithReceipts: onBlock callback must be a function");
+  }
+  if (options !== undefined && (options === null || typeof options !== "object")) {
+    throw new TypeError("subscribeNewBlocksWithReceipts: options must be an object when provided");
+  }
+
+  if (options?.maxQueueSize !== undefined) {
+    resolvePositiveSafeIntegerOption(
+      options.maxQueueSize,
+      DEFAULT_WS_MAX_QUEUE_SIZE,
+      "maxQueueSize",
+    );
+  }
+  if (options?.maxPendingQueue !== undefined) {
+    resolvePositiveSafeIntegerOption(
+      options.maxPendingQueue,
+      DEFAULT_WS_MAX_QUEUE_SIZE,
+      "maxPendingQueue",
+    );
+  }
+  const maxQueueSize =
+    options?.maxQueueSize ?? options?.maxPendingQueue ?? DEFAULT_WS_MAX_QUEUE_SIZE;
+  const overflowPolicy = resolveOverflowPolicy(options?.overflowPolicy);
+  const receiptConcurrency = resolvePositiveSafeIntegerOption(
+    options?.receiptConcurrency,
+    DEFAULT_BLOCK_RECEIPT_CONCURRENCY,
+    "receiptConcurrency",
+  );
+  const fetchMissingBlock = options?.fetchMissingBlock ?? true;
+
+  if (options?.onError !== undefined && typeof options.onError !== "function") {
+    throw new TypeError("subscribeNewBlocksWithReceipts: onError must be a function when provided");
+  }
+  if (
+    options?.onBackpressureDrop !== undefined &&
+    typeof options.onBackpressureDrop !== "function"
+  ) {
+    throw new TypeError(
+      "subscribeNewBlocksWithReceipts: onBackpressureDrop must be a function when provided",
+    );
+  }
+
+  const externalSignal = options?.signal;
+  if (externalSignal?.aborted) {
+    throw new KovanicaAbortError("subscribeNewBlocksWithReceipts: subscription was aborted");
+  }
+
+  const onError = options?.onError;
+  const onBackpressureDrop = options?.onBackpressureDrop;
+  const stopController = new AbortController();
+
+  let active = true;
+  let processing = false;
+  let totalDropped = 0;
+  let pendingDropsAfterTail = 0;
+  let subscriptionId = "";
+  let unsubscribePromise: Promise<boolean> | null = null;
+  const queue: QueuedBlockHead[] = [];
+
+  const reportError = (err: unknown, context: BlockReceiptErrorContext): void => {
+    if (!onError) {
+      return;
+    }
+    const normalized = err instanceof Error ? err : new Error(String(err));
+    try {
+      onError(normalized, context);
+    } catch {
+      // Never allow an error hook failure to crash the subscription loop
+    }
+  };
+
+  const reportBackpressureDrop = (droppedItem: WsNewHeadEvent): void => {
+    if (!onBackpressureDrop) {
+      return;
+    }
+    try {
+      onBackpressureDrop({
+        policy: overflowPolicy,
+        ...(subscriptionId ? { subscriptionId } : {}),
+        droppedItem,
+        queueSize: queue.length,
+        maxQueueSize,
+        droppedCount: totalDropped,
+      });
+    } catch {
+      // Never allow telemetry hooks to crash the subscription loop
+    }
+  };
+
+  const fetchReceiptsForBlock = async (
+    head: WsNewHeadEvent,
+  ): Promise<{ block?: BlockResponse | null; receipts: TransactionReceipt[] }> => {
+    const { options: reqOpts, cleanup } = createCombinedBlockRequestOptions(
+      stopController.signal,
+      options?.requestOptions,
+    );
+
+    try {
+      let block: BlockResponse | null | undefined;
+      let txHashes: string[] = [];
+
+      if (Array.isArray(head.transactions)) {
+        txHashes = extractTransactionHashesFromList(head.transactions);
+      } else if (
+        fetchMissingBlock &&
+        typeof rpcClient.getBlockByHash === "function"
+      ) {
+        const blockHash =
+          typeof head.hash === "string" && head.hash.trim().length > 0
+            ? head.hash.trim()
+            : typeof head.digest === "string" && head.digest.trim().length > 0
+              ? head.digest.trim()
+              : null;
+
+        if (blockHash !== null && active && !stopController.signal.aborted) {
+          try {
+            block = await rpcClient.getBlockByHash(blockHash, false, reqOpts);
+            if (block && Array.isArray(block.transactions)) {
+              txHashes = extractTransactionHashesFromList(block.transactions);
+            }
+          } catch (err) {
+            if (active && !stopController.signal.aborted) {
+              reportError(err, { stage: "block", head });
+            }
+            return { ...(block !== undefined ? { block } : {}), receipts: [] };
+          }
+        }
+      }
+
+      if (txHashes.length === 0 || !active || stopController.signal.aborted) {
+        return { ...(block !== undefined ? { block } : {}), receipts: [] };
+      }
+
+      const orderedReceipts: Array<TransactionReceipt | null> = new Array(txHashes.length).fill(
+        null,
+      );
+      let nextIndex = 0;
+      const workerCount = Math.min(receiptConcurrency, txHashes.length);
+
+      const worker = async (): Promise<void> => {
+        while (active && !stopController.signal.aborted) {
+          const idx = nextIndex;
+          if (idx >= txHashes.length) {
+            return;
+          }
+          nextIndex += 1;
+
+          const txHash = txHashes[idx]!;
+          try {
+            const receipt = await rpcClient.getTransactionReceipt(txHash, reqOpts);
+            orderedReceipts[idx] = receipt ?? null;
+          } catch (err) {
+            if (active && !stopController.signal.aborted) {
+              reportError(err, { stage: "receipt", head, txHash });
+            }
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+      const receipts: TransactionReceipt[] = [];
+      for (const receipt of orderedReceipts) {
+        if (receipt !== null) {
+          receipts.push(receipt);
+        }
+      }
+
+      return { ...(block !== undefined ? { block } : {}), receipts };
+    } finally {
+      cleanup();
+    }
+  };
+
+  const processEntry = async (entry: QueuedBlockHead): Promise<void> => {
+    if (!active || stopController.signal.aborted) {
+      return;
+    }
+
+    const { block, receipts } = await fetchReceiptsForBlock(entry.head);
+    if (!active || stopController.signal.aborted) {
+      return;
+    }
+
+    const event: BlockWithReceiptsEvent = {
+      head: entry.head,
+      ...(block !== undefined ? { block } : {}),
+      receipts,
+      droppedBeforeThis: entry.droppedBefore,
+    };
+
+    try {
+      await onBlock(event);
+    } catch (err) {
+      if (active && !stopController.signal.aborted) {
+        reportError(err, { stage: "callback", head: entry.head });
+      }
+    }
+  };
+
+  const drainQueue = async (): Promise<void> => {
+    if (processing) {
+      return;
+    }
+    processing = true;
+    try {
+      while (active && !stopController.signal.aborted && queue.length > 0) {
+        const nextEntry = queue.shift()!;
+        await processEntry(nextEntry);
+      }
+    } finally {
+      processing = false;
+      if (active && !stopController.signal.aborted && queue.length > 0) {
+        void drainQueue();
+      }
+    }
+  };
+
+  const handleIncomingHead = (head: WsNewHeadEvent): void => {
+    if (!active || stopController.signal.aborted) {
+      return;
+    }
+
+    if (!processing && queue.length === 0) {
+      const immediateEntry: QueuedBlockHead = {
+        head,
+        droppedBefore: pendingDropsAfterTail,
+      };
+      pendingDropsAfterTail = 0;
+      processing = true;
+      void processEntry(immediateEntry).finally(() => {
+        processing = false;
+        if (active && !stopController.signal.aborted && queue.length > 0) {
+          void drainQueue();
+        }
+      });
+      return;
+    }
+
+    if (queue.length < maxQueueSize) {
+      queue.push({ head, droppedBefore: pendingDropsAfterTail });
+      pendingDropsAfterTail = 0;
+      if (!processing) {
+        void drainQueue();
+      }
+      return;
+    }
+
+    totalDropped += 1;
+
+    if (overflowPolicy === "drop-oldest") {
+      const evicted = queue.shift()!;
+      const carriedDrops = evicted.droppedBefore + 1;
+      if (queue.length > 0) {
+        queue[0]!.droppedBefore += carriedDrops;
+        queue.push({ head, droppedBefore: pendingDropsAfterTail });
+      } else {
+        queue.push({ head, droppedBefore: carriedDrops + pendingDropsAfterTail });
+      }
+      pendingDropsAfterTail = 0;
+      reportBackpressureDrop(evicted.head);
+      return;
+    }
+
+    pendingDropsAfterTail += 1;
+    reportBackpressureDrop(head);
+
+    if (overflowPolicy === "error") {
+      reportError(
+        new KovanicaTransportError(
+          `Block receipt subscription backpressure queue overflow (maxQueueSize=${maxQueueSize})`,
+        ),
+        { stage: "backpressure", head },
+      );
+    }
+  };
+
+  const onExternalAbort = (): void => {
+    void unsubscribe().catch((err) => {
+      reportError(err, { stage: "unsubscribe" });
+    });
+  };
+
+  const unsubscribe = (): Promise<boolean> => {
+    if (unsubscribePromise) {
+      return unsubscribePromise;
+    }
+    active = false;
+    queue.length = 0;
+    if (externalSignal) {
+      externalSignal.removeEventListener("abort", onExternalAbort);
+    }
+    stopController.abort();
+
+    if (!subscriptionId) {
+      unsubscribePromise = Promise.resolve(false);
+      return unsubscribePromise;
+    }
+
+    unsubscribePromise = wsClient.unsubscribe(subscriptionId);
+    return unsubscribePromise;
+  };
+
+  if (externalSignal) {
+    externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+  }
+
+  try {
+    subscriptionId = await wsClient.subscribeNewHeads(handleIncomingHead);
+  } catch (err) {
+    active = false;
+    if (externalSignal) {
+      externalSignal.removeEventListener("abort", onExternalAbort);
+    }
+    stopController.abort();
+    throw err;
+  }
+
+  if (stopController.signal.aborted) {
+    await wsClient.unsubscribe(subscriptionId).catch(() => {});
+    throw new KovanicaAbortError("subscribeNewBlocksWithReceipts: subscription was aborted");
+  }
+
+  return {
+    subscriptionId,
+    get droppedCount(): number {
+      return totalDropped;
+    },
+    get pendingCount(): number {
+      return queue.length;
+    },
+    unsubscribe,
+  };
 }

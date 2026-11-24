@@ -28,8 +28,18 @@ export {
   sanitizeRpcUrl,
 } from "./transport";
 export {
+  DEFAULT_BLOCK_RECEIPT_CONCURRENCY,
+  DEFAULT_WS_MAX_QUEUE_SIZE,
   KovanicaWsClient,
+  type BlockReceiptErrorContext,
+  type BlockReceiptsRpcClient,
+  type BlockWithReceiptsEvent,
+  type BlockWithReceiptsSubscriptionHandle,
   type KovanicaWsClientOptions,
+  type SubscribeNewBlocksWithReceiptsOptions,
+  type SubscribeNewHeadsWsClient,
+  type WsBackpressureDropEvent,
+  type WsBackpressureOverflowPolicy,
   type WsCommittedLeaderEvent,
   type WsExecutionEvent,
   type WsLogFilter,
@@ -37,6 +47,7 @@ export {
   type WsNewHeadEvent,
   type WsSubscriptionCallback,
   type WsSubscriptionNotification,
+  subscribeNewBlocksWithReceipts,
 } from "./ws";
 
 // Types & Schemas
