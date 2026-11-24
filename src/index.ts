@@ -317,6 +317,20 @@ export {
   type VaultCreateParams,
 } from "./facades";
 
+// Wave A: Atomic Batch & Sponsored (Gasless) Transactions
+export {
+  MAX_BATCH_ACTIONS,
+  PREV_DEPLOYED_CONTRACT,
+  SPONSOR_DOMAIN,
+  type BatchAction,
+  computeBatchSigningHash,
+  computeSponsorSigningHash,
+  signBatchTransaction,
+  signSponsoredTransaction,
+  signingBatchKindBytes,
+  wireBatchKindBytes,
+} from "./wave-a";
+
 // Paginated Contract Log History & Typed Event Streams
 export {
   DEFAULT_CONTRACT_LOGS_MAX_PAGES,
