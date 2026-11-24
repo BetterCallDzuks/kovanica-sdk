@@ -412,13 +412,29 @@ export {
   encodeMultisigProposalBundle,
 } from "./airgap";
 
-// Mempool Fee Statistics & Fee-Tier Recommendations
+// Mempool Fee Statistics, Priority Fee Tier Presets & RBF Fee Bump
 export {
+  DEFAULT_HIGH_CONGESTION_PENDING_COUNT,
+  DEFAULT_MODERATE_CONGESTION_PENDING_COUNT,
+  DEFAULT_RBF_BUMP_BPS,
+  DEFAULT_RBF_MIN_BUMP_ATOMS,
+  MAX_RBF_BUMP_BPS,
+  MIN_RBF_BUMP_BPS,
+  type EstimatePriorityFeeTiersOptions,
   type FeeRecommendationOptions,
   type FeeRecommendationTier,
   type FeeRecommendations,
+  type MempoolCongestionLevel,
   type MempoolFeeStats,
+  type PriorityFeeTier,
+  type PriorityFeeTierName,
+  type PriorityFeeTiersClient,
+  type PriorityFeeTiersEstimate,
+  type RbfFeeBumpOptions,
+  type RbfFeeBumpResult,
   computeFeeRecommendations,
+  computeRbfFeeBump,
+  estimatePriorityFeeTiers,
   parseMempoolFeeStats,
 } from "./mempool-stats";
 
