@@ -61,6 +61,9 @@ const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKi
   ["decodeAirgapTxEnvelope", "function"],
   ["parseMempoolFeeStats", "function"],
   ["computeFeeRecommendations", "function"],
+  ["parseBip44Path", "function"],
+  ["validateBip44Path", "function"],
+  ["createWatchOnlyAccount", "function"],
 ];
 
 function assertPublicExportSurface(mod: Record<string, unknown>, label: string): void {
