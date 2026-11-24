@@ -331,6 +331,29 @@ export {
   wireBatchKindBytes,
 } from "./wave-a";
 
+// Waves B, C, and D: EIP-1559, Storage Rent, Passkeys, Session Keys, Scheduler, Bridge, PQ
+export {
+  BASE_FEE_MAX_CHANGE_DENOMINATOR,
+  MIN_BASE_FEE_PER_BYTE,
+  ML_DSA_65_PUBKEY_BYTES,
+  ML_DSA_65_SIG_BYTES,
+  STORAGE_DEPOSIT_PER_BYTE,
+  SignatureScheme,
+  TARGET_BLOCK_BYTES,
+  type SessionKeyPolicy,
+  buildBridgeAttestMintCall,
+  buildBridgeInitCall,
+  buildBridgeWithdrawCall,
+  buildSchedulerCreateJobCall,
+  buildSchedulerJobIdCall,
+  checkSessionPolicy,
+  computePqHybridDigest,
+  computeStorageDepositDelta,
+  computeTotalRequiredFee,
+  deriveTypedAddress,
+  nextBaseFeePerByte,
+} from "./waves-bcd";
+
 // Paginated Contract Log History & Typed Event Streams
 export {
   DEFAULT_CONTRACT_LOGS_MAX_PAGES,
