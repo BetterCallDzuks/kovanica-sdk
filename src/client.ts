@@ -90,6 +90,7 @@ export const DEFAULT_IDEMPOTENT_RPC_METHODS: ReadonlyArray<string> = Object.free
   "kovanica_getCode",
   "kovanica_getTransactionByHash",
   "kovanica_getTransactionReceipt",
+  "kovanica_getTransactionHistory",
   "kovanica_getPendingTransactions",
   "kovanica_mempoolStats",
   "kovanica_getLogs",

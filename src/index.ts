@@ -389,3 +389,21 @@ export {
   computeFeeRecommendations,
   parseMempoolFeeStats,
 } from "./mempool-stats";
+
+// Paginated Account Transaction History
+export {
+  DEFAULT_ACCOUNT_TX_HISTORY_LIMIT,
+  DEFAULT_ACCOUNT_TX_HISTORY_MAX_PAGES,
+  MAX_ACCOUNT_TX_HISTORY_LIMIT,
+  type AccountTxDirection,
+  type AccountTxHistoryClient,
+  type AccountTxHistoryEntry,
+  type AccountTxHistoryResult,
+  type AccountTxStatus,
+  type GetAccountTxHistoryOptions,
+  type GetTransactionHistoryParams,
+  type RawAccountTxHistoryEntry,
+  type RawAccountTxHistoryPage,
+  getAccountTxHistory,
+  parseAccountTxHistoryEntry,
+} from "./history";
