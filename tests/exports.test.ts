@@ -13,7 +13,7 @@ const distCjsPath = resolve(distDir, "index.cjs");
 const distDtsPath = resolve(distDir, "index.d.ts");
 const distDctsPath = resolve(distDir, "index.d.cts");
 
-type ExpectedRuntimeKind = "function" | "number" | "array";
+type ExpectedRuntimeKind = "function" | "number" | "bigint" | "array";
 
 const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKind]> = [
   ["KovanicaClient", "function"],
@@ -64,6 +64,14 @@ const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKi
   ["decodeAirgapTxEnvelope", "function"],
   ["parseMempoolFeeStats", "function"],
   ["computeFeeRecommendations", "function"],
+  ["computeRbfFeeBump", "function"],
+  ["estimatePriorityFeeTiers", "function"],
+  ["DEFAULT_RBF_BUMP_BPS", "number"],
+  ["MIN_RBF_BUMP_BPS", "number"],
+  ["MAX_RBF_BUMP_BPS", "number"],
+  ["DEFAULT_RBF_MIN_BUMP_ATOMS", "bigint"],
+  ["DEFAULT_MODERATE_CONGESTION_PENDING_COUNT", "number"],
+  ["DEFAULT_HIGH_CONGESTION_PENDING_COUNT", "number"],
   ["parseBip44Path", "function"],
   ["validateBip44Path", "function"],
   ["createWatchOnlyAccount", "function"],
@@ -82,6 +90,9 @@ function assertPublicExportSurface(mod: Record<string, unknown>, label: string):
     } else if (expectedKind === "number") {
       expect(typeof value, `${label}.${symbol} should be a number`).toBe("number");
       expect(value as number, `${label}.${symbol} should be positive`).toBeGreaterThan(0);
+    } else if (expectedKind === "bigint") {
+      expect(typeof value, `${label}.${symbol} should be a bigint`).toBe("bigint");
+      expect((value as bigint) > 0n, `${label}.${symbol} should be positive`).toBe(true);
     } else {
       expect(typeof value, `${label}.${symbol} should be a function`).toBe("function");
     }

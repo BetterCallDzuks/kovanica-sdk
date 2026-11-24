@@ -6,7 +6,8 @@
  */
 
 import { DEFAULT_FEE_BUFFER_MULTIPLIER_BPS, applyFeeBuffer } from "./finality";
-import { parseQuantity } from "./units";
+import type { RequestOptions } from "./types";
+import { formatKvnc, parseQuantity } from "./units";
 
 /**
  * Parsed response from `kovanica_mempoolStats`.
@@ -192,5 +193,330 @@ export function computeFeeRecommendations(
     standard,
     priority,
     source: "mempool",
+  };
+}
+
+// ============================================================================
+// Replace-By-Fee (RBF) Fee Bump Helper
+// ============================================================================
+
+const BPS_DENOMINATOR = 10_000n;
+
+/** Default RBF fee bump in basis points (`1_500` = +15%). */
+export const DEFAULT_RBF_BUMP_BPS = 1_500;
+
+/** Minimum allowed RBF fee bump in basis points (`100` = +1%). */
+export const MIN_RBF_BUMP_BPS = 100;
+
+/** Maximum allowed RBF fee bump in basis points (`50_000` = +500%). */
+export const MAX_RBF_BUMP_BPS = 50_000;
+
+/** Default minimum absolute fee increment in atoms for RBF (`1n`). */
+export const DEFAULT_RBF_MIN_BUMP_ATOMS = 1n;
+
+/** Optional configuration for {@link computeRbfFeeBump}. */
+export interface RbfFeeBumpOptions {
+  /**
+   * Percentage fee bump in basis points (`100` = +1%, `1_500` = +15%, `50_000` = +500%).
+   * Must be a safe integer in `[100, 50_000]`.
+   * Default: {@link DEFAULT_RBF_BUMP_BPS} (`1_500`).
+   */
+  bumpBps?: number;
+  /**
+   * Minimum absolute fee increment in atoms to guarantee a strict fee increase.
+   * Must be a `bigint >= 1n`.
+   * Default: {@link DEFAULT_RBF_MIN_BUMP_ATOMS} (`1n`).
+   */
+  minBumpAtoms?: bigint;
+}
+
+/** Result returned by {@link computeRbfFeeBump}. */
+export interface RbfFeeBumpResult {
+  /** Original transaction fee in atoms. */
+  previousFee: bigint;
+  /** Replacement transaction fee in atoms. Always strictly greater than `previousFee`. */
+  bumpedFee: bigint;
+  /** Absolute fee increase in atoms (`bumpedFee - previousFee`). Always `>= minBumpAtoms`. */
+  delta: bigint;
+  /** Applied percentage bump in basis points. */
+  bumpBps: number;
+}
+
+/**
+ * Computes a lossless, overflow-safe Replace-By-Fee (RBF) fee bump using pure `bigint`
+ * ceiling division so even small fees strictly increase (`bumpedFee > previousFee`).
+ *
+ * - Default bump: `+15%` (`bumpBps = 1_500`) with `minBumpAtoms = 1n`.
+ * - Rejects negative `previousFee`, non-integer or out-of-range `bumpBps` (`[100, 50_000]`),
+ *   and `minBumpAtoms < 1n`.
+ */
+export function computeRbfFeeBump(
+  previousFee: bigint,
+  options: RbfFeeBumpOptions = {},
+): RbfFeeBumpResult {
+  if (typeof previousFee !== "bigint") {
+    throw new TypeError(`previousFee must be a bigint, got ${typeof previousFee}`);
+  }
+  if (previousFee < 0n) {
+    throw new RangeError(`previousFee must be non-negative, got ${previousFee}`);
+  }
+
+  const bumpBps = options.bumpBps ?? DEFAULT_RBF_BUMP_BPS;
+  if (
+    typeof bumpBps !== "number" ||
+    !Number.isSafeInteger(bumpBps) ||
+    bumpBps < MIN_RBF_BUMP_BPS ||
+    bumpBps > MAX_RBF_BUMP_BPS
+  ) {
+    throw new RangeError(
+      `bumpBps must be an integer between ${MIN_RBF_BUMP_BPS} and ${MAX_RBF_BUMP_BPS}, got ${bumpBps}`,
+    );
+  }
+
+  const minBumpAtoms = options.minBumpAtoms ?? DEFAULT_RBF_MIN_BUMP_ATOMS;
+  if (typeof minBumpAtoms !== "bigint") {
+    throw new TypeError(`minBumpAtoms must be a bigint, got ${typeof minBumpAtoms}`);
+  }
+  if (minBumpAtoms < 1n) {
+    throw new RangeError(`minBumpAtoms must be >= 1n, got ${minBumpAtoms}`);
+  }
+
+  const percentDelta =
+    previousFee === 0n
+      ? 0n
+      : (previousFee * BigInt(bumpBps) + (BPS_DENOMINATOR - 1n)) / BPS_DENOMINATOR;
+  const delta = percentDelta > minBumpAtoms ? percentDelta : minBumpAtoms;
+  const bumpedFee = previousFee + delta;
+
+  return {
+    previousFee,
+    bumpedFee,
+    delta,
+    bumpBps,
+  };
+}
+
+// ============================================================================
+// Priority Fee Tier Presets
+// ============================================================================
+
+/** Default pending transaction count threshold for `"moderate"` mempool congestion (`50`). */
+export const DEFAULT_MODERATE_CONGESTION_PENDING_COUNT = 50;
+
+/** Default pending transaction count threshold for `"high"` mempool congestion (`200`). */
+export const DEFAULT_HIGH_CONGESTION_PENDING_COUNT = 200;
+
+/** Supported priority fee tier preset names ordered from lowest to highest urgency. */
+export type PriorityFeeTierName = "slow" | "standard" | "fast";
+
+/** Qualitative mempool congestion classification derived from pending transaction count. */
+export type MempoolCongestionLevel = "low" | "moderate" | "high";
+
+/** Structured lossless fee estimate for a single priority tier. */
+export interface PriorityFeeTier {
+  /** Tier name (`"slow"`, `"standard"`, or `"fast"`). */
+  tier: PriorityFeeTierName;
+  /** Recommended fee in atomic units (`bigint`, lossless). */
+  feeAtoms: bigint;
+  /** Recommended fee formatted as a decimal KVNC string via {@link formatKvnc}. */
+  feeKvnc: string;
+  /** Recommended fee rate in atoms per byte (`bigint`, lossless). */
+  feePerByte: bigint;
+  /** Estimated number of blocks until transaction inclusion for this tier. */
+  estimatedInclusionBlocks: number;
+}
+
+/** Structured priority fee tier estimate returned by {@link estimatePriorityFeeTiers}. */
+export interface PriorityFeeTiersEstimate {
+  /** Low-urgency tier derived from `computeFeeRecommendations(...).economy`. */
+  slow: PriorityFeeTier;
+  /** Default tier derived from `computeFeeRecommendations(...).standard`. Always `>= slow`. */
+  standard: PriorityFeeTier;
+  /** High-urgency tier derived from `computeFeeRecommendations(...).priority`. Always `>= standard`. */
+  fast: PriorityFeeTier;
+  /** Number of pending transactions currently in the mempool. */
+  pendingCount: number;
+  /** Derived mempool congestion level (`"low"`, `"moderate"`, or `"high"`). */
+  congestionLevel: MempoolCongestionLevel;
+  /** Indicates whether tiers were derived from live mempool data or fallback values. */
+  source: "mempool" | "fallback";
+  /** Parsed mempool fee statistics used to compute these tiers. */
+  stats: MempoolFeeStats;
+}
+
+/**
+ * Minimal client interface required by {@link estimatePriorityFeeTiers}.
+ * Satisfied by {@link KovanicaClient} (via `getMempoolStats`) or any minimal RPC caller
+ * implementing `call("kovanica_mempoolStats", [], options)`.
+ */
+export type PriorityFeeTiersClient =
+  | {
+      getMempoolStats(
+        options?: RequestOptions,
+      ): Promise<MempoolFeeStats | Record<string, unknown>>;
+    }
+  | {
+      call<TResult = unknown>(
+        method: string,
+        params?: unknown,
+        options?: RequestOptions,
+      ): Promise<TResult>;
+    };
+
+/** Optional configuration for {@link estimatePriorityFeeTiers}. */
+export interface EstimatePriorityFeeTiersOptions extends FeeRecommendationOptions {
+  /**
+   * Optional serialized transaction size in bytes used to scale per-byte fee rates
+   * into total `feeAtoms` (`feePerByte * txSizeBytes`).
+   * Must be a positive integer (`>= 1`). Default: `1n` (per-byte rate).
+   */
+  txSizeBytes?: number | bigint;
+  /**
+   * Pending transaction count at or above which congestion is classified as `"moderate"`.
+   * Must be a safe integer `>= 1`.
+   * Default: {@link DEFAULT_MODERATE_CONGESTION_PENDING_COUNT} (`50`).
+   */
+  moderateCongestionThreshold?: number;
+  /**
+   * Pending transaction count at or above which congestion is classified as `"high"`.
+   * Must be a safe integer `>= moderateCongestionThreshold`.
+   * Default: {@link DEFAULT_HIGH_CONGESTION_PENDING_COUNT} (`200`).
+   */
+  highCongestionThreshold?: number;
+  /** Optional RPC request options (`timeoutMs`, `signal`). */
+  requestOptions?: RequestOptions;
+}
+
+function resolveTxSizeBytes(txSizeBytes: number | bigint | undefined): bigint {
+  if (txSizeBytes === undefined) {
+    return 1n;
+  }
+  if (typeof txSizeBytes === "bigint") {
+    if (txSizeBytes < 1n) {
+      throw new RangeError(`txSizeBytes must be >= 1, got ${txSizeBytes}`);
+    }
+    return txSizeBytes;
+  }
+  if (typeof txSizeBytes === "number") {
+    if (!Number.isSafeInteger(txSizeBytes) || txSizeBytes < 1) {
+      throw new RangeError(`txSizeBytes must be a positive safe integer, got ${txSizeBytes}`);
+    }
+    return BigInt(txSizeBytes);
+  }
+  throw new TypeError(`txSizeBytes must be a bigint or safe integer, got ${typeof txSizeBytes}`);
+}
+
+function classifyCongestion(
+  pendingCount: number,
+  moderateThreshold: number,
+  highThreshold: number,
+): MempoolCongestionLevel {
+  if (pendingCount >= highThreshold) {
+    return "high";
+  }
+  if (pendingCount >= moderateThreshold) {
+    return "moderate";
+  }
+  return "low";
+}
+
+function inclusionBlocksForCongestion(
+  congestionLevel: MempoolCongestionLevel,
+): Record<PriorityFeeTierName, number> {
+  switch (congestionLevel) {
+    case "high":
+      return { slow: 12, standard: 5, fast: 2 };
+    case "moderate":
+      return { slow: 6, standard: 3, fast: 1 };
+    case "low":
+      return { slow: 3, standard: 2, fast: 1 };
+  }
+}
+
+/**
+ * Fetches live mempool statistics via `client` (`getMempoolStats` or
+ * `call("kovanica_mempoolStats", [])`), parses them with {@link parseMempoolFeeStats},
+ * computes monotonic recommendations with {@link computeFeeRecommendations}, and returns
+ * structured lossless `bigint` priority fee tiers (`slow`, `standard`, `fast`).
+ */
+export async function estimatePriorityFeeTiers(
+  client: PriorityFeeTiersClient,
+  options: EstimatePriorityFeeTiersOptions = {},
+): Promise<PriorityFeeTiersEstimate> {
+  if (client === null || typeof client !== "object") {
+    throw new TypeError("client must implement getMempoolStats() or call()");
+  }
+
+  const txSizeBytes = resolveTxSizeBytes(options.txSizeBytes);
+
+  const moderateThreshold =
+    options.moderateCongestionThreshold ?? DEFAULT_MODERATE_CONGESTION_PENDING_COUNT;
+  if (
+    typeof moderateThreshold !== "number" ||
+    !Number.isSafeInteger(moderateThreshold) ||
+    moderateThreshold < 1
+  ) {
+    throw new RangeError(
+      `moderateCongestionThreshold must be a safe integer >= 1, got ${moderateThreshold}`,
+    );
+  }
+
+  const highThreshold =
+    options.highCongestionThreshold ?? DEFAULT_HIGH_CONGESTION_PENDING_COUNT;
+  if (
+    typeof highThreshold !== "number" ||
+    !Number.isSafeInteger(highThreshold) ||
+    highThreshold < moderateThreshold
+  ) {
+    throw new RangeError(
+      `highCongestionThreshold (${highThreshold}) must be a safe integer >= moderateCongestionThreshold (${moderateThreshold})`,
+    );
+  }
+
+  let rawStats: unknown;
+  if ("getMempoolStats" in client && typeof client.getMempoolStats === "function") {
+    rawStats = options.requestOptions
+      ? await client.getMempoolStats(options.requestOptions)
+      : await client.getMempoolStats();
+  } else if ("call" in client && typeof client.call === "function") {
+    rawStats = options.requestOptions
+      ? await client.call<unknown>("kovanica_mempoolStats", [], options.requestOptions)
+      : await client.call<unknown>("kovanica_mempoolStats", []);
+  } else {
+    throw new TypeError("client must implement getMempoolStats() or call()");
+  }
+
+  const stats = parseMempoolFeeStats(rawStats);
+  const recommendations = computeFeeRecommendations(stats, {
+    fallbackBaseFeePerByte: options.fallbackBaseFeePerByte,
+    safetyMultiplierBps: options.safetyMultiplierBps,
+  });
+
+  const congestionLevel = classifyCongestion(
+    stats.pendingCount,
+    moderateThreshold,
+    highThreshold,
+  );
+  const inclusionBlocks = inclusionBlocksForCongestion(congestionLevel);
+
+  const buildTier = (tier: PriorityFeeTierName, feePerByte: bigint): PriorityFeeTier => {
+    const feeAtoms = feePerByte * txSizeBytes;
+    return {
+      tier,
+      feeAtoms,
+      feeKvnc: formatKvnc(feeAtoms),
+      feePerByte,
+      estimatedInclusionBlocks: inclusionBlocks[tier],
+    };
+  };
+
+  return {
+    slow: buildTier("slow", recommendations.economy),
+    standard: buildTier("standard", recommendations.standard),
+    fast: buildTier("fast", recommendations.priority),
+    pendingCount: stats.pendingCount,
+    congestionLevel,
+    source: recommendations.source,
+    stats,
   };
 }
