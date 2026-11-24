@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { KovanicaClient } from "../src/client";
 import {
+  DEFAULT_RBF_BUMP_BPS,
+  DEFAULT_RBF_MIN_BUMP_ATOMS,
+  MAX_RBF_BUMP_BPS,
+  MIN_RBF_BUMP_BPS,
   computeFeeRecommendations,
+  computeRbfFeeBump,
+  estimatePriorityFeeTiers,
   parseMempoolFeeStats,
   type MempoolFeeStats,
 } from "../src/mempool-stats";
@@ -259,5 +265,268 @@ describe("KovanicaClient.getMempoolStats", () => {
       priority: 3n,
       source: "fallback",
     });
+  });
+});
+
+describe("computeRbfFeeBump", () => {
+  it("applies default +15% fee bump with ceiling division", () => {
+    const exact = computeRbfFeeBump(100n);
+    expect(exact).toEqual({
+      previousFee: 100n,
+      bumpedFee: 115n,
+      delta: 15n,
+      bumpBps: DEFAULT_RBF_BUMP_BPS,
+    });
+
+    // 101 * 1500 / 10000 = 15.15 -> ceil = 16
+    const ceiled = computeRbfFeeBump(101n);
+    expect(ceiled).toEqual({
+      previousFee: 101n,
+      bumpedFee: 117n,
+      delta: 16n,
+      bumpBps: 1_500,
+    });
+    expect(ceiled.bumpedFee > ceiled.previousFee).toBe(true);
+  });
+
+  it("strictly increments small 1n and 0n fees", () => {
+    const oneAtom = computeRbfFeeBump(1n);
+    expect(oneAtom).toEqual({
+      previousFee: 1n,
+      bumpedFee: 2n,
+      delta: 1n,
+      bumpBps: 1_500,
+    });
+    expect(oneAtom.bumpedFee > oneAtom.previousFee).toBe(true);
+
+    const zeroAtom = computeRbfFeeBump(0n);
+    expect(zeroAtom).toEqual({
+      previousFee: 0n,
+      bumpedFee: DEFAULT_RBF_MIN_BUMP_ATOMS,
+      delta: 1n,
+      bumpBps: 1_500,
+    });
+    expect(zeroAtom.bumpedFee > zeroAtom.previousFee).toBe(true);
+  });
+
+  it("respects custom bumpBps boundaries and minBumpAtoms floor", () => {
+    const minBump = computeRbfFeeBump(10n, {
+      bumpBps: MIN_RBF_BUMP_BPS,
+      minBumpAtoms: 5n,
+    });
+    expect(minBump).toEqual({
+      previousFee: 10n,
+      bumpedFee: 15n,
+      delta: 5n,
+      bumpBps: 100,
+    });
+
+    const maxBump = computeRbfFeeBump(1_000n, {
+      bumpBps: MAX_RBF_BUMP_BPS,
+    });
+    expect(maxBump).toEqual({
+      previousFee: 1_000n,
+      bumpedFee: 6_000n,
+      delta: 5_000n,
+      bumpBps: 50_000,
+    });
+  });
+
+  it("handles large bigint fees exceeding Number.MAX_SAFE_INTEGER without precision loss", () => {
+    const hugeFee = 100_000_000_000_000_000_001n;
+    const res = computeRbfFeeBump(hugeFee);
+    // ceil(100_000_000_000_000_000_001 * 1500 / 10000) = 15_000_000_000_000_000_001
+    expect(res.delta).toBe(15_000_000_000_000_000_001n);
+    expect(res.bumpedFee).toBe(115_000_000_000_000_000_002n);
+    expect(res.bumpedFee > res.previousFee).toBe(true);
+  });
+
+  it("rejects invalid previousFee, bumpBps, and minBumpAtoms inputs", () => {
+    expect(() => computeRbfFeeBump(-1n)).toThrow(RangeError);
+    expect(() => computeRbfFeeBump(100 as unknown as bigint)).toThrow(TypeError);
+
+    expect(() => computeRbfFeeBump(100n, { bumpBps: 99 })).toThrow(RangeError);
+    expect(() => computeRbfFeeBump(100n, { bumpBps: 0 })).toThrow(RangeError);
+    expect(() => computeRbfFeeBump(100n, { bumpBps: -100 })).toThrow(RangeError);
+    expect(() => computeRbfFeeBump(100n, { bumpBps: 50_001 })).toThrow(RangeError);
+    expect(() => computeRbfFeeBump(100n, { bumpBps: 1_500.5 })).toThrow(RangeError);
+    expect(() => computeRbfFeeBump(100n, { bumpBps: Number.NaN })).toThrow(RangeError);
+
+    expect(() => computeRbfFeeBump(100n, { minBumpAtoms: 0n })).toThrow(RangeError);
+    expect(() => computeRbfFeeBump(100n, { minBumpAtoms: -5n })).toThrow(RangeError);
+    expect(() =>
+      computeRbfFeeBump(100n, { minBumpAtoms: 1 as unknown as bigint }),
+    ).toThrow(TypeError);
+  });
+});
+
+describe("estimatePriorityFeeTiers", () => {
+  it("computes low congestion tiers via KovanicaClient with lossless bigint and KVNC formatting", async () => {
+    const mockTransport: Transport = {
+      send: vi.fn().mockResolvedValue({
+        pending_count: 12,
+        total_bytes: 4096,
+        min_fee_per_byte: "1000000", // 0.001 KVNC
+        p50_fee_per_byte: "2000000", // 0.002 KVNC -> *1.2 = 2_400_000 (0.0024 KVNC)
+        p90_fee_per_byte: "5000000", // 0.005 KVNC -> *1.2 = 6_000_000 (0.006 KVNC)
+        max_fee_per_byte: "10000000",
+      }),
+    };
+    const client = new KovanicaClient({ transport: mockTransport });
+
+    const estimate = await estimatePriorityFeeTiers(client);
+
+    expect(estimate.pendingCount).toBe(12);
+    expect(estimate.congestionLevel).toBe("low");
+    expect(estimate.source).toBe("mempool");
+    expect(estimate.slow).toEqual({
+      tier: "slow",
+      feeAtoms: 1_000_000n,
+      feeKvnc: "0.001",
+      feePerByte: 1_000_000n,
+      estimatedInclusionBlocks: 3,
+    });
+    expect(estimate.standard).toEqual({
+      tier: "standard",
+      feeAtoms: 2_400_000n,
+      feeKvnc: "0.0024",
+      feePerByte: 2_400_000n,
+      estimatedInclusionBlocks: 2,
+    });
+    expect(estimate.fast).toEqual({
+      tier: "fast",
+      feeAtoms: 6_000_000n,
+      feeKvnc: "0.006",
+      feePerByte: 6_000_000n,
+      estimatedInclusionBlocks: 1,
+    });
+    expect(estimate.slow.feeAtoms <= estimate.standard.feeAtoms).toBe(true);
+    expect(estimate.standard.feeAtoms <= estimate.fast.feeAtoms).toBe(true);
+  });
+
+  it("classifies moderate congestion via minimal RPC caller and forwards requestOptions", async () => {
+    const callMock = vi.fn().mockResolvedValue({
+      pending_count: 75,
+      total_bytes: 32_768,
+      min_fee_per_byte: "0x10",
+      p50_fee_per_byte: "0x20",
+      p90_fee_per_byte: "0x40",
+      max_fee_per_byte: "0x80",
+    });
+    const controller = new AbortController();
+
+    const estimate = await estimatePriorityFeeTiers(
+      { call: callMock },
+      { requestOptions: { signal: controller.signal } },
+    );
+
+    expect(callMock).toHaveBeenCalledWith(
+      "kovanica_mempoolStats",
+      [],
+      { signal: controller.signal },
+    );
+    expect(estimate.pendingCount).toBe(75);
+    expect(estimate.congestionLevel).toBe("moderate");
+    expect(estimate.slow.estimatedInclusionBlocks).toBe(6);
+    expect(estimate.standard.estimatedInclusionBlocks).toBe(3);
+    expect(estimate.fast.estimatedInclusionBlocks).toBe(1);
+    expect(estimate.slow.feeAtoms <= estimate.standard.feeAtoms).toBe(true);
+    expect(estimate.standard.feeAtoms <= estimate.fast.feeAtoms).toBe(true);
+  });
+
+  it("classifies high congestion and scales lossless fees by txSizeBytes", async () => {
+    const callMock = vi.fn().mockResolvedValue({
+      pending_count: 250,
+      total_bytes: 262_144,
+      min_fee_per_byte: "10000000000000000", // 10^16 atoms/byte (> MAX_SAFE_INTEGER)
+      p50_fee_per_byte: "20000000000000000",
+      p90_fee_per_byte: "50000000000000000",
+      max_fee_per_byte: "100000000000000000",
+    });
+
+    const estimate = await estimatePriorityFeeTiers(
+      { call: callMock },
+      { txSizeBytes: 250 },
+    );
+
+    expect(estimate.pendingCount).toBe(250);
+    expect(estimate.congestionLevel).toBe("high");
+    expect(estimate.slow.estimatedInclusionBlocks).toBe(12);
+    expect(estimate.standard.estimatedInclusionBlocks).toBe(5);
+    expect(estimate.fast.estimatedInclusionBlocks).toBe(2);
+    expect(estimate.slow.feeAtoms).toBe(2_500_000_000_000_000_000n);
+    expect(estimate.standard.feeAtoms).toBe(6_000_000_000_000_000_000n);
+    expect(estimate.fast.feeAtoms).toBe(15_000_000_000_000_000_000n);
+    expect(estimate.slow.feeKvnc).toBe("2500000000");
+    expect(estimate.slow.feeAtoms <= estimate.standard.feeAtoms).toBe(true);
+    expect(estimate.standard.feeAtoms <= estimate.fast.feeAtoms).toBe(true);
+  });
+
+  it("handles empty mempool fallback with monotonic slow <= standard <= fast tiers", async () => {
+    const callMock = vi.fn().mockResolvedValue({
+      pending_count: 0,
+      total_bytes: 0,
+      min_fee_per_byte: null,
+      p50_fee_per_byte: null,
+      p90_fee_per_byte: null,
+      max_fee_per_byte: null,
+    });
+
+    const estimate = await estimatePriorityFeeTiers(
+      { call: callMock },
+      { fallbackBaseFeePerByte: 100n, safetyMultiplierBps: 12_500 },
+    );
+
+    expect(estimate.source).toBe("fallback");
+    expect(estimate.pendingCount).toBe(0);
+    expect(estimate.congestionLevel).toBe("low");
+    expect(estimate.slow.feeAtoms).toBe(100n);
+    expect(estimate.standard.feeAtoms).toBe(125n);
+    expect(estimate.fast.feeAtoms).toBe(157n);
+    expect(estimate.slow.feeAtoms <= estimate.standard.feeAtoms).toBe(true);
+    expect(estimate.standard.feeAtoms <= estimate.fast.feeAtoms).toBe(true);
+  });
+
+  it("guarantees monotonic slow <= standard <= fast even with inverted mempool percentiles", async () => {
+    const callMock = vi.fn().mockResolvedValue({
+      pending_count: 5,
+      total_bytes: 1024,
+      min_fee_per_byte: 500,
+      p50_fee_per_byte: 100,
+      p90_fee_per_byte: 50,
+      max_fee_per_byte: 500,
+    });
+
+    const estimate = await estimatePriorityFeeTiers({ call: callMock });
+    expect(estimate.slow.feeAtoms).toBe(500n);
+    expect(estimate.standard.feeAtoms).toBe(500n);
+    expect(estimate.fast.feeAtoms).toBe(500n);
+    expect(estimate.slow.feeAtoms <= estimate.standard.feeAtoms).toBe(true);
+    expect(estimate.standard.feeAtoms <= estimate.fast.feeAtoms).toBe(true);
+  });
+
+  it("validates client and tier estimation options", async () => {
+    const validClient = {
+      call: vi.fn().mockResolvedValue({ pending_count: 0, total_bytes: 0 }),
+    };
+
+    await expect(
+      estimatePriorityFeeTiers({} as unknown as { call: typeof validClient.call }),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      estimatePriorityFeeTiers(validClient, { txSizeBytes: 0 }),
+    ).rejects.toThrow(RangeError);
+    await expect(
+      estimatePriorityFeeTiers(validClient, { txSizeBytes: 0n }),
+    ).rejects.toThrow(RangeError);
+    await expect(
+      estimatePriorityFeeTiers(validClient, { moderateCongestionThreshold: 0 }),
+    ).rejects.toThrow(RangeError);
+    await expect(
+      estimatePriorityFeeTiers(validClient, {
+        moderateCongestionThreshold: 100,
+        highCongestionThreshold: 50,
+      }),
+    ).rejects.toThrow(RangeError);
   });
 });
