@@ -2,6 +2,15 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
+## [0.9.0] - 2026-11-25
+
+### Added
+- **Native AMM / DEX (`kovanica-amm` WASM + `AmmClient`)** (`src/amm.ts`, `contracts/kovanica-amm`):
+  - Added standalone constant-product (`x * y = k`, 0.30% LP fee) WASM contract supporting `KVNC/KVP-20` and `KVP-20/KVP-20` pairs with `create_pool`, `add_liquidity`, `remove_liquidity`, `swap_exact_in`, LP mint/burn, slippage `min_out` guards, 256-bit overflow-safe arithmetic, persistent reentrancy lock, and Wave A CPI depth `<= 4` guard.
+  - Added `AmmClient`, Bincode encoders/decoders, `quoteAmmSwapExactIn` / `quoteAmmAddLiquidity`, and 1-tx Wave A atomic `Batch` builders (`buildApproveAndSwapBatchActions`, `buildApproveAndAddLiquidityBatchActions`, `signApproveAndSwapBatch`, `signApproveAndAddLiquidityBatch`).
+- **Institutional RWA (KVP-106) Compliance, Batch Allowlist & Scheduled Dividends** (`src/rwa-compliance.ts`):
+  - Added strict PRO-21 holder validation (`parseStrictRwaHolderAddress`), Wave A `Batch` allowlist builders/chunker (`<= 16` entries/batch) & signer, pause/clawback/mint-cap helpers (`buildRwaPauseCall`, `buildRwaForcedTransferCall`, `checkRwaMintCap`), on-chain `RwaState` Bincode compliance status decoder/reader (`decodeRwaComplianceState`, `readRwaComplianceStatus`), and `kovanica-scheduler` pro-rata coupon/dividend job builders (`computeProRataDividends`, `buildScheduledRwaDividendJobCall`).
+
 ## [0.8.1] - 2026-11-25
 
 ### Added
