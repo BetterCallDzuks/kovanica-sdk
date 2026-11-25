@@ -46,6 +46,33 @@ export const FIXED_FEE_SCHEDULE = {
   rwa_mint: 500_000_000n,
 } as const;
 
+export interface BaseFeeInfo {
+  baseFeePerByte: bigint;
+  minBaseFeePerByte: bigint;
+  maxBaseFeePerByte: bigint;
+  targetBlockBytes: bigint;
+  storageDepositPerByte: bigint;
+  defaultGasPriceAtoms: bigint;
+}
+
+export interface StorageDepositInfo {
+  contract: string;
+  bytes: bigint;
+  depositAtoms: bigint;
+  depositPerByte: bigint;
+}
+
+export interface SessionKeyPolicyInfo {
+  owner: string;
+  sessionPubkey: string;
+  allowedContracts: string[];
+  allowedMethods: string[];
+  maxSpendAtoms: bigint;
+  spentAtoms: bigint;
+  expiresRound: bigint;
+  revoked: boolean;
+}
+
 export interface FeeSchedule {
   chainId: bigint;
   activeFromRound: bigint;
@@ -112,6 +139,9 @@ export const DEFAULT_IDEMPOTENT_RPC_METHODS: ReadonlyArray<string> = Object.free
   "kovanica_getNonce",
   "kovanica_estimateFee",
   "kovanica_getFeeSchedule",
+  "kovanica_getBaseFee",
+  "kovanica_getStorageDeposit",
+  "kovanica_getSessionKey",
   "kovanica_call",
   "kovanica_getStorageAt",
   "kovanica_getCode",
@@ -829,6 +859,75 @@ export class KovanicaClient {
         rwaCreate: parseQuantity(fees.rwa_create ?? FIXED_FEE_SCHEDULE.rwa_create),
         rwaMint: parseQuantity(fees.rwa_mint ?? FIXED_FEE_SCHEDULE.rwa_mint),
       },
+    };
+  }
+
+  /**
+   * Returns current EIP-1559 dynamic base fee per byte and storage deposit parameters.
+   * RPC: `kovanica_getBaseFee`
+   */
+  async getBaseFee(options?: RequestOptions): Promise<BaseFeeInfo> {
+    const raw = await this.call<Record<string, unknown>>("kovanica_getBaseFee", [], options);
+    return {
+      baseFeePerByte: parseQuantity(raw.base_fee_per_byte),
+      minBaseFeePerByte: parseQuantity(raw.min_base_fee_per_byte),
+      maxBaseFeePerByte: parseQuantity(raw.max_base_fee_per_byte),
+      targetBlockBytes: parseQuantity(raw.target_block_bytes),
+      storageDepositPerByte: parseQuantity(raw.storage_deposit_per_byte),
+      defaultGasPriceAtoms: parseQuantity(raw.default_gas_price_atoms),
+    };
+  }
+
+  /**
+   * Returns refundable storage deposit accounting for a contract address.
+   * RPC: `kovanica_getStorageDeposit`
+   */
+  async getStorageDeposit(
+    contract: string,
+    options?: RequestOptions,
+  ): Promise<StorageDepositInfo> {
+    const raw = await this.call<Record<string, unknown>>(
+      "kovanica_getStorageDeposit",
+      [contract],
+      options,
+    );
+    return {
+      contract: String(raw.contract ?? contract),
+      bytes: parseQuantity(raw.bytes),
+      depositAtoms: parseQuantity(raw.deposit_atoms),
+      depositPerByte: parseQuantity(raw.deposit_per_byte),
+    };
+  }
+
+  /**
+   * Looks up a persisted scoped session key policy for `(owner, sessionPubkeyHex)`.
+   * Returns `null` if absent or revoked.
+   * RPC: `kovanica_getSessionKey`
+   */
+  async getSessionKey(
+    owner: string,
+    sessionPubkeyHex: string,
+    options?: RequestOptions,
+  ): Promise<SessionKeyPolicyInfo | null> {
+    const raw = await this.call<Record<string, unknown> | null>(
+      "kovanica_getSessionKey",
+      [owner, sessionPubkeyHex],
+      options,
+    );
+    if (!raw) return null;
+    return {
+      owner: String(raw.owner ?? owner),
+      sessionPubkey: String(raw.session_pubkey ?? sessionPubkeyHex),
+      allowedContracts: Array.isArray(raw.allowed_contracts)
+        ? raw.allowed_contracts.map(String)
+        : [],
+      allowedMethods: Array.isArray(raw.allowed_methods)
+        ? raw.allowed_methods.map(String)
+        : [],
+      maxSpendAtoms: parseQuantity(raw.max_spend_atoms),
+      spentAtoms: parseQuantity(raw.spent_atoms),
+      expiresRound: parseQuantity(raw.expires_round),
+      revoked: Boolean(raw.revoked),
     };
   }
 
