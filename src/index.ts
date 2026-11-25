@@ -535,3 +535,29 @@ export {
   getAccountTxHistory,
   parseAccountTxHistoryEntry,
 } from "./history";
+
+// Native AMM / DEX (`kovanica-amm`)
+export {
+  AMM_FEE_DENOMINATOR,
+  AMM_FEE_NUMERATOR,
+  AMM_LP_FEE_BPS,
+  AMM_MINIMUM_LIQUIDITY,
+  AmmClient,
+  NATIVE_KVNC_TOKEN,
+  NATIVE_KVNC_TOKEN_HEX,
+  type AmmLiquidityQuote,
+  type AmmPoolState,
+  type AmmSwapQuote,
+  buildAmmAddLiquidityCall,
+  buildAmmCreatePoolCall,
+  buildAmmRemoveLiquidityCall,
+  buildAmmSwapExactInCall,
+  buildApproveAndAddLiquidityBatchActions,
+  buildApproveAndSwapBatchActions,
+  buildTokenApproveCall,
+  decodeAmmPoolState,
+  deriveAmmPoolId,
+  quoteAmmAddLiquidity,
+  quoteAmmSwapExactIn,
+  sortAmmTokens,
+} from "./amm";
