@@ -2,6 +2,18 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
+## [0.8.0] - 2026-11-25
+
+### Added
+- **Balanced Fixed Fee Schedule & RPC Client** (`client.ts`):
+  - Added `FIXED_FEE_SCHEDULE`, `FeeSchedule`, and `KovanicaClient.getFeeSchedule()` (`kovanica_getFeeSchedule`).
+- **KVP-106 Real-World Asset (RWA) Support** (`contracts.ts`, `facades.ts`):
+  - Added `RWA_ASSET_CLASSES`, `buildRwaCreateCall`, `buildRwaMintCall`, `buildRwaTransferCall`, `buildRwaBurnCall`, `buildRwaFreezeCall`, `buildRwaUpdateMetadataCall`, and typed `RwaClient` facade.
+- **Wave A — Atomic Batch & Sponsored (Gasless) Transactions** (`wave-a.ts`):
+  - Added `signBatchTransaction`, `computeBatchSigningHash`, `PREV_DEPLOYED_CONTRACT`, `signSponsoredTransaction`, and `computeSponsorSigningHash`.
+- **Waves B, C & D Utilities** (`waves-bcd.ts`):
+  - Added EIP-1559 `nextBaseFeePerByte`, `computeStorageDepositDelta`, `computeTotalRequiredFee`, `SignatureScheme`, `deriveTypedAddress`, `checkSessionPolicy`, `computePqHybridDigest`, and call builders for `kovanica-scheduler` & `kovanica-bridge`.
+
 ## [0.7.0] - 2026-11-24
 
 ### Added
