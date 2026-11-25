@@ -561,3 +561,26 @@ export {
   quoteAmmSwapExactIn,
   sortAmmTokens,
 } from "./amm";
+
+// Institutional RWA (KVP-106) Compliance, Batch Allowlist & Scheduled Dividend Helpers
+export {
+  RWA_STATE_STORAGE_KEY,
+  type RwaAllowlistEntry,
+  type RwaComplianceStatus,
+  type RwaDividendHolder,
+  type RwaDividendPayoutItem,
+  type RwaProRataDividendPlan,
+  buildRwaAllowlistCall,
+  buildRwaBatchAllowlistActions,
+  buildRwaDividendDistributionCall,
+  buildRwaForcedTransferCall,
+  buildRwaPauseCall,
+  buildScheduledRwaDividendJobCall,
+  checkRwaMintCap,
+  chunkRwaAllowlistBatches,
+  computeProRataDividends,
+  decodeRwaComplianceState,
+  parseStrictRwaHolderAddress,
+  readRwaComplianceStatus,
+  signRwaBatchAllowlistUpdate,
+} from "./rwa-compliance";
