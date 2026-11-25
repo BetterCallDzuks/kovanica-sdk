@@ -2,6 +2,14 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
+## [0.8.1] - 2026-11-25
+
+### Added
+- **Wave B & C RPC Client Methods** (`client.ts`):
+  - Added `getBaseFee()`, `getStorageDeposit(contract)`, and `getSessionKey(owner, sessionPubkeyHex)` with typed interfaces (`BaseFeeInfo`, `StorageDepositInfo`, `SessionKeyPolicyInfo`).
+- **Multi-Chain Bridge Registry (Bitcoin, Solana & All EVM Chains)** (`waves-bcd.ts`):
+  - Added `BRIDGE_CHAINS`, `getBridgeChainFamily`, `getBridgeChainById`, and `validateExternalBridgeAddress` covering Bitcoin (`wBTC`), Solana (`wSOL`/`wUSDC`/`wUSDT`), and all major & custom EIP-155 EVM chains.
+
 ## [0.8.0] - 2026-11-25
 
 ### Added

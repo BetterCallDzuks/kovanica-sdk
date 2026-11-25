@@ -194,3 +194,64 @@ export function buildBridgeWithdrawCall(params: {
     u128le(params.amount),
   ]);
 }
+
+// ============================================================================
+// Multi-Chain Bridge Registry (Bitcoin, Solana, and All EVM Chains)
+// ============================================================================
+
+export type BridgeChainFamily = "bitcoin" | "evm" | "solana";
+
+export interface BridgeChainInfo {
+  chainId: number;
+  family: BridgeChainFamily;
+  name: string;
+  nativeWrappedSymbol: string;
+  supportedAssets: readonly string[];
+  minConfirmations: number;
+}
+
+export const BRIDGE_CHAINS: ReadonlyArray<BridgeChainInfo> = Object.freeze([
+  { chainId: 0, family: "bitcoin", name: "Bitcoin", nativeWrappedSymbol: "wBTC", supportedAssets: ["wBTC"], minConfirmations: 6 },
+  { chainId: 1, family: "evm", name: "Ethereum", nativeWrappedSymbol: "wETH", supportedAssets: ["wETH", "wUSDC", "wUSDT", "wEURC"], minConfirmations: 12 },
+  { chainId: 10, family: "evm", name: "Optimism", nativeWrappedSymbol: "wETH", supportedAssets: ["wETH", "wUSDC", "wUSDT"], minConfirmations: 20 },
+  { chainId: 56, family: "evm", name: "BNB Smart Chain", nativeWrappedSymbol: "wBNB", supportedAssets: ["wBNB", "wUSDT", "wUSDC"], minConfirmations: 15 },
+  { chainId: 137, family: "evm", name: "Polygon PoS", nativeWrappedSymbol: "wPOL", supportedAssets: ["wPOL", "wUSDC", "wUSDT"], minConfirmations: 64 },
+  { chainId: 501, family: "solana", name: "Solana", nativeWrappedSymbol: "wSOL", supportedAssets: ["wSOL", "wUSDC", "wUSDT"], minConfirmations: 32 },
+  { chainId: 8453, family: "evm", name: "Base", nativeWrappedSymbol: "wETH", supportedAssets: ["wETH", "wUSDC", "wEURC"], minConfirmations: 20 },
+  { chainId: 42161, family: "evm", name: "Arbitrum One", nativeWrappedSymbol: "wETH", supportedAssets: ["wETH", "wUSDC", "wUSDT"], minConfirmations: 20 },
+  { chainId: 43114, family: "evm", name: "Avalanche C-Chain", nativeWrappedSymbol: "wAVAX", supportedAssets: ["wAVAX", "wUSDC", "wUSDT"], minConfirmations: 12 },
+  { chainId: 59144, family: "evm", name: "Linea", nativeWrappedSymbol: "wETH", supportedAssets: ["wETH", "wUSDC"], minConfirmations: 20 },
+  { chainId: 81457, family: "evm", name: "Blast", nativeWrappedSymbol: "wETH", supportedAssets: ["wETH", "wUSDB"], minConfirmations: 20 },
+  { chainId: 534352, family: "evm", name: "Scroll", nativeWrappedSymbol: "wETH", supportedAssets: ["wETH", "wUSDC"], minConfirmations: 20 },
+]);
+
+export function getBridgeChainFamily(chainId: number): BridgeChainFamily {
+  if (chainId === 0) return "bitcoin";
+  if (chainId === 501) return "solana";
+  return "evm";
+}
+
+export function getBridgeChainById(chainId: number): BridgeChainInfo {
+  const known = BRIDGE_CHAINS.find((c) => c.chainId === chainId);
+  if (known) return known;
+  return {
+    chainId,
+    family: getBridgeChainFamily(chainId),
+    name: `EVM Chain #${chainId}`,
+    nativeWrappedSymbol: "wETH",
+    supportedAssets: ["wETH", "wUSDC", "wUSDT"],
+    minConfirmations: 20,
+  };
+}
+
+export function validateExternalBridgeAddress(chainId: number, address: string): boolean {
+  const trimmed = address.trim();
+  const family = getBridgeChainFamily(chainId);
+  if (family === "bitcoin") {
+    return /^(bc1[a-z0-9]{25,87}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$/.test(trimmed);
+  }
+  if (family === "solana") {
+    return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed);
+  }
+  return /^0x[0-9a-fA-F]{40}$/.test(trimmed);
+}
