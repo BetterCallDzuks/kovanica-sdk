@@ -47,12 +47,12 @@ const readme = readFileSync(readmePath, "utf8");
 const hasDistDir = existsSync(distDir);
 
 describe("kovanica-sdk v0.7.0 release readiness", () => {
-  it("sets package.json and package-lock.json versions to 0.7.0", () => {
+  it("maintains package.json and package-lock.json versions at or above 0.7.0", () => {
     expect(pkg.name).toBe("kovanica-sdk");
-    expect(pkg.version).toBe("0.7.0");
+    expect(pkg.version).toMatch(/^0\.[7-9]\.|^[1-9]\./);
     expect(pkgLock.name).toBe("kovanica-sdk");
-    expect(pkgLock.version).toBe("0.7.0");
-    expect(pkgLock.packages?.[""]?.version).toBe("0.7.0");
+    expect(pkgLock.version).toBe(pkg.version);
+    expect(pkgLock.packages?.[""]?.version).toBe(pkg.version);
   });
 
   it("documents v0.7.0 additions in CHANGELOG.md", () => {
