@@ -509,6 +509,15 @@ export {
   parseMempoolFeeStats,
 } from "./mempool-stats";
 
+export {
+  BRIDGE_CHAINS,
+  type BridgeChainFamily,
+  type BridgeChainInfo,
+  getBridgeChainById,
+  getBridgeChainFamily,
+  validateExternalBridgeAddress,
+} from "./waves-bcd";
+
 // Paginated Account Transaction History
 export {
   DEFAULT_ACCOUNT_TX_HISTORY_LIMIT,
