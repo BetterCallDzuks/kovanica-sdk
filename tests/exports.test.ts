@@ -89,6 +89,18 @@ const EXPECTED_PUBLIC_EXPORTS: ReadonlyArray<readonly [string, ExpectedRuntimeKi
   ["queryContractLogsPaginated", "function"],
   ["parseContractLogCursor", "function"],
   ["formatContractLogCursor", "function"],
+  ["STEALTH_META_ADDRESS_PREFIX", "string"],
+  ["formatStealthMetaAddress", "function"],
+  ["parseStealthMetaAddress", "function"],
+  ["createStealthMeta", "function"],
+  ["isValidStealthMetaAddress", "function"],
+  ["generateStealthKeypair", "function"],
+  ["deriveStealthKeypairFromMnemonic", "function"],
+  ["deriveOnetimeAddress", "function"],
+  ["matchStealthAnnouncement", "function"],
+  ["scanStealthAnnouncements", "function"],
+  ["deriveOnetimeSpendKey", "function"],
+  ["signSighashWithStealthScalar", "function"],
 ];
 
 function assertPublicExportSurface(mod: Record<string, unknown>, label: string): void {
