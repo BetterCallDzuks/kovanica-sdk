@@ -353,14 +353,94 @@ function parseValidPoint(hex: string, label: string): ExtendedPoint {
   return pt;
 }
 
+interface NodeProcessLike {
+  versions?: { node?: string };
+  getBuiltinModule?: (id: string) => unknown;
+}
+
+interface NodeCryptoLike {
+  randomBytes?: (size: number) => Uint8Array;
+  webcrypto?: {
+    getRandomValues: <T extends ArrayBufferView>(array: T) => T;
+  };
+}
+
+function getNodeProcess(): NodeProcessLike | undefined {
+  return (globalThis as unknown as { process?: NodeProcessLike }).process;
+}
+
+let cachedNodeCrypto: NodeCryptoLike | null = null;
+
+// Pre-load `node:crypto` on Node 18 runtimes where `globalThis.crypto` is not exposed globally.
+// Uses a computed specifier so browser bundlers do not statically resolve `node:crypto`.
+const nodeProcessAtLoad = getNodeProcess();
+if (
+  typeof globalThis.crypto?.getRandomValues !== "function" &&
+  typeof nodeProcessAtLoad?.versions?.node === "string"
+) {
+  const nodeCryptoSpecifier = `node:${"crypto"}`;
+  void import(/* @vite-ignore */ nodeCryptoSpecifier)
+    .then((mod: unknown) => {
+      if (mod && typeof mod === "object") {
+        cachedNodeCrypto = mod as NodeCryptoLike;
+      }
+    })
+    .catch(() => {
+      // Ignore; randomBytes() will fall back to synchronous loaders or throw cleanly.
+    });
+}
+
+function getNodeCryptoSync(): NodeCryptoLike | null {
+  if (cachedNodeCrypto) {
+    return cachedNodeCrypto;
+  }
+  const proc = getNodeProcess();
+  if (typeof proc?.getBuiltinModule === "function") {
+    const mod = proc.getBuiltinModule(`node:${"crypto"}`);
+    if (mod && typeof mod === "object") {
+      cachedNodeCrypto = mod as NodeCryptoLike;
+      return cachedNodeCrypto;
+    }
+  }
+  try {
+    const dynamicRequire = Function(
+      "return typeof require === 'function' ? require : null;",
+    )() as ((id: string) => unknown) | null;
+    if (dynamicRequire) {
+      const mod = dynamicRequire(`node:${"crypto"}`);
+      if (mod && typeof mod === "object") {
+        cachedNodeCrypto = mod as NodeCryptoLike;
+        return cachedNodeCrypto;
+      }
+    }
+  } catch {
+    // Not in a CommonJS environment.
+  }
+  return null;
+}
+
 function randomBytes(length: number): Uint8Array {
   const cryptoObj = globalThis.crypto;
-  if (!cryptoObj || typeof cryptoObj.getRandomValues !== "function") {
-    throw new Error("Web Crypto API (crypto.getRandomValues) is unavailable in this runtime");
+  if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+    const out = new Uint8Array(length);
+    cryptoObj.getRandomValues(out);
+    return out;
   }
-  const out = new Uint8Array(length);
-  cryptoObj.getRandomValues(out);
-  return out;
+
+  const nodeCrypto = getNodeCryptoSync();
+  if (nodeCrypto?.webcrypto && typeof nodeCrypto.webcrypto.getRandomValues === "function") {
+    const out = new Uint8Array(length);
+    nodeCrypto.webcrypto.getRandomValues(out);
+    return out;
+  }
+  if (typeof nodeCrypto?.randomBytes === "function") {
+    const buf = nodeCrypto.randomBytes(length);
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+
+  throw new Error(
+    "Web Crypto API (crypto.getRandomValues) is unavailable in this runtime",
+  );
 }
 
 function randomScalar(): bigint {
