@@ -49,7 +49,8 @@ const hasDistDir = existsSync(distDir);
 describe("kovanica-sdk v0.7.0 release readiness", () => {
   it("maintains package.json and package-lock.json versions at or above 0.7.0", () => {
     expect(pkg.name).toBe("kovanica-sdk");
-    expect(pkg.version).toMatch(/^0\.[7-9]\.|^[1-9]\./);
+    const [major, minor] = pkg.version.split(".").map(Number);
+    expect(major > 0 || (major === 0 && minor >= 7)).toBe(true);
     expect(pkgLock.name).toBe("kovanica-sdk");
     expect(pkgLock.version).toBe(pkg.version);
     expect(pkgLock.packages?.[""]?.version).toBe(pkg.version);

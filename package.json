@@ -1,6 +1,6 @@
 {
   "name": "kovanica-sdk",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Typed TypeScript SDK for the Kovanica (KVNC) Layer-1 blockchain",
   "author": "Kovanica Core Developers",
   "license": "MIT",
