@@ -4,6 +4,10 @@
   "description": "Typed TypeScript SDK for the Kovanica (KVNC) Layer-1 blockchain",
   "author": "Kovanica Core Developers",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BetterCallDzuks/kovanica-sdk.git"
+  },
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.cjs",

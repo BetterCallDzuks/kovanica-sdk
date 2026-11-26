@@ -1022,6 +1022,18 @@ The deterministic test suite (`tests/transport-contracts.test.ts`) verifies clie
 
 ---
 
+## Publishing to npm
+
+Automated publishing with npm OIDC provenance attestation is configured in [`.github/workflows/publish.yml`](.github/workflows/publish.yml):
+
+1. Configure an npm granular access token with publish permission for `kovanica-sdk` as the `NPM_TOKEN` repository secret in GitHub Actions.
+2. Bump `"version"` in `package.json` (and `package-lock.json`) on `main` via PR.
+3. Push a matching semantic version tag (`v<version>`, e.g., `git tag v0.10.0 && git push origin v0.10.0`).
+
+The workflow verifies that the pushed `v*` tag matches `package.json`, runs `npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, and `npm pack --dry-run`, and then publishes with `npm publish --provenance --access public`. You can also trigger the workflow manually via **Actions -> Publish to npm -> Run workflow** (`dry_run` defaults to `true` for safe pre-release verification).
+
+---
+
 ## Ecosystem Repositories
 
 | Repository | Role |
