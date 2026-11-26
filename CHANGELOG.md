@@ -2,6 +2,15 @@
 
 All notable changes to `kovanica-sdk` are documented in this file.
 
+## [0.10.0] - 2026-11-26
+
+### Added
+- **KVP-103 Dual-Key Ed25519 Stealth Addresses** (`src/stealth.ts`, `src/index.ts`):
+  - Pure-TypeScript, browser-safe (and Node 18/20/22 compatible) KVP-103 / RFC-003 dual-key Ed25519 ECDH stealth address implementation bit-for-bit compatible with `kovanica-web`.
+  - Added meta-address encoding/decoding/validation (`formatStealthMetaAddress`, `parseStealthMetaAddress`, `createStealthMeta`, `isValidStealthMetaAddress` with small-order point rejection), keypair generation & deterministic mnemonic derivation (`generateStealthKeypair`, `deriveStealthKeypairFromMnemonic`), sender one-time derivation (`deriveOnetimeAddress`), watch-only announcement scanning with 2-byte BLAKE3 view-tag fast-filter (`matchStealthAnnouncement`, `scanStealthAnnouncements`), one-time spend key recovery (`deriveOnetimeSpendKey`), and RFC 8032 scalar signing (`signSighashWithStealthScalar`).
+- **Reproducible AMM Contract Lockfile**:
+  - Committed `contracts/kovanica-amm/Cargo.lock` for deterministic WASM contract builds.
+
 ## [0.9.0] - 2026-11-25
 
 ### Added
